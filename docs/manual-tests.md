@@ -32,16 +32,39 @@ cameras write what the standard says they write, so this stays manual.
 
 ## Phase 2 — Minimal viewer
 
+Generate the sample files first:
+
+```
+cargo run --release --package fits-core --all-features --example make-sample -- /tmp/fitsview-samples
+```
+
+Then open the viewer:
+
+```
+cargo run --release --package fitsview -- /tmp/fitsview-samples/light_orientation.fits
+```
+
+Orientation and NaN handling are also asserted automatically in
+`crates/fitsview/tests/rendering.rs`, so the entries below are confirmation on
+real hardware rather than the only evidence.
+
 - [ ] Window opens at a sensible size on a fresh profile.
 - [ ] `Open File…` dialog appears and filters to FITS extensions.
-- [ ] Image is the right way up. A synthetic file with a bright first FITS row
-      shows that row at the **bottom** of the window.
+- [ ] Image is the right way up. `light_orientation.fits` shows its bright band
+      along the **bottom** edge. Along the top means the flip was lost.
 - [ ] Zoom with the scroll wheel keeps the pixel under the cursor fixed.
 - [ ] Drag pans; `F` fits; `1` shows 100 %.
 - [ ] Panning a 24 MP image feels smooth, with no visible stutter.
 - [ ] Drag and drop a file onto the window loads it.
-- [ ] A file containing NaN pixels renders with those pixels black, not a blank
-      image.
+- [ ] `nan_test.fits` renders with scattered black pixels and visible structure,
+      not a uniformly blank image.
+- [ ] `colour_test.fits` shows a red-to-yellow gradient, not greyscale.
+- [ ] Opening a non-FITS file, such as `notes.txt`, shows an error in the status
+      bar and leaves the previous image on screen.
+
+Status on macOS as of Phase 2: the window opens, loads a 24 MP file in about
+18 ms, and downsamples it by two for display. The remaining boxes need a human
+at the keyboard, and the whole list needs running on Linux and Windows.
 
 ---
 

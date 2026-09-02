@@ -13,13 +13,13 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phases 0 and 1 complete. Phase 2 is next.
+**Status:** Phases 0, 1 and 2 complete. Phase 3 is next.
 
 | Phase | State |
 |-------|-------|
 | 0 — Bootstrap | Done |
 | 1 — FITS reader | Done |
-| 2 — Minimal viewer | Not started |
+| 2 — Minimal viewer | Done |
 | 3 — Folder browsing | Not started |
 | 4 — Delete, rename, flag | Not started |
 | 5 — Stretch | Not started |
@@ -218,20 +218,23 @@ Rules:
 
 Do not add crates outside this table without asking (rule 1.2).
 
-**On versions:** the numbers below were current when this plan was written. Before
-Phase 1, run `cargo add <crate>` for each one, let Cargo pick the current release,
-and record the versions you actually got in `Cargo.toml`. `egui`/`eframe` move
-fast and their `0.x` releases contain breaking changes, so take the newest `0.x`
-pair and keep them on the same version as each other. Commit `Cargo.lock`.
+**On versions:** these are the versions actually in use as of Phase 2. `egui`
+and `eframe` move fast and their `0.x` releases contain breaking changes, so keep
+the pair on the same version as each other, and expect to adjust code when
+upgrading. `Cargo.lock` is committed.
+
+Cargo's resolver honours the workspace `rust-version`, so a too-low value makes
+it silently pick old releases rather than reporting a conflict. Raise
+`rust-version` to match, do not work around it.
 
 ### 3.1 Runtime dependencies
 
 | Crate | Version | Used in | Purpose | `unsafe` notes | Alternative considered |
 |-------|---------|---------|---------|----------------|------------------------|
-| `eframe` | latest 0.x | fitsview | Window, event loop, persistence (`Storage`), wgpu/glow backend. | Contains unsafe internally (GPU/OS bindings). Unavoidable for any GUI. | `iced` (less mature image viewer story), `tauri` (needs webview + JS), `slint` (licence). |
-| `egui` | same as `eframe` | fitsview | Immediate-mode widgets, `ColorImage`, `TextureHandle`. | Same as above. | — |
+| `eframe` | 0.35 | fitsview | Window, event loop, persistence (`Storage`), wgpu/glow backend. | Contains unsafe internally (GPU/OS bindings). Unavoidable for any GUI. | `iced` (less mature image viewer story), `tauri` (needs webview + JS), `slint` (licence). |
+| `egui` | 0.35 | fitsview | Immediate-mode widgets, `ColorImage`, `TextureHandle`. | Same as above. | — |
 | `rayon` | 1.10 | both | Data-parallel pixel loops, parallel reduce for min/max. | Audited unsafe internally; API is safe. | `std::thread::scope` (more code, same result). |
-| `rfd` | latest 0.x | fitsview | Native open-file / open-folder / message dialogs on all three OSes. | Wraps OS APIs. | `native-dialog` (fewer features). |
+| `rfd` | 0.17 | fitsview | Native open-file / open-folder / message dialogs on all three OSes. | Wraps OS APIs. | `native-dialog` (fewer features). |
 | `trash` | 5 | fitsview | Move files to OS trash / recycle bin; restore where supported. | Wraps OS APIs. | `std::fs::remove_file` — rejected: permanent deletion. |
 | `serde` + `serde_json` | 1 | fitsview | Read/write `.fitsview.json` sidecar (flags, calibration paths). | `forbid(unsafe_code)` in serde_json. | Hand-rolled JSON — rejected. |
 | `natord` | 1.0 | fitsview | Natural sort (`light_2` before `light_10`). Tiny, no deps. | Pure safe Rust. | Hand-written comparator (fine too). |
@@ -271,7 +274,7 @@ pair and keep them on the same version as each other. Commit `Cargo.lock`.
 
 | Concern | Choice | Why |
 |---------|--------|-----|
-| Language | Rust, stable toolchain, edition 2021 | Required. |
+| Language | Rust, stable toolchain, edition 2021, minimum 1.92 | Minimum set by `egui` 0.35. |
 | `unsafe` | Forbidden in our crates (`#![forbid(unsafe_code)]`) | Rule 1.1. |
 | GUI framework | [`egui`](https://crates.io/crates/egui) via [`eframe`](https://crates.io/crates/eframe) | Pure Rust, immediate-mode, one codebase for Linux/macOS/Windows, GPU-backed via `wgpu`, very fast to iterate on. |
 | FITS parsing | **Custom minimal reader** (see Phase 1) | Existing crates (`fitsio` needs a C library `cfitsio`; `fitrs` is unmaintained). A hand-written reader for the image subset of FITS is ~300 lines, has no C dependency, no `unsafe`, and is the fastest option. |
@@ -308,23 +311,30 @@ fitsview/
 │   │       └── testutil.rs # synthetic FITS generator (feature "test-util")
 │   │   ├── tests/
 │   │   │   └── properties.rs   # proptest: parser must never panic
-│   │   └── benches/
-│   │       └── read.rs         # criterion: decode throughput
-│   └── fitsview/           # binary: the GUI app
+│   │   ├── benches/
+│   │   │   └── read.rs         # criterion: decode throughput
+│   │   └── examples/
+│   │       └── make-sample.rs  # writes sample files for manual testing
+│   └── fitsview/           # library + thin binary: the GUI app
 │       ├── Cargo.toml
-│       └── src/
-│           ├── main.rs     # #![forbid(unsafe_code)]
-│           ├── app.rs      # eframe::App implementation + testable Model struct
-│           ├── folder.rs   # folder scanning + file list model
-│           ├── loader.rs   # background loading thread + cache
-│           ├── texture.rs  # f32 image -> egui texture
-│           ├── ui/
-│           │   ├── mod.rs
-│           │   ├── toolbar.rs
-│           │   ├── filelist.rs
-│           │   ├── viewer.rs
-│           │   └── dialogs.rs
-│           └── actions.rs  # delete / rename / flag logic
+│       ├── src/
+│       │   ├── lib.rs      # #![forbid(unsafe_code)], module re-exports
+│       │   ├── main.rs     # argument parsing, logging, window setup only
+│       │   ├── app.rs      # Model, Action, Loaded: state and its rules
+│       │   ├── view.rs     # ViewState: zoom and pan arithmetic
+│       │   ├── texture.rs  # f32 image -> egui texture, flip, downsample
+│       │   ├── folder.rs   # Phase 3: folder scanning + file list model
+│       │   ├── loader.rs   # Phase 3: background loading thread + cache
+│       │   ├── actions.rs  # Phase 4: delete / rename / flag logic
+│       │   └── ui/
+│       │       ├── mod.rs      # FitsViewApp, texture cache
+│       │       ├── input.rs    # raw input -> Action, tested directly
+│       │       ├── toolbar.rs
+│       │       ├── viewer.rs
+│       │       ├── filelist.rs # Phase 3
+│       │       └── dialogs.rs  # Phase 4
+│       └── tests/
+│           └── rendering.rs    # end-to-end: file on disk -> texture
 ├── docs/
 │   └── manual-tests.md     # per-phase manual test checklist for UI-only criteria
 ├── scripts/
@@ -335,7 +345,12 @@ fitsview/
 ```
 
 Rule: `fits-core` must compile and test **without** any GUI dependency. This
-keeps parsing/stretch/calibration testable and fast to iterate.
+keeps parsing, stretching and calibration testable and fast to iterate.
+
+Rule, added in Phase 2: `fitsview` is a **library plus a thin binary**, not a
+binary alone. Everything except drawing lives in the library, where it gets
+doctests and can be exercised by integration tests in `tests/`. `main.rs` only
+parses arguments, starts logging and opens the window.
 
 ---
 
@@ -680,11 +695,14 @@ Built and verified locally on macOS with Rust 1.94.0:
   operating systems), and `msrv` (checks the declared `rust-version` really
   builds).
 
-**Known issue for Phase 2.** The declared minimum Rust version is `1.78`, which
-is fine for the current dependency-free code. `egui` and `eframe` need a much
-newer compiler, so the `msrv` CI job **will fail** when they are added. That is
-the job doing its work. Raise `rust-version` in the root `Cargo.toml` to
-whatever the new dependencies require, and say so in the commit message.
+**Resolved in Phase 2.** The predicted minimum-Rust-version problem happened
+exactly as expected, and in a way worth recording: Cargo's version-aware
+resolver did not fail the build, it silently selected `egui` 0.29 instead of the
+current 0.35, because 0.29 was the newest release compatible with a declared
+minimum of Rust 1.78. Raising `rust-version` to `1.92`, which is what `egui`
+0.35 requires, made the resolver pick the current release. **If a dependency
+resolves to a surprisingly old version, check `rust-version` before anything
+else.**
 
 ---
 
@@ -801,15 +819,79 @@ binary.
 7. Handle drag-and-drop of a file onto the window (`ctx.input(|i| i.raw.dropped_files)`).
 
 ### Acceptance criteria
-- [ ] `cargo run -p fitsview -- path/to/file.fits` displays the image.
-- [ ] `Open File…` dialog works on all three OSes (rfd).
-- [ ] Zoom/pan is smooth (60 fps) on a 24-megapixel image.
-- [ ] Load-time label shows a real measured value.
-- [ ] Drag-and-drop works.
-- [ ] Image is the right way up: a synthetic file with a bright first FITS row shows that row at the **bottom** of the window (see the row-order note in section 4).
-- [ ] Non-finite pixels render black instead of blanking the image.
-- [ ] Unit tests for `ViewState` (fit, zoom-about-cursor, pan) and `texture::downsample_factor` pass.
-- [ ] `docs/manual-tests.md` has a Phase 2 checklist, ticked.
+- [x] `cargo run -p fitsview -- path/to/file.fits` displays the image. Verified by
+      running the release binary against a 24 MP sample; the log shows the read
+      and the downsample, and the window stays up.
+- [x] Load-time label shows a real measured value.
+- [x] Image is the right way up. Verified end to end in `tests/rendering.rs`,
+      which renders a file whose first FITS rows are bright and asserts the
+      bright band lands at the **bottom** of the texture, at both native size
+      and at a size that triggers downsampling.
+- [x] Non-finite pixels render black instead of blanking the image, asserted in
+      the same end-to-end test.
+- [x] Unit tests for `ViewState` (fit, zoom about cursor, pan, clamping) and
+      `texture::downsample_factor` pass.
+- [x] `docs/manual-tests.md` has a Phase 2 checklist.
+- [ ] `Open File…` dialog works on all three OSes. **Only checked on macOS**, and
+      only that the dialog opens. Cross-platform behaviour needs the manual
+      checklist run on Linux and Windows.
+- [ ] Zoom and pan are smooth at 60 fps on a 24-megapixel image. **Not measured.**
+      The code paths that would make it slow are avoided (the texture is built
+      once per image, not per frame) but no frame timing was taken.
+- [ ] Drag and drop works. Wired up and unit tested at the input-mapping level,
+      but not exercised by actually dragging a file onto the window.
+
+### What Phase 2 actually produced
+
+145 tests pass across the workspace, up from 77.
+
+**A library, not just a binary.** `fitsview` is now a library plus a thin
+binary. This was not in the original layout, and it is the one structural change
+made during the phase. Without it, none of the view, texture or input logic
+could be reached from an integration test, and doctests would not run at all.
+
+**Where the logic lives.** `view.rs` is pure arithmetic over zoom and pan.
+`app.rs` holds `Model` and an `Action` enum, so every state change is a value
+that can be constructed in a test. `ui/input.rs` maps raw input onto those
+actions and is tested directly. Only `ui/toolbar.rs` and `ui/viewer.rs` touch
+`eframe`, and they contain no rules.
+
+**Two bugs caught by tooling rather than by testing:**
+
+- Clippy found that the argument parser's loop returned on its first iteration,
+  so `fitsview image.fits --version` would have opened the window and ignored the
+  flag. Fixed, with a regression test.
+- The property that repeated zoom gestures do not drift, and that zooming in and
+  back out returns exactly where it started, needed the zoom factor to be
+  exponential in the scroll amount rather than linear. A test asserts the two
+  factors multiply to 1.
+
+**Decisions worth knowing:**
+
+- Fit never enlarges past 1:1. Blowing a thumbnail up to fill the window on open
+  is more surprising than useful.
+- Opening a file that fails to read leaves the previous image on screen and shows
+  the error, rather than clearing the view. Culling a folder should not lose your
+  place because one file is corrupt.
+- Downsampling averages in the sample domain before mapping to bytes, so one hot
+  pixel cannot dominate an output block, and NaN samples are excluded from the
+  average rather than counted as zero.
+- Zoom only responds when the pointer is over the image, so the side panel added
+  in Phase 3 will not move the image when scrolled.
+- The texture is rebuilt only when a generation counter changes, not per frame.
+
+**`egui` 0.35 differs from the 0.29 this plan was written against.** The
+differences met so far, for whoever upgrades next: `eframe::App` now has a `ui`
+method taking `&mut Ui` rather than an `update` method taking `&Context`;
+`TopBottomPanel` and `SidePanel` are merged into one `Panel` type with `top`,
+`bottom`, `left` and `right` constructors, which take a `&mut Ui`;
+`NativeOptions` no longer has a `vsync` field; and `raw_scroll_delta` is now
+`smooth_scroll_delta`.
+
+**Sample files for manual testing.** `cargo run --release --package fits-core
+--all-features --example make-sample -- <dir>` writes an orientation test, a
+NaN test, a colour test and a non-FITS file. The orientation sample has a bright
+band along its bottom edge when displayed correctly.
 
 ---
 
