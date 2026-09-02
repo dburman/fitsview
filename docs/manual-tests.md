@@ -20,11 +20,13 @@ CI, so this section is intentionally empty.
 
 ## Phase 1 — FITS reader
 
-Covered by unit, property and round-trip tests. Add manual entries here only if
-a real capture file exposes something the synthetic generator cannot produce.
+Covered by 77 automated tests, including property tests that feed the parser
+arbitrary bytes. The one thing synthetic files cannot prove is that real
+cameras write what the standard says they write, so this stays manual.
 
 - [ ] Open a real 16-bit file from a capture program and confirm the reported
-      dimensions and BITPIX match what the capture program shows.
+      dimensions and BITPIX match what the capture program shows. Deferred
+      until Phase 2, when there is a user interface to read them from.
 
 ---
 

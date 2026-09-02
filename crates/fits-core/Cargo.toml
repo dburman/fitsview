@@ -12,5 +12,17 @@ description = "FITS image parsing, stretching and calibration. No GUI dependenci
 test-util = []
 
 [dependencies]
+log = "0.4.34"
+rayon = "1.10.0"
+thiserror = "2.0.20"
 
 [dev-dependencies]
+approx = "0.5.1"
+criterion = "0.5.1"
+proptest = "1.8.0"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "read"
+harness = false
+required-features = ["test-util"]

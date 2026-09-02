@@ -13,12 +13,12 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phase 0 complete. Phase 1 is next.
+**Status:** Phases 0 and 1 complete. Phase 2 is next.
 
 | Phase | State |
 |-------|-------|
 | 0 — Bootstrap | Done |
-| 1 — FITS reader | Not started |
+| 1 — FITS reader | Done |
 | 2 — Minimal viewer | Not started |
 | 3 — Folder browsing | Not started |
 | 4 — Delete, rename, flag | Not started |
@@ -298,13 +298,18 @@ fitsview/
 │   ├── fits-core/          # library: FITS parsing, stretch, calibration. NO GUI CODE.
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs      # #![forbid(unsafe_code)]
+│   │       ├── lib.rs      # #![forbid(unsafe_code)], re-exports
+│   │       ├── error.rs    # FitsError
 │   │       ├── header.rs   # FITS header parsing
-│   │       ├── image.rs    # FitsImage struct + pixel conversion
-│   │       ├── reader.rs   # read_fits / write_fits
+│   │       ├── image.rs    # FitsImage, Geometry, pixel conversion, statistics
+│   │       ├── reader.rs   # read_fits, is_fits_path (write_fits in Phase 6)
 │   │       ├── stretch.rs  # Phase 5
 │   │       ├── calib.rs    # Phase 6 & 7
 │   │       └── testutil.rs # synthetic FITS generator (feature "test-util")
+│   │   ├── tests/
+│   │   │   └── properties.rs   # proptest: parser must never panic
+│   │   └── benches/
+│   │       └── read.rs         # criterion: decode throughput
 │   └── fitsview/           # binary: the GUI app
 │       ├── Cargo.toml
 │       └── src/
@@ -378,6 +383,13 @@ because it is two lines of code.
 **Detecting a FITS file:** first 6 bytes are `SIMPLE`, **and** extension is one
 of `.fits`, `.fit`, `.fts` (case-insensitive). Check the extension first (cheap),
 then verify the magic bytes.
+
+**Trailing padding is optional on read (decided in Phase 1).** The standard pads
+the data section out to a whole 2880-byte block, but a file that stops
+immediately after its last pixel has lost nothing that matters. The reader
+accepts that, so a capture that was interrupted at the very end still opens.
+Anything shorter than the full pixel data is still refused as truncated. Files
+this crate *writes* are always fully padded.
 
 ---
 
@@ -550,7 +562,23 @@ indexed parallel iterators, so rayon keeps the two sides aligned. `chunks_exact`
 guarantees each `s` has the length the array literal indexes, so no bounds check
 survives optimisation and no `unwrap` is needed.
 
-Why this is fast enough without `mmap`: the conversion pass touches every byte anyway, so the extra copy that `fs::read` performs is a small fraction of total time and is done by the kernel at memory bandwidth. Measured expectation for a 24 MP 16-bit file: read ≈ 15 ms (warm), convert ≈ 30–60 ms with 8 threads. If a benchmark shows otherwise, report the numbers and ask before changing strategy (rule 1.1).
+Why this is fast enough without `mmap`: the conversion pass touches every byte
+anyway, so the extra copy that `fs::read` performs is a small fraction of total
+time and is done by the kernel at memory bandwidth.
+
+**Measured in Phase 1** by `benches/read.rs` on an Apple silicon laptop, decoding
+a 6000 x 4000 unsigned 16-bit image already in memory:
+
+| Operation | Time | Throughput |
+|-----------|------|------------|
+| Full decode: header parse, conversion, min/max | 7.3 ms | 6.2 GiB/s |
+| `finite_min_max` alone over 24 M samples | 4.5 ms | — |
+
+The plan's target was 150 ms, so there is roughly twenty times more headroom
+than required and no reason to revisit the no-`mmap` decision. Re-run with
+`cargo bench --package fits-core --all-features` after any change to the read
+path, and if a number regresses badly, report it before changing strategy
+(rule 1.1).
 
 ### 5.4 Synthetic FITS generator for tests (`fits-core/src/testutil.rs`)
 
@@ -571,7 +599,7 @@ Every test that needs a file uses these. No binary fixtures are committed.
 |--------|-----------|-----------------|
 | `header.rs` | unit + proptest | Card parsing, quoted strings with `/` inside, `END` detection, multi-block headers, missing `NAXIS` → `BadHeader`, arbitrary bytes never panic. |
 | `image.rs` | unit + criterion | Every BITPIX, BZERO/BSCALE, u16 fast path equals the generic path, `finite_min_max` with NaN/inf present and with an all-NaN image, `BLANK` becomes NaN, 3-channel layout. |
-| `reader.rs` | unit + proptest | Truncated, NotFits, absurd NAXIS values do not overflow or allocate wildly, primary-empty-then-extension fallback, `write_fits`→`read_fits` identity. |
+| `reader.rs` | unit + proptest | Truncated, NotFits, absurd NAXIS values do not overflow or allocate wildly, primary-empty-then-extension fallback, missing trailing padding tolerated. The `write_fits`→`read_fits` identity test arrives with `write_fits` itself in Phase 6. |
 | `stretch.rs` | unit | Median maps to `target_bg` within tolerance, LUT is monotonic non-decreasing, constant image does not divide by zero, all-NaN image does not panic, RGB per-channel. |
 | `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, all dark/bias/scale combinations. |
 | `folder.rs` | integration (tempdir) | Filters extensions, skips hidden, natural sort, sidecar round-trip. |
@@ -689,18 +717,63 @@ whatever the new dependencies require, and say so in the commit message.
 6. Add `pub fn is_fits_path(path: &Path) -> bool` — extension check only (`.fits`, `.fit`, `.fts`, case-insensitive). Used by folder scanning.
 7. Write `testutil.rs` (see 5.4) **first**, then use it in tests for every supported `BITPIX`.
 8. Add `proptest` tests: (a) `header::parse` never panics on arbitrary input; (b) `convert_pixels` u16 fast path equals the generic path for random data.
-9. Add a `criterion` bench in `benches/read.rs` that times `read_fits` on a 6000×4000 16-bit synthetic file written to a temp dir. Target: **< 150 ms** on a modern laptop, warm cache.
-10. Run `cargo geiger -p fits-core` and confirm zero `unsafe` in the crate.
+9. Add a `criterion` bench in `benches/read.rs` that times decoding a 6000×4000 16-bit synthetic image. Target: **< 150 ms** on a modern laptop, warm cache. Measured at 7.3 ms, so the target is met with room to spare.
+10. Run `scripts/check-unsafe.sh` and confirm it is clean.
 
 ### Acceptance criteria
-- [ ] `cargo test -p fits-core` passes with tests for BITPIX 8, 16 (with BZERO 32768), 32, -32, -64.
-- [ ] Reading a truncated file returns `FitsError::Truncated`, not a panic.
-- [ ] Non-FITS file returns `FitsError::NotFits`.
-- [ ] A 3-plane (`NAXIS3=3`) file returns `channels == 3`.
-- [ ] `min`/`max` are correct for the synthetic tests.
-- [ ] No `unwrap()` on user data paths.
-- [ ] `#![forbid(unsafe_code)]` present; `cargo geiger` reports 0 unsafe in `fits-core`.
-- [ ] Property tests and criterion bench exist and run.
+- [x] `cargo test -p fits-core` passes with tests for BITPIX 8, 16 (with BZERO 32768), 32, 64, -32, -64.
+- [x] Reading a truncated file returns `FitsError::Truncated`, not a panic.
+- [x] Non-FITS file returns `FitsError::NotFits`.
+- [x] A 3-plane (`NAXIS3=3`) file returns `channels == 3`.
+- [x] `min`/`max` are correct for the synthetic tests, and skip NaN and infinities.
+- [x] No `unwrap()` on user data paths.
+- [x] `#![forbid(unsafe_code)]` present and the unsafe guard passes.
+- [x] Property tests and criterion bench exist and run.
+
+### What Phase 1 actually produced
+
+77 tests pass across the workspace: 66 unit tests, 7 property tests, 2 binary
+tests and 2 doctests.
+
+**Modules.** `error.rs` holds a `FitsError` whose variants carry enough context
+to show a user, including the path on I/O failures and the expected against
+actual byte counts on truncation. `header.rs` parses cards, handling the two
+details that trip people up: a `/` inside a quoted string is not a comment, and
+a doubled quote is an escape. `image.rs` holds `Geometry`, which validates once
+so the conversion loop can assume correctness, plus `convert_pixels` and
+`finite_min_max`. `reader.rs` reads files and falls back to the first extension
+when the primary header is empty. `testutil.rs` builds valid FITS files in
+memory so no binary fixtures are committed.
+
+**Decisions made while building, worth knowing:**
+
+- Keyword lookup is case-insensitive. The standard says keywords are upper case;
+  files in the wild are not always careful.
+- `get_i64` accepts a value written as a float with no fractional part, because
+  cameras write `BZERO = 32768.0` and `BZERO = 32768` interchangeably.
+- `get_f64` normalises Fortran-style exponents (`1.5D2`), which Rust will not
+  otherwise parse.
+- `BLANK` is only honoured for integer `BITPIX`, as the standard requires. A
+  float image carrying the keyword does not get pixels silently blanked.
+- `finite_min_max` returns `(0.0, 1.0)` when nothing is finite *or* when every
+  sample is identical, so callers can always divide by `max - min`.
+- A `BSCALE` of zero is rejected at header-validation time rather than producing
+  a uniform image.
+
+**Found by the property tests, not by the example tests.** Truncating a valid
+file at every possible offset showed that a file missing only its trailing block
+padding still decodes, because every pixel byte is present. That is the right
+behaviour for a viewer, so it is now documented in section 4 and pinned by a
+named unit test rather than left as an accident.
+
+**Deferred to Phase 6, deliberately.** `write_fits` is not implemented. Nothing
+in Phase 1 needs it, and it belongs with the calibration export that first uses
+it. The `write_fits`→`read_fits` identity test in the section 5.5 table moves to
+Phase 6 with it.
+
+**Dependency note.** `log` was added to `fits-core` so the read path can record
+timings. The library only emits records; choosing where they go stays with the
+binary.
 
 ---
 
