@@ -1,0 +1,16 @@
+[package]
+name = "fits-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FITS image parsing, stretching and calibration. No GUI dependencies."
+
+[features]
+# Exposes the synthetic FITS generator so the fitsview crate can use it in tests.
+test-util = []
+
+[dependencies]
+
+[dev-dependencies]

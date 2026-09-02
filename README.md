@@ -13,7 +13,22 @@ criteria all pass.
 
 ## 0. Product Summary
 
-Phase 0 is project bootstrap. Phases 1 through 8 deliver the features below.
+**Status:** Phase 0 complete. Phase 1 is next.
+
+| Phase | State |
+|-------|-------|
+| 0 — Bootstrap | Done |
+| 1 — FITS reader | Not started |
+| 2 — Minimal viewer | Not started |
+| 3 — Folder browsing | Not started |
+| 4 — Delete, rename, flag | Not started |
+| 5 — Stretch | Not started |
+| 6 — Dark calibration | Not started |
+| 7 — Bias calibration | Not started |
+| 8 — Packaging | Not started |
+
+Keep this table current. Phase 0 is project bootstrap; phases 1 through 8
+deliver the features below.
 
 | # | Requirement | Phase |
 |---|-------------|-------|
@@ -307,6 +322,10 @@ fitsview/
 │           └── actions.rs  # delete / rename / flag logic
 ├── docs/
 │   └── manual-tests.md     # per-phase manual test checklist for UI-only criteria
+├── scripts/
+│   └── check-unsafe.sh     # unsafe guard, run by CI and locally
+├── rust-toolchain.toml     # pins the stable channel plus rustfmt and clippy
+├── Cargo.lock              # committed: this workspace produces a binary
 └── .github/workflows/ci.yml
 ```
 
@@ -607,12 +626,37 @@ every later phase starts from a green build.
 7. Commit `Cargo.lock`. It is a binary crate, so the lock file belongs in version control.
 
 ### Acceptance criteria
-- [ ] `cargo build --workspace` and `cargo test --workspace` succeed locally.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
-- [ ] `cargo fmt --all --check` is clean.
-- [ ] CI is green on Linux, macOS, and Windows.
-- [ ] The unsafe-guard CI step is present and passes.
-- [ ] `Cargo.lock` is committed.
+- [x] `cargo build --workspace` and `cargo test --workspace` succeed locally.
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings` is clean.
+- [x] `cargo fmt --all --check` is clean.
+- [x] The unsafe guard is present, and is itself tested against a real `unsafe`
+      block and against a deleted `forbid` attribute.
+- [x] `Cargo.lock` is committed.
+- [ ] CI is green on Linux, macOS, and Windows. **Cannot be confirmed until the
+      repository has a remote and the workflow has run at least once.**
+
+### What Phase 0 actually produced
+
+Built and verified locally on macOS with Rust 1.94.0:
+
+- Workspace with `crates/fits-core` (library) and `crates/fitsview` (binary),
+  both carrying `#![forbid(unsafe_code)]`.
+- Six passing tests: three unit tests and one doctest in `fits-core`, two unit
+  tests in `fitsview`. They are small but real, covering `block_align` rounding
+  and its overflow behaviour, rather than `assert!(true)` placeholders.
+- `scripts/check-unsafe.sh`, which checks both that each crate root has the
+  `forbid` attribute and that the `unsafe` keyword appears nowhere in our
+  sources. Prose mentioning the word in comments does not trip it.
+- `.github/workflows/ci.yml` with three jobs: `checks` (fmt, clippy, unsafe
+  guard, once on Linux), `test` (test and release build across all three
+  operating systems), and `msrv` (checks the declared `rust-version` really
+  builds).
+
+**Known issue for Phase 2.** The declared minimum Rust version is `1.78`, which
+is fine for the current dependency-free code. `egui` and `eframe` need a much
+newer compiler, so the `msrv` CI job **will fail** when they are added. That is
+the job doing its work. Raise `rust-version` in the root `Cargo.toml` to
+whatever the new dependencies require, and say so in the commit message.
 
 ---
 
@@ -622,7 +666,9 @@ every later phase starts from a green build.
 
 ### Steps
 
-1. Work in `crates/fits-core`, created in Phase 0.
+1. Work in `crates/fits-core`, created in Phase 0. The crate currently holds
+   only the block-size constants and `block_align`; build the reader around
+   those rather than redefining them.
 2. Add dependencies: `rayon`, `thiserror`. Add `#![forbid(unsafe_code)]` to `lib.rs`. Dev-deps: `tempfile`, `criterion`, `proptest`, `approx`.
 3. Implement `header.rs`:
    - Read 2880-byte blocks. Split each into 36 cards of 80 bytes.
