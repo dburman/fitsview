@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.orig
+*.pdb
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Test / scratch data
+*.fits
+!tests/data/*.fits
