@@ -36,10 +36,15 @@ pub fn show(ui: &mut Ui, model: &mut Model, texture: Option<&TextureHandle>) -> 
                     );
                 }
                 _ => {
+                    let message = if model.loading {
+                        "Loading…"
+                    } else {
+                        "Drop a FITS file or folder here, or use Open File…"
+                    };
                     ui.painter().text(
                         viewport.center(),
                         Align2::CENTER_CENTER,
-                        "Drop a FITS file here, or use Open File…",
+                        message,
                         FontId::proportional(16.0),
                         Color32::from_gray(140),
                     );

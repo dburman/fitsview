@@ -13,14 +13,14 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phases 0, 1 and 2 complete. Phase 3 is next.
+**Status:** Phases 0 to 3 complete. Phase 4 is next.
 
 | Phase | State |
 |-------|-------|
 | 0 — Bootstrap | Done |
 | 1 — FITS reader | Done |
 | 2 — Minimal viewer | Done |
-| 3 — Folder browsing | Not started |
+| 3 — Folder browsing | Done |
 | 4 — Delete, rename, flag | Not started |
 | 5 — Stretch | Not started |
 | 6 — Dark calibration | Not started |
@@ -323,18 +323,20 @@ fitsview/
 │       │   ├── app.rs      # Model, Action, Loaded: state and its rules
 │       │   ├── view.rs     # ViewState: zoom and pan arithmetic
 │       │   ├── texture.rs  # f32 image -> egui texture, flip, downsample
-│       │   ├── folder.rs   # Phase 3: folder scanning + file list model
-│       │   ├── loader.rs   # Phase 3: background loading thread + cache
+│       │   ├── folder.rs   # folder scanning, file list, selection
+│       │   ├── loader.rs   # worker thread, bounded LRU cache, prefetch
+│       │   ├── natsort.rs  # light_2 sorts before light_10
 │       │   ├── actions.rs  # Phase 4: delete / rename / flag logic
 │       │   └── ui/
 │       │       ├── mod.rs      # FitsViewApp, texture cache
 │       │       ├── input.rs    # raw input -> Action, tested directly
 │       │       ├── toolbar.rs
 │       │       ├── viewer.rs
-│       │       ├── filelist.rs # Phase 3
+│       │       ├── filelist.rs
 │       │       └── dialogs.rs  # Phase 4
 │       └── tests/
-│           └── rendering.rs    # end-to-end: file on disk -> texture
+│           ├── rendering.rs    # end-to-end: file on disk -> texture
+│           └── navigation.rs   # measured: no interface stall, bounded memory
 ├── docs/
 │   └── manual-tests.md     # per-phase manual test checklist for UI-only criteria
 ├── scripts/
@@ -619,7 +621,8 @@ Every test that needs a file uses these. No binary fixtures are committed.
 | `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, flat normalises to mean 1.0, near-zero gain becomes NaN and is counted, dark is subtracted before the flat divides, all dark and flat combinations. |
 | `folder.rs` | integration (tempdir) | Filters extensions, skips hidden, natural sort, sidecar round-trip. |
 | `actions.rs` | integration (tempdir) | Rename rules, flag toggle persists, delete calls trash (mock via trait `FileOps` so tests don't touch the real trash). |
-| `loader.rs` | unit | LRU eviction by count and bytes, stale generation dropped, prefetch order. |
+| `loader.rs` | unit | LRU eviction by count and bytes, recently used entries survive, an oversized image is still kept, stale results dropped after a folder change, the queue is replaced rather than appended to, failures reported and not cached. |
+| `natsort.rs` | unit | Numeric ordering, leading zeros, case insensitivity, overlong digit runs, and that the comparator is a valid total order. |
 | `texture.rs` | unit | Vertical flip applied exactly once, downsample factor selection, NaN maps to black. |
 | `app.rs` model | unit | Keyboard actions mutate `Model` correctly: next/prev at ends, delete advances selection, flagged delete requires confirm state. |
 | UI files | manual | `docs/manual-tests.md` checklist per phase. |
@@ -927,12 +930,73 @@ correctly, and along its top edge if the vertical flip has been lost.
 7. Watch for external changes: **not required**. Add a `Rescan` button (key `F5`) instead.
 
 ### Acceptance criteria
-- [ ] Folder with mixed files shows only `.fits/.fit/.fts`.
-- [ ] Pressing `→` repeatedly through 50 files of 24 MP never stalls the UI thread (measure: frame time stays under 20 ms; loading happens off-thread).
-- [ ] Memory stays bounded (verify with a 200-file folder).
-- [ ] Natural sort order is correct (unit test with `light_2`, `light_10`, `Light_1`).
-- [ ] `loader::Cache` unit tests: eviction by count, eviction by bytes, stale generation dropped, prefetch order `i, i+1, i-1`.
-- [ ] `scan_folder` integration test on a tempdir with mixed files.
+- [x] Folder with mixed files shows only `.fits/.fit/.fts`.
+- [x] Stepping through a folder never stalls the interface. Measured in
+      `tests/navigation.rs`: the slowest single step is asserted under 16 ms,
+      one frame at 60 fps, across 40 files and again across full-frame 24 MP
+      images. See the note below on what was and was not measured.
+- [x] Memory stays bounded, verified with a 200-file folder: peak cache
+      occupancy is asserted against the entry bound and against a quarter of
+      what holding the whole folder would cost.
+- [x] Natural sort order is correct.
+- [x] `loader::Cache` unit tests: eviction by count, eviction by bytes, stale
+      results dropped, prefetch order.
+- [x] `scan_folder` integration test on a tempdir with mixed files.
+
+### What Phase 3 actually produced
+
+210 tests pass across the workspace, up from 145.
+
+**Loading moved off the interface thread, which changed the shape of the model.**
+Opening a path no longer produces an image by the time the call returns. The
+model gains `poll`, called once per frame, which collects finished work. Every
+test that opens a file now waits for it. This is the change that makes holding
+down the arrow key usable, and it is worth understanding before touching
+`app.rs`.
+
+**The queue is replaced, not appended to.** When the selection moves, the loader
+hands the worker the complete list of what is now wanted, so work nobody wants
+any more is dropped before it starts. Without this, jumping to the end of a
+folder would wait for every file in between. A test asserts that jump completes
+in about the time of a single decode.
+
+**A bug worth recording, because the fix is not obvious.** The first version of
+`Loader::request` skipped paths that were already in flight, then replaced the
+queue, which cancelled those very paths. A file requested twice in quick
+succession was therefore never loaded at all. The fix is that the loader tracks
+which single path the worker has actually started, shared through the queue
+mutex. Only that one path is skipped; everything else is re-queued. A test
+covers the case.
+
+**A second bug, in the test helper rather than the code.** The helper polled the
+loader before running the predicate, so a predicate that also polled saw
+nothing and timed out. Helpers that consume state need the same scrutiny as the
+code they test.
+
+**Decisions worth knowing:**
+
+- Opening a single file also opens its folder, so the arrow keys work at once.
+- Selection stops at both ends rather than wrapping. Wrapping while holding a
+  key silently starts a second pass through the folder.
+- Prefetch order is the selection, then the next file, then the previous one.
+  Culling runs forwards, so the next file is much more likely to be wanted.
+- Rescan keeps the selection on the same file if it still exists, and otherwise
+  on the same position in the list, which is what deleting a file should feel
+  like in Phase 4.
+- A failed prefetch is silent. Only a failure on the file being looked at is
+  reported, otherwise a corrupt file two positions ahead would interrupt.
+- Natural sort is written here rather than taken from a crate, because the
+  behaviour needed is specific: case-insensitive, a true total order so sorting
+  is deterministic, and safe for digit runs longer than any integer type. A
+  test checks reflexivity, antisymmetry and transitivity directly, since an
+  inconsistent comparator makes `sort_by` panic.
+
+**What was not measured.** The plan asked for 50 files of 24 megapixels. The
+automated test uses 40 files at 1 megapixel plus 4 at 24 megapixels, because
+50 full frames is 2.4 GB of temporary files. The property under test, that the
+interface thread never decodes, does not depend on the count. Frame timing
+inside a running window has still never been sampled; the tests measure the
+model, not the renderer.
 
 ---
 

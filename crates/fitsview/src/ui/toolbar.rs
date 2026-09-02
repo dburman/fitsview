@@ -20,10 +20,43 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 }
             }
 
-            // Folder browsing arrives in Phase 3. Showing the control disabled
-            // keeps the shape of the interface stable between phases.
-            ui.add_enabled(false, Button::new("Open Folder…"))
-                .on_disabled_hover_text("Folder browsing arrives in a later phase");
+            if ui
+                .button("Open Folder…")
+                .on_hover_text("Browse every FITS image in a folder")
+                .clicked()
+            {
+                if let Some(dir) = pick_folder() {
+                    actions.push(Action::Open(dir));
+                }
+            }
+
+            ui.separator();
+
+            let has_folder = model.folder.is_some();
+            if ui
+                .add_enabled(has_folder, Button::new("◀"))
+                .on_hover_text("Previous file (Left arrow)")
+                .clicked()
+            {
+                actions.push(Action::PreviousFile);
+            }
+            if ui
+                .add_enabled(has_folder, Button::new("▶"))
+                .on_hover_text("Next file (Right arrow, or Space)")
+                .clicked()
+            {
+                actions.push(Action::NextFile);
+            }
+            if has_folder {
+                ui.label(model.position_label());
+            }
+            if ui
+                .add_enabled(has_folder, Button::new("Rescan"))
+                .on_hover_text("Re-read the folder from disk (F5)")
+                .clicked()
+            {
+                actions.push(Action::Rescan);
+            }
 
             ui.separator();
 
@@ -59,6 +92,13 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
     });
 
     actions
+}
+
+/// Asks the operating system for a folder to browse.
+fn pick_folder() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Open a folder of FITS images")
+        .pick_folder()
 }
 
 /// Asks the operating system for a file to open.

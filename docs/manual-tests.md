@@ -70,11 +70,28 @@ at the keyboard, and the whole list needs running on Linux and Windows.
 
 ## Phase 3 — Folder browsing
 
-- [ ] `Open Folder…` lists only FITS files; other files are absent.
-- [ ] Holding the right arrow key scrolls through 50 large files without the
-      window becoming unresponsive.
-- [ ] The counter reads `n / total` and tracks selection.
-- [ ] `F5` picks up a file added to the folder from outside the app.
+```
+cargo run --release --package fitsview -- /tmp/fitsview-samples
+```
+
+- [ ] `Open Folder…` lists only FITS files; `notes.txt` is absent.
+- [ ] The list is in natural order: `light_1`, `light_2`, `light_10`, not
+      `light_1`, `light_10`, `light_2`.
+- [ ] Clicking a row in the list shows that image.
+- [ ] Arrow keys, Space, Page Up and Page Down move through the list, and stop
+      at both ends rather than wrapping.
+- [ ] Home and End jump to the first and last file.
+- [ ] Holding the right arrow key through a folder of large files leaves the
+      window responsive, with no beachball or freeze.
+- [ ] Stepping back to a file just visited is instant, with no visible reload.
+- [ ] The counter reads `n / total` and tracks the selection.
+- [ ] `F5` picks up a file added to the folder from outside the application.
+- [ ] Dropping a folder on the window opens it.
+
+Automated coverage: `crates/fitsview/tests/navigation.rs` asserts that no single
+step takes more than one frame at 60 fps, and that cache memory stays bounded
+across a 200-file folder. The boxes above are about how it feels on real
+hardware, which those tests cannot judge.
 
 ---
 

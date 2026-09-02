@@ -4,6 +4,9 @@
 //! opening a window:
 //!
 //! - [`app`] holds the state and every rule that changes it.
+//! - [`folder`] is the file list and the selection within it.
+//! - [`loader`] decodes images on a worker thread and caches the results.
+//! - [`natsort`] orders file names so `light_2` comes before `light_10`.
 //! - [`view`] is the zoom and pan arithmetic.
 //! - [`texture`] converts decoded samples into something the GPU can draw,
 //!   including the vertical flip FITS requires.
@@ -17,6 +20,9 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod folder;
+pub mod loader;
+pub mod natsort;
 pub mod texture;
 pub mod ui;
 pub mod view;

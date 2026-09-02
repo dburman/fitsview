@@ -11,6 +11,23 @@ use fits_core::read_fits;
 use fits_core::testutil::{gaussian_background, write_synthetic, SyntheticSpec};
 use fitsview::app::{Action, Model};
 use fitsview::texture::{self, Mapping};
+use std::time::{Duration, Instant};
+
+/// Pumps the model until the selected image is on screen.
+///
+/// Loading moved to a worker thread in Phase 3, so opening a path no longer
+/// produces an image by the time `handle` returns.
+fn settle(model: &mut Model) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        model.poll();
+        if !model.loading && (model.loaded.is_some() || model.error.is_some()) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("image never arrived");
+}
 
 /// Average brightness of one texture row.
 fn row_brightness(image: &egui::ColorImage, y: usize) -> f64 {
@@ -131,6 +148,7 @@ fn opening_a_real_file_through_the_model_produces_a_drawable_texture() {
 
     let mut model = Model::new();
     model.handle(Action::Open(path));
+    settle(&mut model);
 
     let loaded = model.loaded.as_ref().expect("should have loaded");
     let rendered = render(&loaded.image);

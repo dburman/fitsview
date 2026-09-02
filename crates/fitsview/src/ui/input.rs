@@ -45,6 +45,14 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
 
     for key in &frame.keys {
         match key {
+            // Navigation. Space steps forward because culling is a
+            // one-hand-on-the-keyboard job.
+            Key::ArrowRight | Key::Space | Key::PageDown => out.push(Action::NextFile),
+            Key::ArrowLeft | Key::PageUp => out.push(Action::PreviousFile),
+            Key::Home => out.push(Action::FirstFile),
+            Key::End => out.push(Action::LastFile),
+            Key::F5 => out.push(Action::Rescan),
+            // View.
             Key::F => out.push(Action::FitToWindow),
             Key::Num1 => out.push(Action::ActualSize),
             Key::Escape => out.push(Action::ClearError),
@@ -111,10 +119,42 @@ mod tests {
     #[test]
     fn unmapped_keys_do_nothing() {
         let f = Frame {
-            keys: vec![Key::Q, Key::Z, Key::Space],
+            keys: vec![Key::Q, Key::Z, Key::W],
             ..frame()
         };
         assert!(actions_for(&f).is_empty());
+    }
+
+    #[test]
+    fn every_navigation_key_maps_to_its_action() {
+        let cases = [
+            (Key::ArrowRight, Action::NextFile),
+            (Key::Space, Action::NextFile),
+            (Key::PageDown, Action::NextFile),
+            (Key::ArrowLeft, Action::PreviousFile),
+            (Key::PageUp, Action::PreviousFile),
+            (Key::Home, Action::FirstFile),
+            (Key::End, Action::LastFile),
+            (Key::F5, Action::Rescan),
+        ];
+        for (key, expected) in cases {
+            let f = Frame {
+                keys: vec![key],
+                ..frame()
+            };
+            assert_eq!(actions_for(&f), vec![expected], "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn holding_a_navigation_key_produces_one_action_per_reported_press() {
+        // The event collector filters out auto-repeat, so several presses in a
+        // frame means the user really pressed it several times.
+        let f = Frame {
+            keys: vec![Key::ArrowRight, Key::ArrowRight, Key::ArrowRight],
+            ..frame()
+        };
+        assert_eq!(actions_for(&f).len(), 3);
     }
 
     #[test]

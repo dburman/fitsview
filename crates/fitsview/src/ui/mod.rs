@@ -5,6 +5,7 @@
 //! carries few tests of its own: the behaviour worth testing lives in
 //! [`crate::app`], [`crate::view`], [`crate::texture`] and [`input`].
 
+mod filelist;
 pub mod input;
 mod toolbar;
 mod viewer;
@@ -80,7 +81,22 @@ impl FitsViewApp {
 
 impl eframe::App for FitsViewApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // Collect anything the worker finished since the last frame. Painting
+        // continues either way; this never blocks.
+        if self.model.poll() {
+            ui.ctx().request_repaint();
+        }
+        // While a decode is outstanding, keep asking for frames so the result
+        // appears as soon as it lands rather than on the next input event.
+        if self.model.loading {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
         for action in toolbar::show(ui, &self.model) {
+            self.model.handle(action);
+        }
+        for action in filelist::show(ui, &self.model) {
             self.model.handle(action);
         }
 
