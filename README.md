@@ -24,7 +24,7 @@ criteria all pass.
 | 4 — Delete, rename, flag | Not started |
 | 5 — Stretch | Not started |
 | 6 — Dark calibration | Not started |
-| 7 — Bias calibration | Not started |
+| 7 — Flat calibration | Not started |
 | 8 — Packaging | Not started |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 8
@@ -39,7 +39,7 @@ deliver the features below.
 | d | Flag images to "keep". Flagged files need extra confirmation before deletion. | 4 |
 | e | Button to apply a standard astro stretch to all viewed images; can be turned off. | 5 |
 | f | Dark-frame calibration applied to all files in the folder. | 6 |
-| g | Bias-frame calibration applied to all files in the folder. | 7 |
+| g | Flat-frame calibration applied to all files in the folder. | 7 |
 
 ---
 
@@ -98,14 +98,14 @@ Format the question as a short list: **what you want to do, why, the alternative
 
 ```mermaid
 flowchart TB
-    subgraph UI["UI layer (crate fitsview, egui) — no business logic"]
+    subgraph UI["UI layer: egui, no business logic"]
         TB[toolbar.rs]
         FL[filelist.rs]
         VW[viewer.rs]
         DG[dialogs.rs<br/>rename / confirm / help / calibration]
     end
 
-    subgraph MODEL["Application model (crate fitsview) — pure state, fully unit-tested"]
+    subgraph MODEL["Application model: pure state, unit tested"]
         APP[app.rs<br/>Model: selection, view state,<br/>toggles, toasts]
         FO[folder.rs<br/>Folder, FileEntry, scan, natural sort]
         AC[actions.rs<br/>delete / rename / flag / sidecar]
@@ -113,12 +113,12 @@ flowchart TB
         TX[texture.rs<br/>f32 → ColorImage → TextureHandle]
     end
 
-    subgraph CORE["fits-core (library) — no GUI deps, #![forbid(unsafe_code)]"]
+    subgraph CORE["fits-core library: no GUI dependencies, no unsafe"]
         HD[header.rs]
         RD[reader.rs<br/>read_fits / write_fits]
         IM[image.rs<br/>FitsImage, pixel conversion]
         ST[stretch.rs<br/>MTF auto-stretch, LUT]
-        CB[calib.rs<br/>master median, dark/bias subtract]
+        CB[calib.rs<br/>master median, dark subtract, flat divide]
         TU[testutil.rs<br/>synthetic FITS generator]
     end
 
@@ -163,17 +163,17 @@ Caches sit at three points, all bounded LRU keyed by path:
 
 ```mermaid
 sequenceDiagram
-    participant UI as UI thread (egui update loop)
-    participant LW as Loader worker thread
-    participant EW as Export worker thread (Phase 6+)
+    participant UI as UI thread
+    participant LW as Loader worker
+    participant EW as Export worker
 
-    UI->>LW: Request{path, generation} via mpsc::Sender
-    Note over LW: fs::read → parse → convert (rayon pool)
-    LW-->>UI: Response{path, generation, Result<Arc<FitsImage>>}
-    Note over UI: poll() with try_recv each frame; request_repaint on arrival
-    UI->>LW: Prefetch i+1, i-1
-    UI->>EW: ExportJob{files, masters, out_dir, cancel: Arc<AtomicBool>}
-    EW-->>UI: Progress{done, total} / Finished / Error
+    UI->>LW: Request with path and generation
+    Note over LW: read file, parse header, convert pixels on the rayon pool
+    LW-->>UI: Response with the decoded image or an error
+    Note over UI: poll with try_recv each frame, then request a repaint
+    UI->>LW: Prefetch the next and previous files
+    UI->>EW: Export job with files, masters, output folder and a cancel flag
+    EW-->>UI: Progress, then finished or failed
 ```
 
 Rules:
@@ -616,7 +616,7 @@ Every test that needs a file uses these. No binary fixtures are committed.
 | `image.rs` | unit + criterion | Every BITPIX, BZERO/BSCALE, u16 fast path equals the generic path, `finite_min_max` with NaN/inf present and with an all-NaN image, `BLANK` becomes NaN, 3-channel layout. |
 | `reader.rs` | unit + proptest | Truncated, NotFits, absurd NAXIS values do not overflow or allocate wildly, primary-empty-then-extension fallback, missing trailing padding tolerated. The `write_fits`→`read_fits` identity test arrives with `write_fits` itself in Phase 6. |
 | `stretch.rs` | unit | Median maps to `target_bg` within tolerance, LUT is monotonic non-decreasing, constant image does not divide by zero, all-NaN image does not panic, RGB per-channel. |
-| `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, all dark/bias/scale combinations. |
+| `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, flat normalises to mean 1.0, near-zero gain becomes NaN and is counted, dark is subtracted before the flat divides, all dark and flat combinations. |
 | `folder.rs` | integration (tempdir) | Filters extensions, skips hidden, natural sort, sidecar round-trip. |
 | `actions.rs` | integration (tempdir) | Rename rules, flag toggle persists, delete calls trash (mock via trait `FileOps` so tests don't touch the real trash). |
 | `loader.rs` | unit | LRU eviction by count and bytes, stale generation dropped, prefetch order. |
@@ -888,10 +888,15 @@ method taking `&mut Ui` rather than an `update` method taking `&Context`;
 `NativeOptions` no longer has a `vsync` field; and `raw_scroll_delta` is now
 `smooth_scroll_delta`.
 
-**Sample files for manual testing.** `cargo run --release --package fits-core
---all-features --example make-sample -- <dir>` writes an orientation test, a
-NaN test, a colour test and a non-FITS file. The orientation sample has a bright
-band along its bottom edge when displayed correctly.
+**Sample files for manual testing.** This writes an orientation test, a NaN
+test, a colour test and a non-FITS file into the directory you name:
+
+```bash
+cargo run --release --package fits-core --all-features --example make-sample -- /tmp/fitsview-samples
+```
+
+The orientation sample has a bright band along its bottom edge when displayed
+correctly, and along its top edge if the vertical flip has been lost.
 
 ---
 
@@ -972,6 +977,8 @@ band along its bottom edge when displayed correctly.
 | `F2` | Rename |
 | `Ctrl+Z` | Undo last delete (where supported) |
 | `S` | Toggle stretch (Phase 5) |
+| `D` | Toggle dark calibration (Phase 6) |
+| `Shift+F` | Toggle flat calibration (Phase 7) |
 | `F` / `1` | Fit / 100 % zoom |
 | `F5` | Rescan folder |
 | `?` | Help |
@@ -1110,7 +1117,7 @@ pub fn write_fits(path: &Path, img: &FitsImage) -> Result<(), FitsError>; // BIT
 
 1. New collapsible right-side panel `Calibration`.
 2. `Add darks…` (multi-file dialog) → shows list with count, dimension, EXPTIME; `Build master` button; `Load master…`; `Save master…`; `Clear`.
-3. Toggle `Apply dark` (key `D`). When on, the display pipeline becomes: load → subtract master dark → (stretch) → texture. Cache calibrated images separately (`HashMap<PathBuf, Arc<FitsImage>>`) with the same size bound.
+3. Toggle `Apply dark`, on `D`. When on, the display pipeline becomes: load → subtract master dark → (stretch) → texture. Cache calibrated images separately (`HashMap<PathBuf, Arc<FitsImage>>`) with the same size bound.
 4. Mismatch (dimensions) → toggle is disabled and a red message explains why.
 5. `Export calibrated…` → choose output folder → writes `<name>_cal.fits` for every file in the folder, using a background thread with a progress bar and cancel button. Never overwrites originals.
 
@@ -1123,31 +1130,147 @@ pub fn write_fits(path: &Path, img: &FitsImage) -> Result<(), FitsError>; // BIT
 
 ---
 
-## Phase 7 — Bias-Frame Calibration
+## Phase 7 — Flat-Frame Calibration
 
-**Goal:** Same workflow as Phase 6 for bias frames, and correct ordering when both are used.
+**Goal:** Divide out the optical system's response, and get the calibration
+order right when darks and flats are both in play.
+
+Flats correct a different and more visible problem than darks do. A dark
+removes signal the sensor adds; a flat removes *variation in sensitivity*
+across the frame. Without one, images show vignetting, a bright centre falling
+off to dark corners, and dark rings from dust on the sensor window. Those
+artefacts survive stacking and are what makes an image look amateurish, so flats
+usually matter more to the final picture than darks do.
 
 ### Concepts
-- A **bias** is a zero-length (shortest possible) exposure. It captures the sensor read offset.
-- **Master bias** = pixel-wise median of N biases (reuse `build_master_median`).
-- If you have a **master dark that already contains bias** (which is the normal case for an un-scaled dark subtraction), you should **not** also subtract bias. So the rules are:
-  - Bias only: `light - master_bias`.
-  - Dark only: `light - master_dark`.
-  - Both: `light - master_dark` (dark already includes bias). Show an info message: "Bias not subtracted separately because a dark is applied." Only if the user enables `Scale dark` (optional feature, see below) does bias get used: `light - bias - k * (dark - bias)`.
-- Optional `Scale dark` (dark optimisation): `k = EXPTIME_light / EXPTIME_dark`. Implement only if `EXPTIME` is available in both headers; otherwise disabled.
 
-### Implementation
+- A **flat** is an exposure of an evenly illuminated surface, taken through the
+  same optical train, at the same focus and rotation, as the lights. It records
+  vignetting, dust shadows and pixel-to-pixel sensitivity differences all at once.
+- **A flat must itself be calibrated before use.** Flats are short exposures, so
+  they carry the sensor's read offset. Subtract either a **flat dark**, a dark of
+  the same exposure and temperature as the flats, or a **bias**, the shortest
+  exposure the camera can take. A flat dark is the better choice and is what this
+  plan supports; a bias frame works in the same slot, since the code cannot tell
+  them apart and does not need to.
+- **Master flat** = pixel-wise median of the calibrated flats, then **normalised
+  by its own mean** so the average pixel is 1.0. That turns it into a gain map:
+  multiplying by it changes brightness, dividing by it removes the variation
+  while leaving overall brightness alone.
+- **The full calibration, in order:**
 
-1. Add `pub fn subtract_bias(light, bias) -> FitsImage` (identical to `subtract_dark`; factor out a shared `subtract_frame`).
-2. Add `pub fn calibrate(light, dark: Option<&MasterFrame>, bias: Option<&MasterFrame>, scale_dark: bool) -> Result<FitsImage>` implementing the rules above. This is the single entry point the UI calls.
-3. UI: in the `Calibration` panel add a `Bias` section mirroring `Darks` (`Add biases…`, `Build master`, `Load/Save master`, `Apply bias` toggle, key `B`), plus `Scale dark` checkbox.
-4. Export uses `calibrate` and writes `HISTORY` cards describing what was applied.
-5. Persist last-used master dark/bias paths per folder in the `.fitsview.json` sidecar so reopening a folder restores the calibration setup.
+  ```text
+  master_dark  = median(darks)
+  master_flat  = median(flats) - median(flat_darks)
+  gain         = master_flat / mean(master_flat)     # average pixel is 1.0
+  calibrated   = (light - master_dark) / gain
+  ```
+
+  **Subtraction before division, always.** Dividing first would scale the dark
+  signal by the gain map and smear it across the frame in a way nothing later
+  can undo.
+
+- **Dividing by near-zero is the trap.** A heavily vignetted corner, or a flat
+  taken with the lens cap on by mistake, produces gain values near zero, and
+  dividing by them turns read noise into enormous bright pixels. Any gain below
+  a floor is treated as having no usable data and its pixel becomes `NaN`, which
+  the display already renders black and every statistic already skips. Report
+  how many pixels this affected: a large count means the flats are wrong, and
+  the user needs to know that rather than wonder about the speckles.
+- **Colour images are normalised by a single global mean**, not per channel.
+  Normalising each plane separately would divide out the camera's colour
+  response along with the vignetting, leaving a grey image.
+- Flats must match the lights in dimensions. Matching filter, focus and rotation
+  matters just as much physically, but nothing in the header reliably records it,
+  so that stays the user's responsibility.
+
+### Implementation in `fits-core/src/calib.rs`
+
+```rust
+/// A master flat, already normalised so its mean is 1.0.
+pub struct MasterFlat {
+    pub width: usize,
+    pub height: usize,
+    pub channels: usize,
+    /// Gain per pixel, centred on 1.0.
+    pub gain: Vec<f32>,
+    /// How many frames were combined.
+    pub source_count: usize,
+    /// Pixels whose gain fell below `MIN_GAIN` and will produce NaN.
+    pub unusable: usize,
+}
+
+/// Gain below this is treated as no data. Chosen so a corner at 5 % of centre
+/// brightness still calibrates, while a near-black flat does not explode.
+pub const MIN_GAIN: f32 = 0.01;
+
+/// Builds a master flat: median-combine, subtract the flat dark, normalise.
+pub fn build_master_flat(
+    flats: &[Arc<FitsImage>],
+    flat_dark: Option<&MasterFrame>,
+) -> Result<MasterFlat, CalibError>;
+
+/// The one entry point the UI calls. Applies dark then flat, in that order.
+pub fn calibrate(
+    light: &FitsImage,
+    dark: Option<&MasterFrame>,
+    flat: Option<&MasterFlat>,
+) -> Result<FitsImage, CalibError>;
+```
+
+1. Reuse `build_master_median` from Phase 6 for the median combine.
+2. Normalise by the mean of the **finite** values only, and refuse a flat whose
+   mean is not positive: that means the frames were blank, and every pixel would
+   become `NaN`.
+3. In `calibrate`, subtract the dark first and clamp at zero, then divide by the
+   gain. Parallelise with `rayon` over the same chunking the conversion path uses.
+4. Write `HISTORY` cards recording what was applied, including the frame counts,
+   so a calibrated file says how it was made.
+
+### UI
+
+1. Extend the `Calibration` panel from Phase 6 with a `Flats` section that
+   mirrors `Darks`: `Add flats…`, `Add flat darks…`, `Build master`,
+   `Load master…`, `Save master…`, `Clear`.
+2. Toggle `Apply flat`, on `Shift+F`. Plain `F` already fits the image to the
+   window, and stealing it would be worse than a two-key shortcut.
+3. When a master flat is built, show its frame count and, if any pixels fell
+   below `MIN_GAIN`, a warning naming the count.
+4. A dimension mismatch disables the toggle and explains why, exactly as darks do.
+5. `Export calibrated…` runs `calibrate`, so it picks up flats with no further
+   work.
+6. Persist the master dark, flat and flat-dark paths per folder in the
+   `.fitsview.json` sidecar, so reopening a folder restores the setup.
 
 ### Acceptance criteria
-- [ ] Unit tests for all four combinations (none / dark / bias / both) and for `scale_dark`.
-- [ ] Info message appears when both are enabled without `Scale dark`.
+
+- [ ] Unit test: a master flat built from frames with a known gradient normalises
+      to a mean of 1.0.
+- [ ] Unit test: dividing a light by a synthetic flat with known vignetting
+      recovers a flat field, to within floating-point tolerance.
+- [ ] Unit test: calibration order. A light with both a dark offset and a gain
+      pattern is recovered correctly only when the dark is subtracted first.
+      Assert that dividing first gives a measurably different, wrong answer.
+- [ ] Unit test: gain below `MIN_GAIN` produces `NaN`, is counted in `unusable`,
+      and does not produce an infinity.
+- [ ] Unit test: a flat whose mean is zero or negative is refused with an error
+      rather than producing an all-`NaN` image.
+- [ ] Unit test: an RGB flat is normalised by one global mean, so a colour cast
+      in the flat is preserved rather than divided away.
+- [ ] Unit test: all four combinations of dark and flat, present or absent.
 - [ ] Sidecar restores calibration paths on reopen.
+- [ ] Applying dark and flat to a 24 MP image adds under 100 ms per image.
+
+### Note on bias frames
+
+An earlier version of this plan gave bias frames their own phase. Flats replace
+it deliberately. A bias is only useful in two situations: calibrating flats,
+which is covered above by the flat-dark slot, and scaling darks to a different
+exposure time, which is a refinement that matters far less than removing
+vignetting. Bias frames work wherever a flat dark is asked for, because the code
+treats both as "the frame to subtract from the flats" and does not inspect the
+exposure time. If dark scaling is wanted later, it belongs in its own phase
+after this one.
 
 ---
 
@@ -1189,4 +1312,4 @@ pub fn write_fits(path: &Path, img: &FitsImage) -> Result<(), FitsError>; // BIT
 - [ ] Images display right way up, and files containing NaN pixels render correctly.
 - [ ] Manual test with real files from at least two capture programs (e.g. N.I.N.A. and ASIAIR/ZWO) — both 16-bit `BZERO=32768` and 32-bit float.
 - [ ] A 24 MP file opens and displays in well under one second on a warm cache.
-- [ ] Delete / rename / flag / stretch / dark / bias all work from keyboard alone.
+- [ ] Delete / rename / flag / stretch / dark / flat all work from keyboard alone.

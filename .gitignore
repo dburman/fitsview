@@ -15,3 +15,8 @@ Cargo.lock.orig
 # Test / scratch data
 *.fits
 !tests/data/*.fits
+
+# Node, used only by the documentation diagram check
+node_modules/
+package-lock.json
+package.json

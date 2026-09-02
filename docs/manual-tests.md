@@ -110,10 +110,19 @@ at the keyboard, and the whole list needs running on Linux and Windows.
 
 ---
 
-## Phase 7 — Bias calibration
+## Phase 7 — Flat calibration
 
-- [ ] Enabling bias and dark together shows the explanatory message.
-- [ ] `Scale dark` is disabled when exposure times are missing from headers.
+- [ ] A master flat built from real flats shows the expected vignetting pattern:
+      bright centre, darker corners.
+- [ ] Applying the flat visibly evens out corner brightness and removes dust
+      shadows.
+- [ ] Applying dark and flat together looks right. Dividing before subtracting
+      would smear the dark signal across the frame, which shows as an uneven
+      background that the stretch exaggerates.
+- [ ] A deliberately bad flat, for example one taken with the lens cap on,
+      produces a warning naming the number of unusable pixels rather than an
+      image full of bright speckles.
+- [ ] A colour flat does not turn the image grey.
 - [ ] Calibration settings are restored when the folder is reopened.
 
 ---

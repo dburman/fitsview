@@ -54,6 +54,21 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+  # A mermaid diagram that fails to parse renders on GitHub as "Unable to
+  # render rich display", which is invisible when editing locally.
+  docs:
+    name: Documentation diagrams
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install the mermaid parser
+        run: npm install --no-save mermaid@11 jsdom
+      - name: Check mermaid diagrams
+        run: node scripts/check-mermaid.mjs README.md docs/*.md
+
   # The minimum supported Rust version declared in Cargo.toml must actually
   # build, otherwise the claim is decoration.
   msrv:
