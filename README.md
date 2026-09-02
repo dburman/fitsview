@@ -3,15 +3,17 @@
 `fitsview` is a fast, cross-platform (Linux, macOS, Windows) desktop viewer for FITS
 files used in astrophotography. It is written in Rust.
 
-This README is an **execution plan**. It is written so that a developer (or an AI
-coding model) can pick it up and build the application phase by phase without
-needing additional context. Work through the phases **in order**. Each phase ends
-with a checklist of acceptance criteria. Do not begin the next phase until the
-current phase's criteria all pass.
+This README is an **execution plan**. It is self-contained: a developer can pick it
+up and build the application phase by phase without needing additional context.
+Work through the phases **in order**. Each phase ends with a checklist of
+acceptance criteria. Do not begin the next phase until the current phase's
+criteria all pass.
 
 ---
 
 ## 0. Product Summary
+
+Phase 0 is project bootstrap. Phases 1 through 8 deliver the features below.
 
 | # | Requirement | Phase |
 |---|-------------|-------|
@@ -35,19 +37,19 @@ These rules apply to **every** phase. They override anything else in this docume
 - Put `#![forbid(unsafe_code)]` at the top of `lib.rs` and `main.rs` in **both** crates. The compiler will then refuse any `unsafe` block.
 - Do **not** use `memmap2`, raw pointer casts, `transmute`, `from_raw_parts`, or `bytemuck::cast_slice` in our code. Use the safe patterns in section 5.3 instead. They are fast enough.
 - Dependencies may contain their own audited `unsafe` (e.g. `wgpu`, `rayon`). That is acceptable. Prefer a crate that declares `#![forbid(unsafe_code)]` when two crates do the same job.
-- Run `cargo geiger` once per phase and record the result in the phase's PR/commit message.
-- If you believe a task is **impossible or unreasonably slow** without `unsafe`, **stop and ask the user** (see 1.2). Include: what you tried, a benchmark number for the safe version, and the expected gain. Do not write the `unsafe` code before asking.
+- The `forbid` attribute is the real guarantee; a CI step also greps the source for the word `unsafe`. `cargo geiger` gives a dependency-tree view and is nice to have, but it is unmaintained and may fail to build. Do not block a phase on it.
+- If you believe a task is **impossible or unreasonably slow** without `unsafe`, **stop and ask the maintainer** (see 1.2). Include: what you tried, a benchmark number for the safe version, and the expected gain. Do not write the `unsafe` code before asking.
 
 ### 1.2 Always ask before …
 
-Stop and ask the user (do not guess, do not proceed) before any of the following:
+Stop and ask the maintainer (do not guess, do not proceed) before any of the following:
 
 | Situation | What to say when asking |
 |-----------|-------------------------|
 | Using `unsafe` anywhere | Why, safe alternative tried, measured numbers. |
 | Adding a crate that is not in the library table (section 3) | Crate name, version, what it replaces, its `unsafe` status, download count. |
 | Changing the GUI framework, FITS reader strategy, or repo layout | What and why. |
-| Hard-deleting, overwriting, or moving any user file outside the documented behaviour (trash-only deletes, `_cal.fits` exports) | Exactly which files. |
+| Hard-deleting, overwriting, or moving any of the user's image files outside the documented behaviour (trash-only deletes, `_cal.fits` exports) | Exactly which files. |
 | Changing the sidecar `.fitsview.json` format after Phase 4 ships | Old and new schema, migration. |
 | Skipping or weakening a test, or marking a test `#[ignore]` | Which test and why. |
 | Deviating from a phase's acceptance criteria | Which criterion and why. |
@@ -70,7 +72,8 @@ Format the question as a short list: **what you want to do, why, the alternative
 - Read the whole phase before starting it. Read the FITS primer (section 4) before Phase 1.
 - Handle every error path with a typed error; never `unwrap()`/`expect()` on data that came from a file, a dialog, or the user.
 - Log timing for load, convert, stretch, texture upload with `log::debug!` so performance regressions are visible.
-- When a phase is done, write a short summary: what was built, what tests exist, `cargo geiger` result, measured timings, and open questions.
+- When a phase is done, write a short summary: what was built, what tests exist, measured timings, and open questions.
+- One commit (or one pull request) per phase, with the phase number in the subject, e.g. `Phase 2: minimal viewer with zoom and pan`. Commit messages describe the change and nothing else: no tool, generator, or authorship footers.
 
 ---
 
@@ -198,16 +201,22 @@ Rules:
 
 ## 3. Suggested Libraries
 
-Pin the **major.minor** shown; use the latest patch. Do not add crates outside this table without asking (rule 1.2).
+Do not add crates outside this table without asking (rule 1.2).
+
+**On versions:** the numbers below were current when this plan was written. Before
+Phase 1, run `cargo add <crate>` for each one, let Cargo pick the current release,
+and record the versions you actually got in `Cargo.toml`. `egui`/`eframe` move
+fast and their `0.x` releases contain breaking changes, so take the newest `0.x`
+pair and keep them on the same version as each other. Commit `Cargo.lock`.
 
 ### 3.1 Runtime dependencies
 
 | Crate | Version | Used in | Purpose | `unsafe` notes | Alternative considered |
 |-------|---------|---------|---------|----------------|------------------------|
-| `eframe` | 0.29 | fitsview | Window, event loop, persistence (`Storage`), wgpu/glow backend. | Contains unsafe internally (GPU/OS bindings). Unavoidable for any GUI. | `iced` (less mature image viewer story), `tauri` (needs webview + JS), `slint` (licence). |
-| `egui` | 0.29 | fitsview | Immediate-mode widgets, `ColorImage`, `TextureHandle`. | Same as above. | — |
+| `eframe` | latest 0.x | fitsview | Window, event loop, persistence (`Storage`), wgpu/glow backend. | Contains unsafe internally (GPU/OS bindings). Unavoidable for any GUI. | `iced` (less mature image viewer story), `tauri` (needs webview + JS), `slint` (licence). |
+| `egui` | same as `eframe` | fitsview | Immediate-mode widgets, `ColorImage`, `TextureHandle`. | Same as above. | — |
 | `rayon` | 1.10 | both | Data-parallel pixel loops, parallel reduce for min/max. | Audited unsafe internally; API is safe. | `std::thread::scope` (more code, same result). |
-| `rfd` | 0.15 | fitsview | Native open-file / open-folder / message dialogs on all three OSes. | Wraps OS APIs. | `native-dialog` (fewer features). |
+| `rfd` | latest 0.x | fitsview | Native open-file / open-folder / message dialogs on all three OSes. | Wraps OS APIs. | `native-dialog` (fewer features). |
 | `trash` | 5 | fitsview | Move files to OS trash / recycle bin; restore where supported. | Wraps OS APIs. | `std::fs::remove_file` — rejected: permanent deletion. |
 | `serde` + `serde_json` | 1 | fitsview | Read/write `.fitsview.json` sidecar (flags, calibration paths). | `forbid(unsafe_code)` in serde_json. | Hand-rolled JSON — rejected. |
 | `natord` | 1.0 | fitsview | Natural sort (`light_2` before `light_10`). Tiny, no deps. | Pure safe Rust. | Hand-written comparator (fine too). |
@@ -253,7 +262,7 @@ Pin the **major.minor** shown; use the latest patch. Do not add crates outside t
 | FITS parsing | **Custom minimal reader** (see Phase 1) | Existing crates (`fitsio` needs a C library `cfitsio`; `fitrs` is unmaintained). A hand-written reader for the image subset of FITS is ~300 lines, has no C dependency, no `unsafe`, and is the fastest option. |
 | Image data type | `f32` per pixel, single or 3-channel | Covers BITPIX 8/16/32/-32/-64 after conversion; fast SIMD-friendly math. |
 | Parallelism | [`rayon`](https://crates.io/crates/rayon) | Parallel pixel conversion, stretch, and calibration. |
-| Async file I/O | `std::thread` + `std::sync::mpsc` | Keep it simple. Background thread loads files; UI thread never blocks. |
+| Concurrency | `std::thread` + `std::sync::mpsc` (no async runtime) | Keep it simple. A worker thread loads files; the UI thread never blocks. |
 | File I/O | `std::fs::read` into `Vec<u8>` | Safe, one allocation, fast enough (see 5.3). `memmap2` rejected because it needs `unsafe`. |
 | Byte order | `from_be_bytes` on fixed-size chunks | FITS data is always big-endian. No extra crate. |
 | Native dialogs | [`rfd`](https://crates.io/crates/rfd) | Cross-platform open-file / open-folder dialogs. |
@@ -263,8 +272,6 @@ Pin the **major.minor** shown; use the latest patch. Do not add crates outside t
 | Tests | `cargo test`, with small synthetic FITS files generated in code | No binary fixtures in repo. |
 
 **Do not add** other GUI frameworks, `tokio`, C-dependency crates, or anything using `unsafe` in our code (ask first, rule 1.2).
-
----
 
 ### 3.5 Repository Layout
 
@@ -278,11 +285,11 @@ fitsview/
 │   │   └── src/
 │   │       ├── lib.rs      # #![forbid(unsafe_code)]
 │   │       ├── header.rs   # FITS header parsing
-│   │       ├── testutil.rs # synthetic FITS generator (feature "test-util")
 │   │       ├── image.rs    # FitsImage struct + pixel conversion
-│   │       ├── reader.rs   # open file -> FitsImage
+│   │       ├── reader.rs   # read_fits / write_fits
 │   │       ├── stretch.rs  # Phase 5
-│   │       └── calib.rs    # Phase 6 & 7
+│   │       ├── calib.rs    # Phase 6 & 7
+│   │       └── testutil.rs # synthetic FITS generator (feature "test-util")
 │   └── fitsview/           # binary: the GUI app
 │       ├── Cargo.toml
 │       └── src/
@@ -325,11 +332,29 @@ extension instead; handle that as a fallback.
 
 **Data:**
 - Starts right after the padded header.
-- Big-endian.
+- Big-endian. Always, for every BITPIX.
 - `BITPIX` values: `8` (u8), `16` (i16), `32` (i32), `64` (i64), `-32` (f32), `-64` (f64).
 - Pixel count = `NAXIS1 * NAXIS2 * (NAXIS3 or 1)`. Row-major, `NAXIS1` is width.
 - Data section is also padded to a 2880-byte boundary.
 - If `NAXIS3 == 3` treat as RGB planes (plane-major: all R, then all G, then all B).
+
+**Row order (important, easy to get wrong):** FITS stores the **bottom** row of the
+image first. Screen coordinates put row 0 at the top. So the image must be flipped
+vertically for display, or it will appear upside down compared with every other
+viewer. Do the flip once, in `texture.rs`, when building the `ColorImage`; leave
+`FitsImage.data` in native FITS order so that calibration frames line up with
+lights without any flipping. Write a test that asserts the flip happens exactly
+once.
+
+**NaN and infinities:** `BITPIX = -32` and `-64` files can legitimately contain
+`NaN` (undefined pixels) and infinities. Every statistic (`min`, `max`, median,
+MAD, histogram) must skip non-finite values, and the display must map them to a
+fixed colour (use black). A single `NaN` reaching a naive `min`/`max` will make
+the whole image render blank, which is a confusing bug to chase later.
+
+**Integer blanks:** for integer BITPIX, the optional `BLANK` keyword names the
+value that means "no data". Treat it as `NaN` after conversion. Rare; handle it
+because it is two lines of code.
 
 **Detecting a FITS file:** first 6 bytes are `SIMPLE`, **and** extension is one
 of `.fits`, `.fit`, `.fts` (case-insensitive). Check the extension first (cheap),
@@ -377,6 +402,25 @@ pub enum FitsError {
 }
 
 pub fn read_fits(path: &std::path::Path) -> Result<FitsImage, FitsError>;
+
+/// Everything needed to decode the data block, validated once so the hot loop
+/// can assume it is correct.
+pub struct Geometry {
+    pub width: usize,
+    pub height: usize,
+    pub channels: usize,     // 1 or 3
+    pub bitpix: i64,         // one of 8, 16, 32, 64, -32, -64
+    pub bzero: f64,
+    pub bscale: f64,
+    pub blank_as_f32: Option<f32>, // BLANK keyword, integer BITPIX only
+}
+impl Geometry {
+    /// Rejects unsupported BITPIX, NAXIS outside 2..=3, zero or negative axis
+    /// lengths, and NAXIS3 that is neither 1 nor 3.
+    pub fn from_header(h: &FitsHeader) -> Result<Geometry, FitsError>;
+    pub fn pixel_count(&self) -> usize;      // width * height * channels
+    pub fn bytes_per_pixel(&self) -> usize;  // bitpix.unsigned_abs() / 8
+}
 ```
 
 ---
@@ -387,47 +431,105 @@ pub fn read_fits(path: &std::path::Path) -> Result<FitsImage, FitsError>;
 // reader.rs — no unsafe anywhere
 pub fn read_fits(path: &Path) -> Result<FitsImage, FitsError> {
     let t0 = std::time::Instant::now();
-    let bytes = std::fs::read(path)?;              // one allocation, one syscall loop; ~10–40 ms for 50 MB from page cache
-    if !bytes.starts_with(b"SIMPLE") { return Err(FitsError::NotFits); }
+    let bytes = std::fs::read(path)?;              // one allocation; ~10-40 ms for 50 MB from page cache
+    if !bytes.starts_with(b"SIMPLE") {
+        return Err(FitsError::NotFits);
+    }
     let (header, data_start) = header::parse(&bytes)?;
-    let geom = Geometry::from_header(&header)?;    // width, height, channels, bitpix, bzero, bscale
-    let n_bytes = geom.pixel_count() * geom.bytes_per_pixel();
-    let data = bytes.get(data_start..data_start + n_bytes).ok_or(FitsError::Truncated)?;
+    let geom = Geometry::from_header(&header)?;    // validates BITPIX and NAXIS; width, height, channels, bzero, bscale
+
+    // Checked arithmetic: NAXIS values come from the file and can be absurd.
+    let n_bytes = geom
+        .pixel_count()
+        .checked_mul(geom.bytes_per_pixel())
+        .ok_or(FitsError::Truncated)?;
+    let end = data_start.checked_add(n_bytes).ok_or(FitsError::Truncated)?;
+    let data = bytes.get(data_start..end).ok_or(FitsError::Truncated)?;
+
     let mut out = vec![0f32; geom.pixel_count()];
-    image::convert_pixels(geom.bitpix, data, geom.bzero, geom.bscale, &mut out); // rayon inside
-    let (min, max) = image::min_max(&out);         // rayon reduce
+    image::convert_pixels(&geom, data, &mut out);  // rayon inside
+    let (min, max) = image::finite_min_max(&out);  // rayon reduce, skips NaN/inf
     log::debug!("read_fits {:?} in {:?}", path.file_name(), t0.elapsed());
-    Ok(FitsImage { width: geom.width, height: geom.height, channels: geom.channels, data: out, header, min, max })
+    Ok(FitsImage { width: geom.width, height: geom.height, channels: geom.channels,
+                   data: out, header, min, max })
 }
 ```
 
 ```rust
-// image.rs — safe big-endian conversion, parallel
+// image.rs — safe big-endian conversion, parallel.
+// The BITPIX match is hoisted OUT of the pixel loop: branching per pixel costs
+// roughly 30 % here. Each arm is a tight, vectorisable loop.
 use rayon::prelude::*;
-pub fn convert_pixels(bitpix: i64, raw: &[u8], bzero: f64, bscale: f64, out: &mut [f32]) {
-    let bpp = (bitpix.unsigned_abs() / 8) as usize;
-    let fast_u16 = bitpix == 16 && bzero == 32768.0 && bscale == 1.0;
-    out.par_chunks_mut(65536)
-       .zip(raw.par_chunks(65536 * bpp))
-       .for_each(|(dst, src)| {
-           for (d, s) in dst.iter_mut().zip(src.chunks_exact(bpp)) {
-               *d = match bitpix {
-                   8   => s[0] as f32,
-                   16 if fast_u16 => (i16::from_be_bytes([s[0], s[1]]) as i32 + 32768) as f32,
-                   16  => i16::from_be_bytes([s[0], s[1]]) as f32,
-                   32  => i32::from_be_bytes([s[0], s[1], s[2], s[3]]) as f32,
-                   -32 => f32::from_be_bytes([s[0], s[1], s[2], s[3]]),
-                   -64 => f64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32,
-                   64  => i64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32,
-                   _   => unreachable!("validated by Geometry::from_header"),
-               };
-               if !fast_u16 && (bzero != 0.0 || bscale != 1.0) {
-                   *d = (bzero + bscale * (*d as f64)) as f32;
-               }
-           }
-       });
+
+const CHUNK: usize = 65_536; // pixels per rayon task
+
+pub fn convert_pixels(geom: &Geometry, raw: &[u8], out: &mut [f32]) {
+    let bpp = geom.bytes_per_pixel();
+    let (bzero, bscale) = (geom.bzero, geom.bscale);
+    // Unsigned-16 is the overwhelmingly common case from astro cameras.
+    let fast_u16 = geom.bitpix == 16 && bzero == 32768.0 && bscale == 1.0;
+    let scaled = !fast_u16 && (bzero != 0.0 || bscale != 1.0);
+
+    out.par_chunks_mut(CHUNK)
+        .zip(raw.par_chunks(CHUNK * bpp))
+        .for_each(|(dst, src)| {
+            match geom.bitpix {
+                8 => for (d, s) in dst.iter_mut().zip(src.iter()) {
+                    *d = *s as f32;
+                },
+                16 if fast_u16 => for (d, s) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                    *d = (i16::from_be_bytes([s[0], s[1]]) as i32 + 32_768) as f32;
+                },
+                16 => for (d, s) in dst.iter_mut().zip(src.chunks_exact(2)) {
+                    *d = i16::from_be_bytes([s[0], s[1]]) as f32;
+                },
+                32 => for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                    *d = i32::from_be_bytes([s[0], s[1], s[2], s[3]]) as f32;
+                },
+                64 => for (d, s) in dst.iter_mut().zip(src.chunks_exact(8)) {
+                    *d = i64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32;
+                },
+                -32 => for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                    *d = f32::from_be_bytes([s[0], s[1], s[2], s[3]]);
+                },
+                -64 => for (d, s) in dst.iter_mut().zip(src.chunks_exact(8)) {
+                    *d = f64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32;
+                },
+                // Geometry::from_header rejects anything else, so this is dead code.
+                // Fill with NaN rather than panicking in a worker thread.
+                _ => dst.fill(f32::NAN),
+            }
+            if scaled {
+                for d in dst.iter_mut() {
+                    *d = (bzero + bscale * (*d as f64)) as f32;
+                }
+            }
+            if let Some(blank) = geom.blank_as_f32 {
+                for d in dst.iter_mut() {
+                    if *d == blank { *d = f32::NAN; }
+                }
+            }
+        });
+}
+
+/// Min and max over finite values only. Returns (0.0, 1.0) if nothing is finite,
+/// so that callers never divide by zero.
+pub fn finite_min_max(data: &[f32]) -> (f32, f32) {
+    let (lo, hi) = data
+        .par_iter()
+        .filter(|v| v.is_finite())
+        .fold(|| (f32::INFINITY, f32::NEG_INFINITY),
+              |(lo, hi), &v| (lo.min(v), hi.max(v)))
+        .reduce(|| (f32::INFINITY, f32::NEG_INFINITY),
+                |a, b| (a.0.min(b.0), a.1.max(b.1)));
+    if lo.is_finite() && hi.is_finite() && hi > lo { (lo, hi) } else { (0.0, 1.0) }
 }
 ```
+
+Note the `par_chunks_mut(CHUNK).zip(par_chunks(CHUNK * bpp))` pairing: both are
+indexed parallel iterators, so rayon keeps the two sides aligned. `chunks_exact`
+guarantees each `s` has the length the array literal indexes, so no bounds check
+survives optimisation and no `unwrap` is needed.
 
 Why this is fast enough without `mmap`: the conversion pass touches every byte anyway, so the extra copy that `fs::read` performs is a small fraction of total time and is done by the kernel at memory bandwidth. Measured expectation for a 24 MP 16-bit file: read ≈ 15 ms (warm), convert ≈ 30–60 ms with 8 threads. If a benchmark shows otherwise, report the numbers and ask before changing strategy (rule 1.1).
 
@@ -449,15 +551,68 @@ Every test that needs a file uses these. No binary fixtures are committed.
 | Module | Test type | What is covered |
 |--------|-----------|-----------------|
 | `header.rs` | unit + proptest | Card parsing, quoted strings with `/` inside, `END` detection, multi-block headers, missing `NAXIS` → `BadHeader`, arbitrary bytes never panic. |
-| `image.rs` | unit + criterion | Every BITPIX, BZERO/BSCALE, u16 fast path equals slow path, min/max, 3-channel layout. |
-| `reader.rs` | unit + proptest | Truncated, NotFits, primary-empty-then-extension fallback, `write_fits`→`read_fits` identity. |
-| `stretch.rs` | unit | Median maps to `target_bg`, LUT monotonic, constant image does not divide by zero, RGB per-channel. |
+| `image.rs` | unit + criterion | Every BITPIX, BZERO/BSCALE, u16 fast path equals the generic path, `finite_min_max` with NaN/inf present and with an all-NaN image, `BLANK` becomes NaN, 3-channel layout. |
+| `reader.rs` | unit + proptest | Truncated, NotFits, absurd NAXIS values do not overflow or allocate wildly, primary-empty-then-extension fallback, `write_fits`→`read_fits` identity. |
+| `stretch.rs` | unit | Median maps to `target_bg` within tolerance, LUT is monotonic non-decreasing, constant image does not divide by zero, all-NaN image does not panic, RGB per-channel. |
 | `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, all dark/bias/scale combinations. |
 | `folder.rs` | integration (tempdir) | Filters extensions, skips hidden, natural sort, sidecar round-trip. |
 | `actions.rs` | integration (tempdir) | Rename rules, flag toggle persists, delete calls trash (mock via trait `FileOps` so tests don't touch the real trash). |
 | `loader.rs` | unit | LRU eviction by count and bytes, stale generation dropped, prefetch order. |
+| `texture.rs` | unit | Vertical flip applied exactly once, downsample factor selection, NaN maps to black. |
 | `app.rs` model | unit | Keyboard actions mutate `Model` correctly: next/prev at ends, delete advances selection, flagged delete requires confirm state. |
 | UI files | manual | `docs/manual-tests.md` checklist per phase. |
+
+---
+
+## Phase 0 — Bootstrap
+
+**Goal:** An empty but complete workspace that builds, tests, lints, and runs in
+CI on all three platforms. No application code yet. This phase exists so that
+every later phase starts from a green build.
+
+### Steps
+
+1. Root `Cargo.toml` as a workspace:
+   ```toml
+   [workspace]
+   members = ["crates/fits-core", "crates/fitsview"]
+   resolver = "2"
+
+   [workspace.package]
+   edition = "2021"
+   rust-version = "1.78"
+
+   [profile.release]
+   opt-level = 3
+   lto = "fat"
+   codegen-units = 1
+   panic = "abort"
+
+   # Dependencies are still built with optimisation in debug builds, otherwise
+   # decoding a 24 MP image while developing takes seconds instead of milliseconds.
+   [profile.dev.package."*"]
+   opt-level = 3
+   ```
+2. `cargo new --lib crates/fits-core` and `cargo new crates/fitsview`. Add `#![forbid(unsafe_code)]` as the first line of `crates/fits-core/src/lib.rs` and `crates/fitsview/src/main.rs`.
+3. Add `rust-toolchain.toml` pinning `channel = "stable"` with components `rustfmt` and `clippy`, so every machine and CI agent agrees.
+4. Create `docs/manual-tests.md` with a heading per phase and nothing under them yet.
+5. Write `.github/workflows/ci.yml` now, not in Phase 8. Matrix over `ubuntu-latest`, `macos-latest`, `windows-latest`, with steps:
+   - `cargo fmt --all --check`
+   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   - `cargo test --workspace --all-features`
+   - `cargo build --release`
+   - a guard step that fails if the string `unsafe` appears in `crates/**/*.rs`
+   - on Linux only, first install `libgtk-3-dev libxkbcommon-dev libssl-dev` (needed by `rfd` and the windowing stack)
+6. Add one trivial passing test in each crate so the test step is not vacuous.
+7. Commit `Cargo.lock`. It is a binary crate, so the lock file belongs in version control.
+
+### Acceptance criteria
+- [ ] `cargo build --workspace` and `cargo test --workspace` succeed locally.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+- [ ] `cargo fmt --all --check` is clean.
+- [ ] CI is green on Linux, macOS, and Windows.
+- [ ] The unsafe-guard CI step is present and passes.
+- [ ] `Cargo.lock` is committed.
 
 ---
 
@@ -467,7 +622,7 @@ Every test that needs a file uses these. No binary fixtures are committed.
 
 ### Steps
 
-1. `cargo new --lib crates/fits-core`. Set up a workspace `Cargo.toml` at the repo root listing both crates.
+1. Work in `crates/fits-core`, created in Phase 0.
 2. Add dependencies: `rayon`, `thiserror`. Add `#![forbid(unsafe_code)]` to `lib.rs`. Dev-deps: `tempfile`, `criterion`, `proptest`, `approx`.
 3. Implement `header.rs`:
    - Read 2880-byte blocks. Split each into 36 cards of 80 bytes.
@@ -532,6 +687,8 @@ Every test that needs a file uses these. No binary fixtures are committed.
 - [ ] Zoom/pan is smooth (60 fps) on a 24-megapixel image.
 - [ ] Load-time label shows a real measured value.
 - [ ] Drag-and-drop works.
+- [ ] Image is the right way up: a synthetic file with a bright first FITS row shows that row at the **bottom** of the window (see the row-order note in section 4).
+- [ ] Non-finite pixels render black instead of blanking the image.
 - [ ] Unit tests for `ViewState` (fit, zoom-about-cursor, pan) and `texture::downsample_factor` pass.
 - [ ] `docs/manual-tests.md` has a Phase 2 checklist, ticked.
 
@@ -638,24 +795,75 @@ Implement in `fits-core/src/stretch.rs`:
 ```rust
 pub struct StretchParams { pub shadows_clip: f32, pub target_bg: f32 } // defaults: -2.8, 0.25
 pub struct Stretch { pub shadows: f32, pub midtones: f32, pub highlights: f32 }
-pub fn compute_stretch(img: &FitsImage, p: &StretchParams) -> Stretch;
-pub fn apply_stretch_lut(s: &Stretch, min: f32, max: f32) -> [u8; 65536]; // build once per image
+
+/// One Stretch per channel (len 1 for mono, 3 for RGB).
+pub fn compute_stretch(img: &FitsImage, p: &StretchParams) -> Vec<Stretch>;
+
+/// 65536-entry lookup table. Boxed so it is not copied on the stack.
+pub fn build_lut(s: &Stretch) -> Box<[u8; 65536]>;
 ```
 
-Steps to compute (per channel, or on luminance for RGB — per channel is fine here):
+**The midtone transfer function.** Fix the argument order once and never vary it:
 
-1. Normalise pixel values to `[0,1]` using image `min`/`max`.
-2. Compute the **median** `m` and **MAD** (median absolute deviation) `d` of the normalised data.
-   - For speed, compute on a subsample: every k-th pixel so that at most ~1 million samples are used. Use `select_nth_unstable` for the median (O(n)), not a full sort.
-   - `d = 1.4826 * MAD` (normalise MAD to sigma).
-3. `shadows = clamp(m + shadows_clip * d, 0, 1)` (with `shadows_clip = -2.8`).
+```rust
+/// m is the midtone balance in (0,1); x is the input in [0,1].
+fn mtf(m: f32, x: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    if x >= 1.0 { return 1.0; }
+    if m == 0.5 { return x; }
+    ((m - 1.0) * x) / (((2.0 * m - 1.0) * x) - m)
+}
+```
+
+`mtf` has a property this algorithm depends on: if `t = mtf(m, x)` then
+`mtf(t, x) = m`. The midtone and the output swap roles. That is why step 6 can
+call `mtf` itself to *solve* for the midtone that puts the background where we
+want it, instead of inverting the function by hand.
+
+Steps to compute, per channel:
+
+1. Normalise pixel values to `[0,1]` using the image `min`/`max`. Skip non-finite values entirely.
+2. Compute the **median** `med` and the **MAD** (median absolute deviation) of the normalised samples.
+   - Subsample: take every k-th pixel so at most ~1 million samples are used. Use `select_nth_unstable` for the median, which is O(n); never a full sort.
+   - `sigma = 1.4826 * MAD` (this rescales MAD to a standard-deviation equivalent).
+3. `shadows = clamp(med + shadows_clip * sigma, 0.0, 1.0)`, with `shadows_clip = -2.8`. Because `shadows_clip` is negative this lands below the median, at roughly the noise floor.
 4. `highlights = 1.0`.
-5. `midtones = MTF(target_bg, m - shadows)` where
-   `MTF(m, x) = ((m - 1) * x) / (((2*m - 1) * x) - m)` — solve so that the median maps to `target_bg` (0.25).
-   Concretely: `midtones = mtf(m_target = target_bg, x = m - shadows)`; guard division by zero; clamp to `(0,1)`.
-6. Output for each pixel `x` (normalised): `y = MTF(midtones, clamp((x - shadows) / (highlights - shadows), 0, 1))`, then `u8 = (y * 255).round()`.
+5. Rescale the median into the shadows-to-highlights window **before** solving:
+   `x0 = (med - shadows) / (highlights - shadows)`.
+6. `midtones = mtf(target_bg, x0)`. Clamp the result into `(0.001, 0.999)`.
+7. Per pixel: `y = mtf(midtones, clamp((x - shadows) / (highlights - shadows), 0.0, 1.0))`, then `u8 = (y * 255.0).round()`.
 
-**Performance:** do not evaluate the MTF per pixel. Build a 65536-entry `u8` LUT once per image (index = quantised normalised value), then map pixels through the LUT with `rayon`. This makes the stretch cost roughly the same as the linear display path.
+Step 5 is the step that is easy to skip, and skipping it is silent. If you solve
+for the midtone using `med - shadows` instead of `x0`, the background comes out
+at about `0.28` instead of `0.25` for the example below: too bright, but not
+obviously broken by eye. The unit test in the next section is what catches it.
+
+**Worked example to test against.** Background median `0.20`, sigma `0.02`,
+defaults `shadows_clip = -2.8`, `target_bg = 0.25`:
+
+| Quantity | Formula | Value |
+|----------|---------|-------|
+| `shadows` | `0.20 + (-2.8 × 0.02)` | `0.144` |
+| `highlights` | fixed | `1.0` |
+| `x0` | `(0.20 - 0.144) / (1.0 - 0.144)` | `0.065421` |
+| `midtones` | `mtf(0.25, 0.065421)` | `0.173554` |
+| median through the full pipeline | `mtf(0.173554, 0.065421)` | `0.250000` → `64` as `u8` |
+
+These values are verified. Assert the last two rows in a unit test to 6 decimal
+places. If the median comes back at about `0.282`, step 5 was skipped. If it
+comes back at some unrelated value, the argument order of `mtf` is reversed.
+
+**Degenerate inputs that must not panic:** a constant image (`MAD = 0`, so
+`sigma = 0` and `med - shadows = 0`; fall back to a linear ramp), an all-NaN
+image (return an identity stretch), and `min == max` (already guarded by
+`finite_min_max` returning `(0.0, 1.0)`).
+
+**Performance:** do not evaluate `mtf` per pixel. Build the 65536-entry `u8` LUT
+once per image (index = normalised value quantised to 16 bits), then map pixels
+through it with `rayon`. That turns the stretch into one multiply, one cast and
+one array index per pixel, so it costs about the same as the linear display path.
+Cache the LUT next to the image in the loader cache, keyed by the stretch
+parameters, so toggling back and forth does not recompute it.
 
 ### UI
 
@@ -665,8 +873,11 @@ Steps to compute (per channel, or on luminance for RGB — per channel is fine h
 4. Stretch parameters are computed **per image** (auto), not shared.
 
 ### Acceptance criteria
-- [ ] Unit test: for a synthetic image with a known Gaussian background, the median pixel maps to ~`target_bg * 255` (±3).
-- [ ] Toggling stretch on a 24 MP image re-renders in under 100 ms after the first computation (LUT cached per image).
+- [ ] Unit test: synthetic Gaussian background, median maps to `target_bg * 255` ±3.
+- [ ] Unit test: the worked example table above reproduces to 6 decimal places.
+- [ ] Unit test: LUT is monotonic non-decreasing across all 65536 entries.
+- [ ] Unit test: constant image, all-NaN image, and single-pixel image do not panic.
+- [ ] Toggling stretch on a 24 MP image re-renders in under 100 ms once the LUT is cached.
 - [ ] Setting persists across restart.
 
 ---
@@ -741,9 +952,8 @@ pub fn write_fits(path: &Path, img: &FitsImage) -> Result<(), FitsError>; // BIT
 
 ## Phase 8 — Packaging, CI, and Polish
 
-1. **CI** (`.github/workflows/ci.yml`): matrix `ubuntu-latest`, `macos-latest`, `windows-latest`; steps `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --all-features`, `cargo build --release`, plus a step that greps for `unsafe` in `crates/**/*.rs` and fails if found (belt and braces alongside `forbid(unsafe_code)`). Upload the release binary as an artifact per OS.
-   - Linux needs system packages for eframe: `libgtk-3-dev libxkbcommon-dev libssl-dev` (gtk is for `rfd`).
-2. **Release profile** in root `Cargo.toml`: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`.
+1. **CI** was set up in Phase 0. Extend it here to upload the release binary as a per-OS build artifact, and add a tag-triggered job that attaches those binaries to a GitHub release.
+2. **Release profile** was set in Phase 0. Verify `cargo build --release` still produces a single self-contained binary per platform.
 3. **App icon** and window title. On macOS, produce a `.app` bundle with `cargo-bundle`; on Windows set the icon via `winres`. Optional.
 4. **Settings persistence**: window size/position, stretch toggle, stretch params, last folder — via `eframe` `Storage`.
 5. **Error handling**: every failure surfaces as a non-blocking toast; never a panic. Add `std::panic::set_hook` that logs and shows a message box (`rfd::MessageDialog`) before exit.
@@ -761,6 +971,8 @@ pub fn write_fits(path: &Path, img: &FitsImage) -> Result<(), FitsError>; // BIT
 - Downsample display textures for very large images; keep full-res data in memory.
 - Stretch via a 64 K LUT, never a per-pixel `powf`/division.
 - Compute statistics (median/MAD/histogram) on a ≤ 1 M sample, never the full image.
+- Hoist the BITPIX match out of the pixel loop (section 5.3). A per-pixel branch costs roughly 30 %.
+- Keep `[profile.dev.package."*"] opt-level = 3` so debug builds decode images at usable speed.
 - Build in `--release` for any timing measurement. Log load/convert/texture times with `log::debug!`.
 - Profile before optimising further: `cargo flamegraph` on Linux/macOS.
 
@@ -769,10 +981,11 @@ pub fn write_fits(path: &Path, img: &FitsImage) -> Result<(), FitsError>; // BIT
 ## 10. Definition of Done (whole project)
 
 - [ ] All phase acceptance criteria checked.
-- [ ] `cargo clippy -- -D warnings` clean on all three OSes.
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean on all three OSes.
 - [ ] `cargo test --workspace` green in CI on all three OSes.
-- [ ] Zero `unsafe` in `crates/`; `cargo geiger` output recorded in the final summary.
+- [ ] Zero `unsafe` in `crates/`: both crates carry `#![forbid(unsafe_code)]` and the CI guard step passes.
 - [ ] Every module in the test plan table (5.5) has the listed tests.
+- [ ] Images display right way up, and files containing NaN pixels render correctly.
 - [ ] Manual test with real files from at least two capture programs (e.g. N.I.N.A. and ASIAIR/ZWO) — both 16-bit `BZERO=32768` and 32-bit float.
 - [ ] A 24 MP file opens and displays in well under one second on a warm cache.
 - [ ] Delete / rename / flag / stretch / dark / bias all work from keyboard alone.
