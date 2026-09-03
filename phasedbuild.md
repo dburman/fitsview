@@ -37,7 +37,7 @@ been run on Linux or Windows. See section 10.
 | 9 — Debayering | Done |
 | 10 — Measure the display path | Done |
 | 11 — True full-resolution zoom | Done |
-| 12 — Faster colour, fewer copies | Not started |
+| 12 — Faster colour, fewer copies | Done |
 | 13 — Frame quality measures | Not started |
 | 14 — Readouts | Not started |
 
@@ -2112,16 +2112,68 @@ smaller wastes sit beside it.
 
 ### Acceptance criteria
 
-- [ ] Debayering a 24 MP frame is measurably faster, with the before and after
-      recorded here.
-- [ ] Every debayer test passes unchanged, including the four patterns, the
+- [x] Debayering a 24 MP frame is measurably faster: **77 ms to 36 ms**, a 53%
+      reduction.
+- [x] Every debayer test passes unchanged, including the four patterns, the
       colour reconstruction, the NaN propagation and the edge behaviour.
-- [ ] A property test asserts the specialised implementation agrees with the
-      general one, pixel for pixel, on random images for every pattern.
-- [ ] Calibration makes one copy of the samples rather than two, with the
-      benchmark to show it.
-- [ ] Stepping through a folder of colour frames does not re-debayer a frame it
-      has already shown, demonstrated by a test that counts the work.
+- [x] A property test asserts the specialised implementation agrees with the
+      general one **bit for bit**, on random images with scattered undefined
+      pixels, for every pattern and at four sizes.
+- [x] Calibration makes one copy of the samples rather than two: dark and flat
+      together fall from **17.8 ms to 8.8 ms**.
+- [x] Stepping back to a colour frame does not rebuild it, proved by pointer
+      identity rather than by counting.
+
+### What Phase 12 actually produced
+
+**The per-image cost, before and after:**
+
+| Step | Before | After |
+|------|--------|-------|
+| Decode | 4.6 ms | 4.6 ms |
+| Debayer a mosaic | 77 ms | **36 ms** |
+| Subtract a dark | 6.6 ms | 5.5 ms |
+| Dark and flat together | 17.8 ms | **8.8 ms** |
+| Measure the stretch, mono | 11.8 ms | 12.3 ms |
+| Measure the stretch, colour | 16.7 ms | 17.1 ms |
+| Combine five frames | 36 ms | 34 ms |
+
+Taken with the texture work in Phase 10, a one-shot colour frame now costs
+roughly **65 ms** of interface-thread work where it cost about 130 ms.
+
+**The specialisation was safe because of one test.** The general path scans a
+3x3 neighbourhood and asks the pattern what colour each neighbour carries. But
+the site type already determines that: at a red site the greens are always the
+four orthogonal neighbours and the blues always the four diagonals. Writing the
+four cases out removes a lookup and a dynamically indexed accumulator from every
+one of a hundred million neighbour visits.
+
+Rewriting arithmetic that produces an image is exactly the kind of change that
+introduces a subtle, invisible error, so the general implementation was **kept**
+and a property test holds the two to agreeing **bit for bit**, not
+approximately. That required care: both accumulate in `f64` and visit
+neighbours in the same order, because floating point addition is not
+associative and a different order would differ in the last place. The edges keep
+the general path entirely, since they are a rounding error's worth of pixels and
+the general version already copes with missing neighbours.
+
+**Calibration was copying the image twice.** Subtracting the dark cloned the
+samples, and dividing by the flat cloned them again: 192 MB of copying on a
+24-megapixel frame to produce one result. `calibrate` now makes one copy and
+works on it in place. `divide_flat` is still there for callers who want a copy,
+implemented in terms of the in-place form, so there is one behaviour rather than
+two that might drift.
+
+**The calibrated cache was sized for mono.** A debayered 24-megapixel colour
+frame is 288 MB, and the budget was 512 MB, so fewer than two fitted and
+stepping through a colour folder re-debayered almost every frame. It now holds
+three, matching the working set the loader prefetches, with a budget stated in
+terms of that case so the reasoning survives the next change.
+
+**The test for it compares pointers, not values.** A recomputed image would hold
+equal values in a different allocation, so an equality check would have passed
+while the work was being repeated. `Arc::ptr_eq` is what actually demonstrates
+the cache was used.
 
 ---
 

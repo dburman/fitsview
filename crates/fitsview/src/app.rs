@@ -351,6 +351,19 @@ impl Bayer {
     }
 }
 
+/// How many calibrated images to keep.
+///
+/// The selected file and its two neighbours, which is what the loader
+/// prefetches, so stepping either way is instant.
+const CALIBRATED_CACHE_ENTRIES: usize = 3;
+
+/// How much memory those may occupy.
+///
+/// Three debayered 24-megapixel colour frames come to about 864 MB, which is
+/// the case this has to accommodate; anything smaller is limited by the entry
+/// count instead.
+const CALIBRATED_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+
 /// A short-lived message shown after an action.
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -426,6 +439,12 @@ pub struct Model {
     /// The background job in progress, if any.
     pub job: Option<Job>,
     /// Calibrated images, so stepping back and forth does not recalibrate.
+    ///
+    /// Sized for the working set the loader prefetches, which is the selected
+    /// file and its two neighbours. The bound has to be generous enough for
+    /// **debayered colour**: a one-shot colour frame from a 24-megapixel camera
+    /// becomes three planes of floats, 288 MB, so a budget sized for mono holds
+    /// fewer than two and re-debayers almost every step.
     calibrated: Cache,
     /// Whether the automatic stretch is applied to every image shown.
     pub stretch_enabled: bool,
@@ -473,7 +492,7 @@ impl Model {
             calibration: Calibration::default(),
             bayer: Bayer::default(),
             job: None,
-            calibrated: Cache::new(4, 512 * 1024 * 1024),
+            calibrated: Cache::new(CALIBRATED_CACHE_ENTRIES, CALIBRATED_CACHE_BYTES),
             stretch_enabled: false,
             stretch_params: StretchParams::default(),
             toast: None,
@@ -3090,6 +3109,60 @@ mod tests {
             "a mono dark matches the mosaic it is for"
         );
         assert!(m.calibration.active_dark().is_some());
+    }
+
+    #[test]
+    fn stepping_back_to_a_colour_frame_does_not_debayer_it_again() {
+        // Reconstructing colour is the most expensive step in the application,
+        // so a frame already shown must come back from the cache. Comparing the
+        // pointers proves it: a recomputed image would be a different
+        // allocation holding equal values, which an equality check would miss.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (32usize, 32usize);
+        let bayer = BayerPattern::Rggb;
+        let spec = SyntheticSpec::new(w, h, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("BAYERPAT", "'RGGB    '");
+        for i in 0..3 {
+            let pixels: Vec<f64> = (0..w * h)
+                .map(|p| {
+                    [2000.0, 800.0, 300.0][bayer.colour_at(p % w, p / w).plane()]
+                        + f64::from(i) * 10.0
+                })
+                .collect();
+            write_synthetic(dir.path(), &format!("osc_{i}.fits"), &spec, &pixels).unwrap();
+        }
+
+        let (mut m, _spy) = model_over(dir.path());
+        assert!(m.bayer.enabled, "the header declares a pattern");
+        let first = Arc::clone(&m.loaded.as_ref().unwrap().image);
+        assert_eq!(first.channels, 3);
+
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        m.handle(Action::PreviousFile);
+        settle(&mut m);
+
+        let again = &m.loaded.as_ref().unwrap().image;
+        assert!(
+            Arc::ptr_eq(&first, again),
+            "the frame should have come from the cache, not been rebuilt"
+        );
+    }
+
+    #[test]
+    fn the_calibrated_cache_holds_the_whole_prefetch_working_set() {
+        // Three entries: the selected file and the neighbours either side, so
+        // stepping in either direction is instant.
+        assert_eq!(CALIBRATED_CACHE_ENTRIES, 3);
+        // And enough room for three debayered full frames, which is the case
+        // that would otherwise thrash.
+        let debayered_full_frame = 6000 * 4000 * 3 * std::mem::size_of::<f32>();
+        assert!(
+            CALIBRATED_CACHE_BYTES >= 3 * debayered_full_frame,
+            "the budget holds only {:.1} debayered frames",
+            CALIBRATED_CACHE_BYTES as f64 / debayered_full_frame as f64
+        );
     }
 
     #[test]

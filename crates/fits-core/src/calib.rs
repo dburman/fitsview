@@ -357,15 +357,31 @@ pub fn build_master_flat(
 ///
 /// Returns [`CalibError::WrongSize`] if the frames disagree in shape.
 pub fn divide_flat(light: &FitsImage, flat: &MasterFlat) -> Result<FitsImage, CalibError> {
-    if !flat.matches(light) {
+    let mut result = light.clone();
+    divide_flat_into(&mut result, flat)?;
+    Ok(result)
+}
+
+/// Divides an image by a gain map, in place.
+///
+/// The in-place form exists because [`calibrate`] already owns a copy after
+/// subtracting the dark. Cloning again to divide it costs another 96 MB of
+/// copying on a 24-megapixel frame, for no benefit.
+///
+/// # Errors
+///
+/// Returns [`CalibError::WrongSize`] if the frames disagree in shape.
+pub fn divide_flat_into(image: &mut FitsImage, flat: &MasterFlat) -> Result<(), CalibError> {
+    if !flat.matches(image) {
         return Err(CalibError::WrongSize {
             frame: flat.shape(),
-            image: format!("{}x{}x{}", light.width, light.height, light.channels),
+            image: format!("{}x{}x{}", image.width, image.height, image.channels),
         });
     }
 
-    let mut data = light.data.clone();
-    data.par_iter_mut()
+    image
+        .data
+        .par_iter_mut()
         .zip(flat.gain.par_iter())
         .for_each(|(sample, gain)| {
             if sample.is_finite() && gain.is_finite() && *gain >= MIN_GAIN {
@@ -375,16 +391,10 @@ pub fn divide_flat(light: &FitsImage, flat: &MasterFlat) -> Result<FitsImage, Ca
             }
         });
 
-    let (min, max) = crate::image::finite_min_max(&data);
-    Ok(FitsImage {
-        width: light.width,
-        height: light.height,
-        channels: light.channels,
-        data,
-        header: light.header.clone(),
-        min,
-        max,
-    })
+    let (min, max) = crate::image::finite_min_max(&image.data);
+    image.min = min;
+    image.max = max;
+    Ok(())
 }
 
 /// How well a calibration frame matches the light it will be applied to.
@@ -614,14 +624,16 @@ pub fn calibrate(
     dark: Option<&MasterFrame>,
     flat: Option<&MasterFlat>,
 ) -> Result<FitsImage, CalibError> {
-    let subtracted = match dark {
+    // One copy of the samples, made here, then worked on in place. Calling
+    // `divide_flat` instead would copy a second time.
+    let mut result = match dark {
         Some(dark) => subtract_dark(light, dark)?,
         None => light.clone(),
     };
-    match flat {
-        Some(flat) => divide_flat(&subtracted, flat),
-        None => Ok(subtracted),
+    if let Some(flat) = flat {
+        divide_flat_into(&mut result, flat)?;
     }
+    Ok(result)
 }
 
 /// Calibrates a frame and, if asked, reconstructs its colour.
@@ -1248,6 +1260,41 @@ mod tests {
             (flat.gain[2 * w * h] - 0.5).abs() < 0.01,
             "blue gain {}",
             flat.gain[2 * w * h]
+        );
+    }
+
+    #[test]
+    fn dividing_in_place_gives_the_same_answer_as_copying() {
+        // The in-place form exists only to avoid a copy, so it must be
+        // indistinguishable from the form that makes one.
+        let (w, h) = (12, 9);
+        let pattern: Vec<f64> = (0..w * h)
+            .map(|i| 5_000.0 + (i % 37) as f64 * 100.0)
+            .collect();
+        let flat = build_master_flat(&[image(w, h, &pattern)], None).unwrap();
+
+        let light_pixels: Vec<f64> = (0..w * h).map(|i| 800.0 + (i % 11) as f64).collect();
+        let light = image(w, h, &light_pixels);
+
+        let copied = divide_flat(&light, &flat).unwrap();
+        let mut in_place = (*light).clone();
+        divide_flat_into(&mut in_place, &flat).unwrap();
+
+        assert_eq!(copied.data, in_place.data);
+        assert_eq!((copied.min, copied.max), (in_place.min, in_place.max));
+    }
+
+    #[test]
+    fn dividing_in_place_leaves_the_image_untouched_when_it_refuses() {
+        let light_pixels = vec![100.0; 16];
+        let flat = build_master_flat(&[image(2, 2, &[100.0; 4])], None).unwrap();
+        let mut light = (*image(4, 4, &light_pixels)).clone();
+
+        assert!(divide_flat_into(&mut light, &flat).is_err());
+        assert_eq!(
+            light.data,
+            vec![100.0f32; 16],
+            "a refusal must change nothing"
         );
     }
 

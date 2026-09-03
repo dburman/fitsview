@@ -212,12 +212,20 @@ pub fn debayer(image: &FitsImage, pattern: BayerPattern) -> Result<FitsImage, De
     let (red, rest) = data.split_at_mut(plane);
     let (green, blue) = rest.split_at_mut(plane);
 
+    // The interior, where every neighbour exists, takes the specialised path.
+    reconstruct_interior(image, pattern, red, green, blue);
+
+    // The border keeps the general path, which copes with missing neighbours.
     red.par_chunks_mut(width)
         .zip(green.par_chunks_mut(width))
         .zip(blue.par_chunks_mut(width))
         .enumerate()
         .for_each(|(y, ((red_row, green_row), blue_row))| {
+            let edge_row = y == 0 || y + 1 >= height;
             for x in 0..width {
+                if !edge_row && x != 0 && x + 1 < width {
+                    continue;
+                }
                 let [r, g, b] = reconstruct(image, pattern, x, y);
                 red_row[x] = r;
                 green_row[x] = g;
@@ -235,6 +243,138 @@ pub fn debayer(image: &FitsImage, pattern: BayerPattern) -> Result<FitsImage, De
         min,
         max,
     })
+}
+
+/// The mean of up to four samples, ignoring the undefined ones.
+///
+/// Accumulates in `f64` and in the same order the general path visits
+/// neighbours, so the specialised and general implementations agree bit for
+/// bit rather than approximately. A property test holds them to that.
+#[inline]
+fn mean_of(values: [f32; 4], count: usize) -> f32 {
+    let mut sum = 0.0f64;
+    let mut used = 0u32;
+    for value in values.iter().take(count) {
+        if value.is_finite() {
+            sum += f64::from(*value);
+            used += 1;
+        }
+    }
+    if used == 0 {
+        f32::NAN
+    } else {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (sum / f64::from(used)) as f32
+        }
+    }
+}
+
+/// Reconstructs an image using only the general path.
+///
+/// Kept so the specialised interior can be held to agreeing with it, which is
+/// the only thing making the optimisation safe. Not used in normal operation.
+#[cfg(test)]
+fn debayer_generally(image: &FitsImage, pattern: BayerPattern) -> Vec<f32> {
+    let plane = image.width * image.height;
+    let mut data = vec![f32::NAN; plane * 3];
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let [r, g, b] = reconstruct(image, pattern, x, y);
+            data[y * image.width + x] = r;
+            data[plane + y * image.width + x] = g;
+            data[2 * plane + y * image.width + x] = b;
+        }
+    }
+    data
+}
+
+/// Reconstructs the interior of the image, where every neighbour exists.
+///
+/// The general path in [`reconstruct`] scans a 3x3 neighbourhood and asks the
+/// pattern which colour each neighbour carries. But the site type already
+/// determines that: at a red site the greens are the four orthogonal
+/// neighbours and the blues are the four diagonals, always. Writing the four
+/// cases out removes a lookup and a dynamically indexed accumulator from every
+/// one of a hundred million neighbour visits.
+///
+/// The edges keep the general path: they are a rounding error's worth of
+/// pixels, and the general version already handles missing neighbours.
+fn reconstruct_interior(
+    image: &FitsImage,
+    pattern: BayerPattern,
+    red: &mut [f32],
+    green: &mut [f32],
+    blue: &mut [f32],
+) {
+    let (width, height) = (image.width, image.height);
+    let data = &image.data;
+
+    red.par_chunks_mut(width)
+        .zip(green.par_chunks_mut(width))
+        .zip(blue.par_chunks_mut(width))
+        .enumerate()
+        .for_each(|(y, ((red_row, green_row), blue_row))| {
+            if y == 0 || y + 1 >= height {
+                return; // the general path handles the first and last rows
+            }
+            let row = y * width;
+            let above = row - width;
+            let below = row + width;
+
+            for x in 1..width - 1 {
+                let index = row + x;
+                let own = pattern.colour_at(x, y);
+
+                // Visited in the same order as the general path, so the two
+                // agree exactly: up-left, up, up-right, left, right,
+                // down-left, down, down-right.
+                let up = data[above + x];
+                let down = data[below + x];
+                let left = data[index - 1];
+                let right = data[index + 1];
+                let up_left = data[above + x - 1];
+                let up_right = data[above + x + 1];
+                let down_left = data[below + x - 1];
+                let down_right = data[below + x + 1];
+
+                let centre = data[index];
+                let orthogonal = mean_of([up, left, right, down], 4);
+                let diagonal = mean_of([up_left, up_right, down_left, down_right], 4);
+
+                let (r, g, b) = match own {
+                    // Green sits on the four orthogonal neighbours, and the
+                    // opposite primary on the four diagonals.
+                    Colour::Red => (keep(centre), orthogonal, diagonal),
+                    Colour::Blue => (diagonal, orthogonal, keep(centre)),
+                    // At a green site the two primaries lie on the horizontal
+                    // and vertical pairs; which is which depends on the row.
+                    Colour::Green => {
+                        let horizontal = mean_of([left, right, 0.0, 0.0], 2);
+                        let vertical = mean_of([up, down, 0.0, 0.0], 2);
+                        if pattern.colour_at(x + 1, y) == Colour::Red {
+                            (horizontal, keep(centre), vertical)
+                        } else {
+                            (vertical, keep(centre), horizontal)
+                        }
+                    }
+                };
+
+                red_row[x] = r;
+                green_row[x] = g;
+                blue_row[x] = b;
+            }
+        });
+}
+
+/// A pixel's own measurement, or undefined if it did not make one.
+#[inline]
+const fn keep(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        f32::NAN
+    }
 }
 
 /// The three channels at one pixel.
@@ -561,6 +701,46 @@ mod tests {
         for plane in 0..3 {
             let got = at(&out, 5, 5, plane);
             assert!((got - 500.0).abs() < 0.01, "plane {plane} was {got}");
+        }
+    }
+
+    #[test]
+    fn the_specialised_path_agrees_with_the_general_one_exactly() {
+        // The whole safety argument for the optimisation. Bit for bit, not
+        // approximately: both accumulate in f64 and visit neighbours in the
+        // same order, so any difference is a bug rather than rounding.
+        let mut rng = crate::testutil::Prng::new(20);
+        for pattern in BayerPattern::ALL {
+            for (w, h) in [(2, 2), (3, 5), (16, 16), (33, 17)] {
+                let pixels: Vec<f64> = (0..w * h)
+                    .map(|i| {
+                        // A scattering of undefined pixels, since those take
+                        // the branch most likely to differ between the two.
+                        if i % 23 == 0 {
+                            f64::NAN
+                        } else {
+                            rng.next_f64() * 60_000.0
+                        }
+                    })
+                    .collect();
+                let img = mosaic(w, h, &pixels);
+
+                let fast = debayer(&img, pattern).unwrap().data;
+                let slow = debayer_generally(&img, pattern);
+
+                assert_eq!(fast.len(), slow.len());
+                for (i, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+                    if a.is_nan() && b.is_nan() {
+                        continue;
+                    }
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{} at {w}x{h} index {i}: {a} vs {b}",
+                        pattern.name()
+                    );
+                }
+            }
         }
     }
 
