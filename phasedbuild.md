@@ -36,7 +36,7 @@ been run on Linux or Windows. See section 10.
 | 8 — Packaging | Done |
 | 9 — Debayering | Done |
 | 10 — Measure the display path | Done |
-| 11 — True full-resolution zoom | Not started |
+| 11 — True full-resolution zoom | Done |
 | 12 — Faster colour, fewer copies | Not started |
 | 13 — Frame quality measures | Not started |
 | 14 — Readouts | Not started |
@@ -2029,19 +2029,52 @@ the top of it when one exists, at the rectangle that region maps to on screen.
 
 ### Acceptance criteria
 
-- [ ] Unit test: below 1:1 no detail region is asked for, and the overview is
-      used.
-- [ ] Unit test: at and above 1:1 the region covers the visible part of the
-      image and no more, clamped at the edges.
-- [ ] Unit test: panning by a few pixels returns the same region, so the texture
+- [x] Unit test: below the magnification threshold no detail region is asked
+      for, and the overview is used.
+- [x] Unit test: above it the region covers the visible part of the image and no
+      more, clamped at the edges.
+- [x] Unit test: panning by a few pixels returns the same region, so the texture
       is not rebuilt for every frame of a drag.
-- [ ] Unit test: a viewport larger than the image gives a region covering the
+- [x] Unit test: a viewport larger than the image gives a region covering the
       whole image, not one running off the end.
-- [ ] End-to-end test: a synthetic frame with a one-pixel feature shows that
-      feature at 1:1 on a 6000 x 4000 image, where it is currently averaged
-      away.
-- [ ] The uploaded texture stays bounded by the window size, not the image size,
-      measured on a 24 MP frame.
+- [x] End-to-end test: a one-pixel feature on a 6000 x 4000 frame is recovered
+      at full resolution, where the overview averages it to under a third of its
+      brightness.
+- [x] The uploaded texture stays bounded by the window size, not the image size,
+      asserted from 24 up to 600 megapixels.
+
+### What Phase 11 actually produced
+
+**The threshold is not 1:1, and getting that right mattered.** The obvious rule
+would be "switch to detail above 100% zoom", but the overview holds one texel
+per `factor` image pixels, so it stops carrying real detail as soon as the zoom
+passes `1 / factor`. For a full frame that is **50%**, not 100%. Using 1:1 would
+have left a whole octave of zoom looking soft for no reason.
+
+**Regions are rounded out to a 256-pixel grid.** Without that, every frame of a
+drag computes a slightly different region and rebuilds the texture, which would
+have made panning at high zoom worse than before rather than better. A test
+pans by a few pixels and asserts the region is unchanged.
+
+**The detail texture is uploaded with nearest-neighbour sampling**, not linear.
+The entire point is to show the pixels as they are; smoothing them would undo
+the phase.
+
+**The overview is still drawn underneath.** Painting detail over the top means a
+pan shows something immediately rather than a gap while the new region uploads.
+
+**A wasted upload found by running it rather than by testing.** The debug log
+showed a 2048 x 1280 detail texture being built for a freshly opened image that
+was about to be fitted to the window. The view had not been fitted yet, so the
+zoom still held the previous value, and the region was computed against a view
+one frame from being replaced. Detail is now skipped while a fit is pending. The
+symptom was invisible in the interface and cost a 2.6 megapixel upload on every
+file opened; only the log revealed it.
+
+**Bounded by the window, as intended.** A 600-megapixel frame at 1:1 asks for
+about the same upload as a 24-megapixel one, since both are showing a window's
+worth of pixels. The test asserts this across a twenty-five-fold range of image
+sizes.
 
 ---
 

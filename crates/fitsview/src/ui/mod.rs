@@ -17,7 +17,7 @@ use egui::{TextureHandle, TextureOptions, Ui};
 use fits_core::stretch::StretchParams;
 
 use crate::app::{Action, Model};
-use crate::texture::{self, Mapping};
+use crate::texture::{self, DetailRegion, Mapping};
 
 /// Storage keys for settings that outlive a session.
 const KEY_STRETCH_ENABLED: &str = "stretch_enabled";
@@ -32,9 +32,15 @@ const KEY_SHOW_HEADER: &str = "show_header";
 /// them.
 pub struct FitsViewApp {
     model: Model,
-    /// The uploaded texture, tagged with the model generation it was built
-    /// from, so it is rebuilt only when the displayed image really changes.
+    /// The uploaded overview texture, tagged with the model generation it was
+    /// built from, so it is rebuilt only when the displayed image changes.
     texture: Option<(u64, TextureHandle)>,
+    /// A full-resolution texture for the visible part of the image, used once
+    /// the zoom passes the point where the overview is being magnified.
+    ///
+    /// Tagged with the generation and the region, so panning within a tile
+    /// reuses it and only a real change rebuilds it.
+    detail: Option<(u64, DetailRegion, TextureHandle)>,
 }
 
 impl FitsViewApp {
@@ -48,6 +54,7 @@ impl FitsViewApp {
         Self {
             model,
             texture: None,
+            detail: None,
         }
     }
 
@@ -108,6 +115,7 @@ impl FitsViewApp {
     fn sync_texture(&mut self, ui: &Ui) {
         let Some(loaded) = &self.model.loaded else {
             self.texture = None;
+            self.detail = None;
             return;
         };
         if self
@@ -138,6 +146,71 @@ impl FitsViewApp {
             .ctx()
             .load_texture("fits-image", colour, TextureOptions::LINEAR);
         self.texture = Some((self.model.generation, handle));
+        // The overview changed, so any detail built from the old one is stale.
+        self.detail = None;
+    }
+
+    /// Uploads the visible part of the image at full resolution, when the
+    /// overview is being magnified.
+    ///
+    /// Without this, "100%" on a full-frame image shows a texture that was
+    /// shrunk to fit the size limit and then stretched back out, which is a
+    /// blur rather than the image, and defeats the purpose of looking closely
+    /// at a frame at all.
+    fn sync_detail(&mut self, ui: &Ui) {
+        let Some(loaded) = &self.model.loaded else {
+            self.detail = None;
+            return;
+        };
+        // A newly opened image has not been fitted yet, so the zoom still holds
+        // whatever the previous view had. Asking now would upload a detail
+        // texture for a view about to be replaced.
+        if self.model.needs_fit {
+            self.detail = None;
+            return;
+        }
+        let image = &loaded.image;
+        let factor =
+            texture::downsample_factor(image.width, image.height, texture::MAX_TEXTURE_EDGE);
+
+        let Some(region) = texture::detail_region_for(
+            (image.width, image.height),
+            factor,
+            &self.model.view,
+            self.model.viewport,
+        ) else {
+            self.detail = None;
+            return;
+        };
+
+        // Nothing to do while the same region is already uploaded.
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|(g, r, _)| *g == self.model.generation && *r == region)
+        {
+            return;
+        }
+
+        let mapping = if self.model.stretch_enabled {
+            Mapping::stretched(image, &self.model.stretch_params)
+        } else {
+            Mapping::linear(image)
+        };
+        let colour = texture::to_color_image_region(image, &mapping, &region);
+        log::debug!(
+            "detail texture {}x{} at ({}, {})",
+            colour.size[0],
+            colour.size[1],
+            region.x,
+            region.y
+        );
+        // Nearest, not linear: the point of this texture is to show the pixels
+        // as they are, and smoothing them would undo that.
+        let handle = ui
+            .ctx()
+            .load_texture("fits-detail", colour, TextureOptions::NEAREST);
+        self.detail = Some((self.model.generation, region, handle));
     }
 }
 
@@ -190,9 +263,14 @@ impl eframe::App for FitsViewApp {
         }
 
         self.sync_texture(ui);
+        self.sync_detail(ui);
         let texture = self.texture.as_ref().map(|(_, t)| t.clone());
+        let detail = self
+            .detail
+            .as_ref()
+            .map(|(_, region, handle)| (*region, handle.clone()));
 
-        for action in viewer::show(ui, &mut self.model, texture.as_ref()) {
+        for action in viewer::show(ui, &mut self.model, texture.as_ref(), detail.as_ref()) {
             self.model.handle(action);
         }
         for action in dialogs::show(ui, &self.model) {

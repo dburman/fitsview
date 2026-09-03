@@ -6,13 +6,19 @@ use egui::{
 };
 
 use crate::app::{Action, Model};
+use crate::texture::DetailRegion;
 use crate::ui::input::{actions_for, Frame};
 
 /// Background behind the image. Dark, because astronomical images are.
 const BACKDROP: Color32 = Color32::from_gray(16);
 
 /// Draws the image and returns whatever this frame's input implies.
-pub fn show(ui: &mut Ui, model: &mut Model, texture: Option<&TextureHandle>) -> Vec<Action> {
+pub fn show(
+    ui: &mut Ui,
+    model: &mut Model,
+    texture: Option<&TextureHandle>,
+    detail: Option<&(DetailRegion, TextureHandle)>,
+) -> Vec<Action> {
     let mut actions = Vec::new();
 
     CentralPanel::default()
@@ -26,14 +32,23 @@ pub fn show(ui: &mut Ui, model: &mut Model, texture: Option<&TextureHandle>) -> 
             match (texture, model.loaded.as_ref()) {
                 (Some(texture), Some(loaded)) => {
                     let rect = model.view.image_rect(loaded.size());
+                    let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                     // The texture already holds the flipped, downsampled image,
                     // so it is drawn with the full UV range.
-                    ui.painter().image(
-                        texture.id(),
-                        rect,
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+
+                    // Over the top, where one exists, the same region at full
+                    // resolution. Drawing the overview underneath means a pan
+                    // shows something immediately rather than a gap while the
+                    // detail texture is rebuilt.
+                    if let Some((region, handle)) = detail {
+                        ui.painter().image(
+                            handle.id(),
+                            region.screen_rect(&model.view),
+                            uv,
+                            Color32::WHITE,
+                        );
+                    }
                 }
                 _ => {
                     let message = if model.loading {

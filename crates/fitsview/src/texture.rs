@@ -15,10 +15,12 @@
 
 use std::sync::Arc;
 
-use egui::{Color32, ColorImage};
+use egui::{Color32, ColorImage, Rect, Vec2};
 use fits_core::stretch::{self, Lut, StretchParams};
 use fits_core::FitsImage;
 use rayon::prelude::*;
+
+use crate::view::ViewState;
 
 /// Largest texture edge we will hand to the GPU.
 ///
@@ -112,6 +114,115 @@ impl Mapping {
     }
 }
 
+/// Detail textures are built in tiles of this many image pixels.
+///
+/// Rounding the visible region out to a grid means panning within a tile reuses
+/// the upload instead of rebuilding it every frame of a drag.
+pub const DETAIL_TILE: usize = 256;
+
+/// A rectangle of an image, in display coordinates, where row 0 is the top of
+/// the picture rather than the first row stored in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailRegion {
+    /// Left edge, in image pixels.
+    pub x: usize,
+    /// Top edge, in image pixels, counting down from the top of the picture.
+    pub y: usize,
+    /// Width in image pixels.
+    pub width: usize,
+    /// Height in image pixels.
+    pub height: usize,
+}
+
+impl DetailRegion {
+    /// Number of pixels the region covers.
+    #[must_use]
+    pub fn area(&self) -> usize {
+        self.width.saturating_mul(self.height)
+    }
+
+    /// Where the region sits on screen, given the current view.
+    #[must_use]
+    pub fn screen_rect(&self, view: &ViewState) -> Rect {
+        #[allow(clippy::cast_precision_loss)]
+        let min = Vec2::new(self.x as f32, self.y as f32);
+        #[allow(clippy::cast_precision_loss)]
+        let max = Vec2::new((self.x + self.width) as f32, (self.y + self.height) as f32);
+        Rect::from_min_max(view.image_to_screen(min), view.image_to_screen(max))
+    }
+}
+
+/// The part of an image worth uploading at full resolution, if any.
+///
+/// The overview texture is the image shrunk by `factor`, so each of its texels
+/// covers `factor * zoom` screen pixels. Once that exceeds one, the overview is
+/// being magnified and real detail is no longer visible: a 6000 x 4000 frame
+/// shrunk by two and shown at "100%" is a two-times blur, not the image.
+///
+/// Returns `None` while the overview is good enough, which is the common case
+/// and costs nothing. Otherwise returns the visible region, rounded out to
+/// [`DETAIL_TILE`] and clamped to the image, so the work is bounded by the size
+/// of the window rather than the size of the image.
+#[must_use]
+pub fn detail_region_for(
+    image_size: (usize, usize),
+    factor: usize,
+    view: &ViewState,
+    viewport: Rect,
+) -> Option<DetailRegion> {
+    let (width, height) = image_size;
+    if width == 0 || height == 0 || factor <= 1 {
+        // Nothing was thrown away, so there is no more detail to fetch.
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let overview_scale = 1.0 / factor as f32;
+    if !view.zoom.is_finite() || view.zoom <= overview_scale {
+        return None;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let image = Vec2::new(width as f32, height as f32);
+    let on_screen = view.image_rect(image).intersect(viewport);
+    if on_screen.width() <= 0.0 || on_screen.height() <= 0.0 {
+        // Scrolled entirely out of view.
+        return None;
+    }
+
+    let top_left = view.screen_to_image(on_screen.min);
+    let bottom_right = view.screen_to_image(on_screen.max);
+
+    // Round out to the tile grid, then clamp, so a small pan asks for the same
+    // region and the texture is reused.
+    let floor_tile = |v: f32, limit: usize| -> usize {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let p = v.max(0.0) as usize;
+        (p / DETAIL_TILE * DETAIL_TILE).min(limit)
+    };
+    let ceil_tile = |v: f32, limit: usize| -> usize {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let p = v.max(0.0).ceil() as usize;
+        p.div_ceil(DETAIL_TILE)
+            .saturating_mul(DETAIL_TILE)
+            .min(limit)
+    };
+
+    let x0 = floor_tile(top_left.x, width);
+    let y0 = floor_tile(top_left.y, height);
+    let x1 = ceil_tile(bottom_right.x, width).max(x0);
+    let y1 = ceil_tile(bottom_right.y, height).max(y0);
+
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(DetailRegion {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
+}
+
 /// The integer factor by which an image must shrink to fit within `max_edge`.
 ///
 /// Always at least 1. Returns the smallest factor that works rather than
@@ -168,6 +279,54 @@ pub fn to_color_image(image: &FitsImage, mapping: &Mapping, factor: usize) -> Co
         });
 
     ColorImage::new([out_w, out_h], pixels)
+}
+
+/// Builds a texture for part of an image, at full resolution.
+///
+/// One texel per image pixel, so this is what makes a true 1:1 view possible.
+/// The vertical flip is applied here as it is for the whole image: row 0 of the
+/// result is the top of the picture, which is the last row stored in the file.
+#[must_use]
+pub fn to_color_image_region(
+    image: &FitsImage,
+    mapping: &Mapping,
+    region: &DetailRegion,
+) -> ColorImage {
+    let width = region.width.min(image.width.saturating_sub(region.x));
+    let height = region.height.min(image.height.saturating_sub(region.y));
+    if width == 0 || height == 0 {
+        return ColorImage::new([1, 1], vec![Color32::BLACK]);
+    }
+
+    let plane = image.width * image.height;
+    let mut pixels = vec![Color32::BLACK; width * height];
+
+    pixels
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, out)| {
+            // Display row `region.y + row` counts from the top of the picture,
+            // and the file stores the bottom row first.
+            let display_y = region.y + row;
+            let source_y = image.height - 1 - display_y;
+            let base = source_y * image.width + region.x;
+
+            for (column, slot) in out.iter_mut().enumerate() {
+                let index = base + column;
+                let mut channel_bytes = [0u8; 3];
+                for (c, byte) in channel_bytes.iter_mut().enumerate().take(image.channels) {
+                    let value = image.data[c * plane + index];
+                    *byte = mapping.to_u8(value, c);
+                }
+                *slot = if image.channels >= 3 {
+                    Color32::from_rgb(channel_bytes[0], channel_bytes[1], channel_bytes[2])
+                } else {
+                    Color32::from_gray(channel_bytes[0])
+                };
+            }
+        });
+
+    ColorImage::new([width, height], pixels)
 }
 
 /// Averages the source block that maps to one output pixel, then colours it.
@@ -319,6 +478,286 @@ mod tests {
             let expected = m.to_u8(fits_row as f32 * 60.0, 0);
             assert_eq!(*px, Color32::from_gray(expected), "output row {out_y}");
         }
+    }
+
+    /// A view fitted to a viewport, then zoomed about its centre.
+    fn view_at(image: (usize, usize), viewport: Rect, zoom: f32) -> ViewState {
+        #[allow(clippy::cast_precision_loss)]
+        let size = Vec2::new(image.0 as f32, image.1 as f32);
+        let mut view = ViewState::fit(size, viewport);
+        view.set_zoom_about_centre(viewport, zoom);
+        view
+    }
+
+    fn window() -> Rect {
+        Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 900.0))
+    }
+
+    #[test]
+    fn no_detail_is_needed_while_the_overview_is_sharp_enough() {
+        // The overview of a 6000x4000 frame is half size, so it holds real
+        // detail up to 50% zoom. Below that it is being shrunk, not magnified.
+        let image = (6000, 4000);
+        for zoom in [0.05, 0.2, 0.4, 0.49] {
+            let view = view_at(image, window(), zoom);
+            assert_eq!(
+                detail_region_for(image, 2, &view, window()),
+                None,
+                "zoom {zoom} should not need a detail texture"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_is_needed_once_the_overview_is_being_magnified() {
+        let image = (6000, 4000);
+        for zoom in [0.6, 1.0, 4.0] {
+            let view = view_at(image, window(), zoom);
+            assert!(
+                detail_region_for(image, 2, &view, window()).is_some(),
+                "zoom {zoom} magnifies the overview, so detail is needed"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_that_was_never_shrunk_never_needs_detail() {
+        // Factor 1 means the overview is already every pixel.
+        let image = (800, 600);
+        for zoom in [0.5, 1.0, 8.0] {
+            let view = view_at(image, window(), zoom);
+            assert_eq!(detail_region_for(image, 1, &view, window()), None);
+        }
+    }
+
+    #[test]
+    fn the_region_stays_inside_the_image() {
+        let image = (6000, 4000);
+        // Zoomed in and panned hard against each corner in turn.
+        for (dx, dy) in [(-9000.0, -9000.0), (9000.0, 9000.0), (0.0, 0.0)] {
+            let mut view = view_at(image, window(), 2.0);
+            view.pan(Vec2::new(dx, dy));
+            if let Some(region) = detail_region_for(image, 2, &view, window()) {
+                assert!(
+                    region.x + region.width <= image.0,
+                    "region runs off the right: {region:?}"
+                );
+                assert!(
+                    region.y + region.height <= image.1,
+                    "region runs off the bottom: {region:?}"
+                );
+                assert!(region.width > 0 && region.height > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_pan_reuses_the_same_region() {
+        // Otherwise the texture is rebuilt on every frame of a drag.
+        let image = (6000, 4000);
+        let mut view = view_at(image, window(), 2.0);
+        let first = detail_region_for(image, 2, &view, window()).expect("needs detail");
+
+        // A few screen pixels, well inside one tile at this zoom.
+        view.pan(Vec2::new(3.0, -2.0));
+        let after = detail_region_for(image, 2, &view, window()).expect("still needs detail");
+        assert_eq!(first, after, "a small pan should not rebuild the texture");
+    }
+
+    #[test]
+    fn a_large_pan_asks_for_a_different_region() {
+        let image = (6000, 4000);
+        let mut view = view_at(image, window(), 2.0);
+        let first = detail_region_for(image, 2, &view, window()).expect("needs detail");
+
+        view.pan(Vec2::new(-1200.0, 0.0));
+        let after = detail_region_for(image, 2, &view, window()).expect("needs detail");
+        assert_ne!(first, after, "panning a long way should move the region");
+    }
+
+    #[test]
+    fn a_viewport_larger_than_the_image_covers_the_whole_image() {
+        let image = (600, 400);
+        let view = view_at(image, window(), 2.0);
+        if let Some(region) = detail_region_for(image, 2, &view, window()) {
+            assert_eq!(region.x, 0);
+            assert_eq!(region.y, 0);
+            assert_eq!(region.width, image.0);
+            assert_eq!(region.height, image.1);
+        }
+    }
+
+    #[test]
+    fn the_region_is_bounded_by_the_window_not_the_image() {
+        // The whole point: a bigger image must not mean a bigger upload.
+        let small = (6000, 4000);
+        let huge = (30_000, 20_000);
+        let view_small = view_at(small, window(), 1.0);
+        let view_huge = view_at(huge, window(), 1.0);
+
+        let a = detail_region_for(small, 2, &view_small, window()).expect("detail");
+        let b = detail_region_for(huge, 8, &view_huge, window()).expect("detail");
+
+        assert!(
+            b.area() < small.0 * small.1,
+            "a 600 megapixel image asked for {} pixels",
+            b.area()
+        );
+        // Both are about a window's worth, give or take the tile rounding.
+        let window_pixels = 1400 * 900;
+        for region in [a, b] {
+            assert!(
+                region.area() < window_pixels * 4,
+                "region {region:?} is far larger than the window"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_scrolled_out_of_sight_needs_no_detail() {
+        let image = (6000, 4000);
+        let mut view = view_at(image, window(), 2.0);
+        view.pan(Vec2::new(100_000.0, 100_000.0));
+        assert_eq!(detail_region_for(image, 2, &view, window()), None);
+    }
+
+    #[test]
+    fn a_degenerate_image_or_view_is_handled() {
+        let view = view_at((10, 10), window(), 2.0);
+        assert_eq!(detail_region_for((0, 0), 2, &view, window()), None);
+        let mut broken = view;
+        broken.zoom = f32::NAN;
+        assert_eq!(detail_region_for((6000, 4000), 2, &broken, window()), None);
+    }
+
+    #[test]
+    fn a_fitted_view_of_a_full_frame_needs_no_detail() {
+        // The common case on opening an image: fitted to the window, far below
+        // the point where the overview is magnified. Uploading detail here
+        // would be pure waste on every file the user steps to.
+        let image = (6000, 4000);
+        let view = ViewState::fit(Vec2::new(6000.0, 4000.0), window());
+        assert!(view.zoom < 0.5, "a fitted full frame is well under 1:1");
+        assert_eq!(detail_region_for(image, 2, &view, window()), None);
+    }
+
+    #[test]
+    fn a_detail_texture_is_one_texel_per_image_pixel() {
+        let img = image(
+            64,
+            64,
+            &(0..4096).map(|i| f64::from(i % 256)).collect::<Vec<_>>(),
+        );
+        let region = DetailRegion {
+            x: 8,
+            y: 16,
+            width: 32,
+            height: 24,
+        };
+        let rendered = to_color_image_region(&img, &Mapping::linear(&img), &region);
+        assert_eq!(rendered.size, [32, 24]);
+        assert_eq!(rendered.pixels.len(), 32 * 24);
+    }
+
+    #[test]
+    fn a_detail_texture_is_flipped_the_same_way_as_the_overview() {
+        // The bright first FITS row is the bottom of the picture, so a region
+        // covering the bottom must be the bright one.
+        let img = image(
+            4,
+            4,
+            &[
+                100.0, 100.0, 100.0, 100.0, // FITS row 0: the bottom
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+        );
+        let m = Mapping::range(0.0, 100.0);
+
+        let bottom = to_color_image_region(
+            &img,
+            &m,
+            &DetailRegion {
+                x: 0,
+                y: 3,
+                width: 4,
+                height: 1,
+            },
+        );
+        assert_eq!(
+            bottom.pixels[0],
+            Color32::from_gray(255),
+            "bottom is bright"
+        );
+
+        let top = to_color_image_region(
+            &img,
+            &m,
+            &DetailRegion {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 1,
+            },
+        );
+        assert_eq!(top.pixels[0], Color32::from_gray(0), "top is dark");
+    }
+
+    #[test]
+    fn a_detail_texture_agrees_with_the_overview_where_they_overlap() {
+        // At factor 1 the whole-image builder is already full resolution, so a
+        // region of it must match the same pixels.
+        let pixels: Vec<f64> = (0..1024).map(|i| f64::from(i % 251)).collect();
+        let img = image(32, 32, &pixels);
+        let m = Mapping::linear(&img);
+
+        let whole = to_color_image(&img, &m, 1);
+        let region = DetailRegion {
+            x: 5,
+            y: 7,
+            width: 11,
+            height: 9,
+        };
+        let part = to_color_image_region(&img, &m, &region);
+
+        for row in 0..region.height {
+            for column in 0..region.width {
+                let from_part = part.pixels[row * region.width + column];
+                let from_whole = whole.pixels[(region.y + row) * 32 + region.x + column];
+                assert_eq!(from_part, from_whole, "at ({column}, {row})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_region_running_past_the_edge_is_trimmed_rather_than_panicking() {
+        let img = image(8, 8, &vec![1.0; 64]);
+        let rendered = to_color_image_region(
+            &img,
+            &Mapping::linear(&img),
+            &DetailRegion {
+                x: 6,
+                y: 6,
+                width: 100,
+                height: 100,
+            },
+        );
+        assert_eq!(rendered.size, [2, 2]);
+    }
+
+    #[test]
+    fn a_region_entirely_outside_the_image_yields_something_drawable() {
+        let img = image(8, 8, &vec![1.0; 64]);
+        let rendered = to_color_image_region(
+            &img,
+            &Mapping::linear(&img),
+            &DetailRegion {
+                x: 99,
+                y: 99,
+                width: 4,
+                height: 4,
+            },
+        );
+        assert_eq!(rendered.size, [1, 1], "never an empty texture");
     }
 
     #[test]

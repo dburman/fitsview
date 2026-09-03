@@ -355,3 +355,87 @@ fn the_wrong_bayer_pattern_shows_as_wrong_colour_not_as_damage() {
         "swapping the pattern must not undefine anything"
     );
 }
+
+#[test]
+fn a_single_pixel_star_is_lost_in_the_overview_and_recovered_at_full_resolution() {
+    // The Phase 11 claim. A 6000x4000 frame is downsampled by two for the
+    // overview, so a one-pixel feature is averaged with three dark neighbours
+    // and loses three quarters of its brightness. Judging focus or star shape
+    // through that is impossible, which is the whole purpose of the viewer.
+    use fitsview::texture::{to_color_image_region, DetailRegion};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (w, h) = (6000usize, 4000usize);
+    let mut pixels = vec![100.0f64; w * h];
+    // One bright pixel, well inside the frame, on an even coordinate so it sits
+    // alone in its 2x2 block.
+    let (star_x, star_y) = (3000usize, 2000usize);
+    pixels[star_y * w + star_x] = 60_000.0;
+
+    let spec = SyntheticSpec::new(w, h, 16).with_scaling(32768.0, 1.0);
+    let path = write_synthetic(dir.path(), "star.fits", &spec, &pixels).unwrap();
+    let image = read_fits(&path).unwrap();
+
+    let factor = texture::downsample_factor(image.width, image.height, texture::MAX_TEXTURE_EDGE);
+    assert_eq!(factor, 2, "a full frame is downsampled for the overview");
+    let mapping = Mapping::linear(&image);
+
+    // In the overview the star is averaged with its neighbours.
+    let overview = texture::to_color_image(&image, &mapping, factor);
+    let display_y = h - 1 - star_y; // FITS row 0 is the bottom of the picture
+    let overview_px = overview.pixels[(display_y / factor) * overview.size[0] + star_x / factor];
+
+    // At full resolution the same pixel keeps its own value.
+    let region = DetailRegion {
+        x: star_x - 4,
+        y: display_y - 4,
+        width: 16,
+        height: 16,
+    };
+    let detail = to_color_image_region(&image, &mapping, &region);
+    let detail_px = detail.pixels[4 * region.width + 4];
+
+    assert_eq!(detail_px.r(), 255, "the star should be at full brightness");
+    assert!(
+        overview_px.r() < 80,
+        "the overview should have averaged it down, got {}",
+        overview_px.r()
+    );
+    assert!(
+        u32::from(detail_px.r()) > u32::from(overview_px.r()) * 3,
+        "full resolution should recover what the overview lost: {} vs {}",
+        detail_px.r(),
+        overview_px.r()
+    );
+}
+
+#[test]
+fn the_detail_upload_is_bounded_by_the_window_not_the_image() {
+    // A hundred-megapixel frame must not cost more to inspect closely than a
+    // small one; that is what makes this affordable at all.
+    use egui::{Pos2, Rect, Vec2};
+    use fitsview::texture::detail_region_for;
+    use fitsview::view::ViewState;
+
+    let window = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+    let mut worst = 0usize;
+
+    for (w, h) in [(6000usize, 4000usize), (12_000, 9000), (30_000, 20_000)] {
+        #[allow(clippy::cast_precision_loss)]
+        let size = Vec2::new(w as f32, h as f32);
+        let factor = texture::downsample_factor(w, h, texture::MAX_TEXTURE_EDGE);
+
+        let mut view = ViewState::fit(size, window);
+        view.set_zoom_about_centre(window, 1.0);
+
+        let region = detail_region_for((w, h), factor, &view, window)
+            .unwrap_or_else(|| panic!("{w}x{h} at 1:1 should need detail"));
+        worst = worst.max(region.area());
+    }
+
+    // A window's worth, plus the tile rounding. Nowhere near an image's worth.
+    assert!(
+        worst < 1400 * 900 * 4,
+        "the largest upload was {worst} pixels, which scales with the image"
+    );
+}
