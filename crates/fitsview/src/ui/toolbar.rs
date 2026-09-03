@@ -175,6 +175,11 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 }
             } else {
                 ui.label(model.status_text());
+                if let Some(readout) = model.pixel_readout() {
+                    ui.separator();
+                    ui.label(RichText::new(readout.describe()).monospace())
+                        .on_hover_text("The value in the file, before calibration or stretching");
+                }
             }
         });
     });

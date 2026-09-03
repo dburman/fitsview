@@ -13,11 +13,9 @@ For what the application does and how to build it, see
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 9 complete, delivering the application as originally
-specified. Phases 10 to 14 were added afterwards: measured improvements to speed
-and the features that turn a viewer into a culling tool. Phase 11 is the most
-important of them, because it fixes a limitation that defeats the purpose of the
-application on a full-frame camera.
+**Status:** All phases complete. Phases 0 to 9 delivered the application as
+originally specified; phases 10 to 14 improved its speed and added what turns a
+viewer into a culling tool.
 
 Two gaps remain that need a human rather than more code: the application has
 never been tried against real capture files, and the manual checklist has never
@@ -39,7 +37,7 @@ been run on Linux or Windows. See section 10.
 | 11 — True full-resolution zoom | Done |
 | 12 — Faster colour, fewer copies | Done |
 | 13 — Frame quality measures | Done |
-| 14 — Readouts | Not started |
+| 14 — Readouts | Done |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 9
 deliver the requirements below, and phases 10 onwards improve on them.
@@ -421,7 +419,8 @@ fitsview/
 │   └── manual-tests.md     # per-phase manual test checklist for UI-only criteria
 ├── scripts/
 │   ├── check.sh            # everything CI runs, in one command
-│   └── check-unsafe.sh     # unsafe guard, run by CI and locally
+│   ├── check-unsafe.sh     # unsafe guard, run by CI and locally
+│   └── check-modules.sh    # no source file is silently never compiled
 ├── rust-toolchain.toml     # pins the stable channel plus rustfmt and clippy
 ├── Cargo.lock              # committed: this workspace produces a binary
 └── .github/workflows/ci.yml
@@ -2306,14 +2305,51 @@ Small, and worth having once the larger work is done.
 
 ### Acceptance criteria
 
-- [ ] Unit test: a screen position maps to the right image pixel at several zoom
-      levels and pan offsets, including outside the image, where nothing is
-      reported rather than a wrong pixel.
-- [ ] Unit test: the value shown is the raw sample, not the displayed one, so it
-      means what the file holds.
-- [ ] Unit test: histogram bins sum to the number of finite samples measured, and
-      an all-NaN frame produces an empty histogram rather than a panic.
-- [ ] The readout costs nothing measurable per frame.
+- [x] Unit test: a screen position maps to the right image pixel at three zoom
+      levels and several positions, and a pointer off the image reports nothing
+      rather than the nearest pixel.
+- [x] Unit test: the value shown is the raw sample. A frame with a dark applied
+      displays 500 and reads out 900, which is what the file holds.
+- [x] Unit test: histogram bins sum to the finite samples counted, undefined
+      samples are counted nowhere, and an all-undefined frame is empty rather
+      than a panic.
+- [x] The readout costs nothing measurable: it reads one pixel. The histogram is
+      recomputed only when the image changes, not per frame.
+- [ ] **Blink comparison: not built.** It was the optional third item. The two
+      frames are already cached, so it remains cheap to add, but the pixel
+      readout and the histogram answer questions asked far more often.
+
+### What Phase 14 actually produced
+
+**The readout reports the file's value, not the screen's.** Calibration,
+stretching and colour reconstruction all change what is displayed. A readout of
+those would answer a question nobody asks; what is wanted is whether the star is
+saturated **in the data**. The test makes the two differ deliberately and
+asserts the readout follows the file.
+
+**The histogram is drawn square-rooted, not linearly or logarithmically.** An
+astronomical frame puts almost every sample into a handful of buckets, so a
+linear plot is one spike and nothing else. A logarithm would fix that and lie:
+it makes a bucket holding one sample look occupied. The square root keeps the
+stars visible while an empty bucket stays empty.
+
+**A whole feature that compiled, passed every test, and did nothing.** The
+histogram module was written, the model state added, the key mapped, the panel
+implemented. One line was missing: `mod histogram;`. **Rust says nothing about a
+source file no module declares** — it simply never compiles it. The build stayed
+green, 350 tests passed, and the feature was not in the program. It was found
+only by running `--help` and noticing `G` was absent from a list generated from
+the shortcut table.
+
+That is the third time in this project an edit silently failed to apply, and the
+first time the result was an entire feature quietly missing. So
+`scripts/check-modules.sh` now asserts that every source file is declared in its
+own parent module, and it is part of `scripts/check.sh` and of continuous
+integration. It was verified by deleting the very line whose absence caused the
+bug and confirming the check fails. **The declaration has to be checked against
+the file's own parent**: two crates each have a `histogram.rs`, and finding one
+declared says nothing about the other, which is exactly how the first attempt at
+this guard passed while the bug was present.
 
 ---
 

@@ -90,6 +90,7 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             Key::D => out.push(Action::ToggleApplyDark),
             Key::B => out.push(Action::ToggleDebayer),
             Key::I => out.push(Action::ToggleHeader),
+            Key::G => out.push(Action::ToggleHistogram),
             Key::L => out.push(Action::ToggleFileList),
             // Plain F fits the image to the window, so the flat takes Shift+F
             // rather than stealing a key people use constantly.
@@ -302,6 +303,15 @@ mod tests {
     }
 
     #[test]
+    fn g_toggles_the_histogram() {
+        let f = Frame {
+            keys: key(Key::G),
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::ToggleHistogram]);
+    }
+
+    #[test]
     fn i_toggles_the_header_panel() {
         let f = Frame {
             keys: key(Key::I),
@@ -352,6 +362,7 @@ mod tests {
             Key::F,
             Key::L,
             Key::B,
+            Key::G,
             Key::ArrowRight,
             Key::ArrowDown,
             Key::ArrowUp,

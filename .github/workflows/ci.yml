@@ -32,6 +32,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: unsafe guard
         run: ./scripts/check-unsafe.sh
+      - name: module check
+        run: ./scripts/check-modules.sh
 
   test:
     name: Test on ${{ matrix.os }}

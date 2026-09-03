@@ -167,6 +167,8 @@ pub enum Action {
     ToggleFileList,
     /// Set whether the file list is showing, when the panel itself decides.
     SetFileListVisible(bool),
+    /// Show or hide the histogram strip.
+    ToggleHistogram,
     /// Show or hide the FITS header panel.
     ToggleHeader,
     /// Narrow the header panel to matching cards.
@@ -368,6 +370,49 @@ const CALIBRATED_CACHE_ENTRIES: usize = 3;
 /// count instead.
 const CALIBRATED_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
+/// The pixel under the pointer, and what it holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PixelReadout {
+    /// Column, counting from the left of the picture.
+    pub x: usize,
+    /// Row, counting from the **top** of the picture as displayed.
+    pub y: usize,
+    /// The sample in each channel, as the file holds it.
+    pub values: [f32; 3],
+    /// How many of those are meaningful: 1 for mono, 3 for colour.
+    pub channels: usize,
+}
+
+impl PixelReadout {
+    /// The readout as it appears in the status bar.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let value = |v: f32| {
+            if v.is_finite() {
+                // Whole numbers for the integer formats astronomy cameras
+                // produce, decimals only where they carry information.
+                if v.abs() >= 1000.0 || v.fract() == 0.0 {
+                    format!("{v:.0}")
+                } else {
+                    format!("{v:.3}")
+                }
+            } else {
+                "—".to_string()
+            }
+        };
+        let samples = match self.channels {
+            3 => format!(
+                "{}, {}, {}",
+                value(self.values[0]),
+                value(self.values[1]),
+                value(self.values[2])
+            ),
+            _ => value(self.values[0]),
+        };
+        format!("({}, {})  {samples}", self.x, self.y)
+    }
+}
+
 /// A short-lived message shown after an action.
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -430,10 +475,14 @@ pub struct Model {
     /// Whether the file list is showing. Collapsing it gives the image the
     /// whole window, which matters when culling on a laptop screen.
     pub show_filelist: bool,
+    /// Where the pointer is, when it is over the image.
+    pub pointer: Option<Pos2>,
     /// Set for one frame after the keyboard moves the selection, so the list
     /// scrolls to follow it. Clicking a row must not scroll it under the
     /// pointer, which is why this is not simply always on.
     pub scroll_to_selection: bool,
+    /// Whether the histogram strip beneath the image is showing.
+    pub show_histogram: bool,
     /// Whether the metadata section of the right-hand panel is expanded.
     pub show_header: bool,
     /// Text narrowing the header panel.
@@ -492,8 +541,10 @@ impl Model {
             confirm_every_delete: false,
             show_help: false,
             sort_key: SortKey::default(),
+            pointer: None,
             show_filelist: true,
             scroll_to_selection: false,
+            show_histogram: false,
             show_header: true,
             header_filter: String::new(),
             calibration: Calibration::default(),
@@ -721,6 +772,7 @@ impl Model {
             }
             Action::ToggleFileList => self.show_filelist = !self.show_filelist,
             Action::SetFileListVisible(visible) => self.show_filelist = visible,
+            Action::ToggleHistogram => self.show_histogram = !self.show_histogram,
             Action::ToggleHeader => self.show_header = !self.show_header,
             Action::SetHeaderFilter(text) => self.header_filter = text,
             Action::ToggleHelp => self.show_help = !self.show_help,
@@ -1448,6 +1500,47 @@ impl Model {
                 self.needs_fit = false;
             }
         }
+    }
+
+    /// The pixel under the pointer, if the pointer is over the image.
+    ///
+    /// Reports the sample as the **file** holds it, not as it is displayed.
+    /// Calibration, stretching and colour reconstruction all change what is on
+    /// screen; a readout of those would answer a question nobody asked. What is
+    /// wanted is whether the star is saturated in the data.
+    #[must_use]
+    pub fn pixel_readout(&self) -> Option<PixelReadout> {
+        let loaded = self.loaded.as_ref()?;
+        let pointer = self.pointer?;
+        let raw = &loaded.raw;
+
+        let position = self.view.screen_to_image(pointer);
+        if position.x < 0.0 || position.y < 0.0 {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (x, y) = (position.x as usize, position.y as usize);
+        if x >= raw.width || y >= raw.height {
+            return None;
+        }
+
+        // Display row 0 is the top of the picture; the file stores the bottom
+        // row first.
+        let source_y = raw.height - 1 - y;
+        let plane = raw.width * raw.height;
+        let index = source_y * raw.width + x;
+
+        let mut values = [f32::NAN; 3];
+        for (channel, slot) in values.iter_mut().enumerate().take(raw.channels.min(3)) {
+            *slot = raw.data[channel * plane + index];
+        }
+
+        Some(PixelReadout {
+            x,
+            y,
+            values,
+            channels: raw.channels.min(3),
+        })
     }
 
     /// Text for the status bar.
@@ -3346,6 +3439,151 @@ mod tests {
         m.handle(Action::SortBy(SortKey::Background));
         assert!(m.job.is_none());
         assert!(m.folder.is_none());
+    }
+
+    #[test]
+    fn the_pixel_under_the_pointer_is_reported_at_several_zooms_and_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 16usize);
+        // Each sample equals its own index, so a readout identifies its pixel.
+        let pixels: Vec<f64> = (0..w * h).map(|i| i as f64).collect();
+        let spec = SyntheticSpec::new(w, h, -32);
+        write_synthetic(dir.path(), "grid.fits", &spec, &pixels).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+
+        for zoom in [1.0, 4.0, 12.0] {
+            m.view = ViewState::centred(Vec2::new(w as f32, h as f32), viewport, zoom);
+            for (x, y) in [(0usize, 0usize), (3, 5), (15, 15)] {
+                // The centre of that pixel, in screen space.
+                let screen = m
+                    .view
+                    .image_to_screen(Vec2::new(x as f32 + 0.5, y as f32 + 0.5));
+                m.pointer = Some(screen);
+
+                let readout = m
+                    .pixel_readout()
+                    .unwrap_or_else(|| panic!("no readout at zoom {zoom}, pixel ({x}, {y})"));
+                assert_eq!((readout.x, readout.y), (x, y), "at zoom {zoom}");
+
+                // Display row 0 is the top; the file stores the bottom first.
+                let expected = ((h - 1 - y) * w + x) as f32;
+                assert!(
+                    (readout.values[0] - expected).abs() < 0.01,
+                    "at zoom {zoom}, pixel ({x}, {y}): got {} wanted {expected}",
+                    readout.values[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pointer_outside_the_image_reports_nothing_rather_than_a_wrong_pixel() {
+        let dir = folder_of(1, 16, 16);
+        let (mut m, _spy) = model_over(dir.path());
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+        m.view = ViewState::centred(Vec2::new(16.0, 16.0), viewport, 4.0);
+
+        for offset in [
+            Vec2::new(-500.0, 0.0),
+            Vec2::new(500.0, 0.0),
+            Vec2::new(0.0, -500.0),
+            Vec2::new(0.0, 500.0),
+        ] {
+            m.pointer = Some(m.view.image_to_screen(Vec2::new(8.0, 8.0)) + offset);
+            assert!(
+                m.pixel_readout().is_none(),
+                "a pointer off the image must report nothing, not the nearest pixel"
+            );
+        }
+
+        m.pointer = None;
+        assert!(m.pixel_readout().is_none());
+    }
+
+    #[test]
+    fn the_readout_shows_the_file_value_not_the_displayed_one() {
+        // Calibration changes what is on screen. The question a readout answers
+        // is what the data holds, so it must not follow the display.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(16, 16, 16);
+        write_synthetic(dir.path(), "light.fits", &spec, &vec![900.0; 256]).unwrap();
+        let (_darks_dir, dark_paths) = darks(1, 16, 16, 400.0);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+        m.view = ViewState::centred(Vec2::new(16.0, 16.0), viewport, 4.0);
+        m.pointer = Some(m.view.image_to_screen(Vec2::new(8.5, 8.5)));
+
+        assert_eq!(
+            m.loaded.as_ref().unwrap().image.data[0],
+            500.0,
+            "the displayed image is calibrated"
+        );
+        let readout = m.pixel_readout().expect("should have a readout");
+        assert!(
+            (readout.values[0] - 900.0).abs() < 0.01,
+            "the readout should show the file's 900, not the displayed 500: got {}",
+            readout.values[0]
+        );
+    }
+
+    #[test]
+    fn a_colour_frame_reports_all_three_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(4, 4, -32).with_channels(3);
+        let mut pixels = vec![0.0; 48];
+        for (i, v) in pixels.iter_mut().enumerate() {
+            *v = [10.0, 20.0, 30.0][i / 16];
+        }
+        write_synthetic(dir.path(), "rgb.fits", &spec, &pixels).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+        m.view = ViewState::centred(Vec2::new(4.0, 4.0), viewport, 20.0);
+        m.pointer = Some(m.view.image_to_screen(Vec2::new(2.5, 2.5)));
+
+        let readout = m.pixel_readout().expect("should have a readout");
+        assert_eq!(readout.channels, 3);
+        assert!((readout.values[0] - 10.0).abs() < 0.01);
+        assert!((readout.values[1] - 20.0).abs() < 0.01);
+        assert!((readout.values[2] - 30.0).abs() < 0.01);
+        assert!(
+            readout.describe().contains("10, 20, 30"),
+            "{}",
+            readout.describe()
+        );
+    }
+
+    #[test]
+    fn an_undefined_sample_is_shown_as_such_rather_than_as_a_number() {
+        let readout = PixelReadout {
+            x: 1,
+            y: 2,
+            values: [f32::NAN, 0.0, 0.0],
+            channels: 1,
+        };
+        assert!(readout.describe().contains('—'), "{}", readout.describe());
+        assert!(readout.describe().contains("(1, 2)"));
+    }
+
+    #[test]
+    fn the_histogram_toggles() {
+        let mut m = Model::new();
+        assert!(!m.show_histogram, "it starts out of the way");
+        m.handle(Action::ToggleHistogram);
+        assert!(m.show_histogram);
+        m.handle(Action::ToggleHistogram);
+        assert!(!m.show_histogram);
     }
 
     #[test]

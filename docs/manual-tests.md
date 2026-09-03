@@ -288,3 +288,21 @@ Needs a real session, ideally one with a few frames spoiled by cloud or wind.
       deleted or flagged by it.
 - [ ] The metadata panel shows Background, Noise and Sharpness for the current
       frame, above the header cards.
+
+---
+
+## Phase 14 — Readouts
+
+- [ ] Moving the pointer over the image shows coordinates and a value in the
+      status bar, and it changes as you move.
+- [ ] Moving off the image clears it rather than showing a stale value.
+- [ ] With a dark applied, the readout still shows the file's value rather than
+      the calibrated one. Toggle the dark with D and check the number does not
+      move.
+- [ ] On a colour frame, three values are shown.
+- [ ] `G` shows the histogram, and it has the shape of a sky frame: one tall
+      peak near the left with a thin tail.
+- [ ] With the stretch on, the black point and midtone are marked on the
+      histogram, and dragging the stretch settings moves them.
+- [ ] The histogram updates when you step to another frame.
+- [ ] It is still showing, or still hidden, after quitting and reopening.

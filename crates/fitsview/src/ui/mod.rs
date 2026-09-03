@@ -9,6 +9,7 @@ mod calibration;
 mod dialogs;
 mod filelist;
 mod header;
+mod histogram;
 pub mod input;
 mod toolbar;
 mod viewer;
@@ -27,6 +28,7 @@ const KEY_CONFIRM_EVERY_DELETE: &str = "confirm_every_delete";
 const KEY_LAST_FOLDER: &str = "last_folder";
 const KEY_SHOW_FILELIST: &str = "show_filelist";
 const KEY_SHOW_HEADER: &str = "show_header";
+const KEY_SHOW_HISTOGRAM: &str = "show_histogram";
 
 /// The `eframe` application: a model, a cached texture, and the glue between
 /// them.
@@ -35,6 +37,9 @@ pub struct FitsViewApp {
     /// The uploaded overview texture, tagged with the model generation it was
     /// built from, so it is rebuilt only when the displayed image changes.
     texture: Option<(u64, TextureHandle)>,
+    /// The distribution of the displayed image's samples, rebuilt when the
+    /// image changes rather than every frame.
+    histogram: Option<(u64, fits_core::Histogram)>,
     /// A full-resolution texture for the visible part of the image, used once
     /// the zoom passes the point where the overview is being magnified.
     ///
@@ -55,6 +60,7 @@ impl FitsViewApp {
             model,
             texture: None,
             detail: None,
+            histogram: None,
         }
     }
 
@@ -84,6 +90,7 @@ impl FitsViewApp {
             eframe::get_value(storage, KEY_CONFIRM_EVERY_DELETE).unwrap_or(false);
         app.model.show_filelist = eframe::get_value(storage, KEY_SHOW_FILELIST).unwrap_or(true);
         app.model.show_header = eframe::get_value(storage, KEY_SHOW_HEADER).unwrap_or(true);
+        app.model.show_histogram = eframe::get_value(storage, KEY_SHOW_HISTOGRAM).unwrap_or(false);
 
         // Reopen the folder from last time, but only when the command line did
         // not name something, and only if it is still there.
@@ -148,6 +155,31 @@ impl FitsViewApp {
         self.texture = Some((self.model.generation, handle));
         // The overview changed, so any detail built from the old one is stale.
         self.detail = None;
+    }
+
+    /// Recomputes the histogram when the displayed image changes.
+    ///
+    /// Counting samples is cheap but not free, and the distribution changes
+    /// only when the image does.
+    fn sync_histogram(&mut self) {
+        if !self.model.show_histogram {
+            return;
+        }
+        let Some(loaded) = &self.model.loaded else {
+            self.histogram = None;
+            return;
+        };
+        if self
+            .histogram
+            .as_ref()
+            .is_some_and(|(generation, _)| *generation == self.model.generation)
+        {
+            return;
+        }
+        self.histogram = Some((
+            self.model.generation,
+            fits_core::histogram::compute(&loaded.image),
+        ));
     }
 
     /// Uploads the visible part of the image at full resolution, when the
@@ -234,6 +266,7 @@ impl eframe::App for FitsViewApp {
         );
         eframe::set_value(storage, KEY_SHOW_FILELIST, &self.model.show_filelist);
         eframe::set_value(storage, KEY_SHOW_HEADER, &self.model.show_header);
+        eframe::set_value(storage, KEY_SHOW_HISTOGRAM, &self.model.show_histogram);
         if let Some(folder) = self.model.folder.as_ref() {
             eframe::set_value(storage, KEY_LAST_FOLDER, &folder.dir.display().to_string());
         }
@@ -259,6 +292,12 @@ impl eframe::App for FitsViewApp {
             self.model.handle(action);
         }
         for action in calibration::show(ui, &self.model) {
+            self.model.handle(action);
+        }
+
+        self.sync_histogram();
+        let histogram = self.histogram.as_ref().map(|(_, h)| h.clone());
+        for action in histogram::show(ui, &self.model, histogram.as_ref()) {
             self.model.handle(action);
         }
 

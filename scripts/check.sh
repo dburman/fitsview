@@ -32,6 +32,7 @@ run "formatting" cargo fmt --all --check
 run "lints" cargo clippy --workspace --all-targets --all-features -- -D warnings
 run "tests" cargo test --workspace --all-features
 run "unsafe guard" ./scripts/check-unsafe.sh
+run "module check" ./scripts/check-modules.sh
 
 # Optional extras: skipped rather than failed when the toolchain or target for
 # them is not installed, since they are not needed to work on the project.

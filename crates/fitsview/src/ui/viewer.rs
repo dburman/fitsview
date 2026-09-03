@@ -66,6 +66,13 @@ pub fn show(
                 }
             }
 
+            // Recorded for the status bar, which needs it after this panel has
+            // finished drawing.
+            model.pointer = ui
+                .ctx()
+                .input(|i| i.pointer.hover_pos())
+                .filter(|p| viewport.contains(*p));
+
             let modal = model.pending != crate::app::Pending::None;
             actions.extend(actions_for(&collect_input(ui, &response, viewport, modal)));
         });
