@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Pos2, Rect, Vec2};
-use fits_core::calib::{self, MasterFrame};
+use fits_core::calib::{self, MasterFlat, MasterFrame};
 use fits_core::stretch::StretchParams;
 use fits_core::FitsImage;
 
@@ -20,6 +20,7 @@ use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
 use crate::folder::{scan_folder, Folder};
 use crate::jobs::{self, Job};
 use crate::loader::{Cache, Loader};
+use crate::sidecar;
 use crate::view::ViewState;
 
 /// An image that has been loaded and is being displayed.
@@ -119,6 +120,20 @@ pub enum Action {
     ClearDarks,
     /// Turn dark subtraction on or off.
     ToggleApplyDark,
+    /// Offer these files as flat frames to combine.
+    AddFlats(Vec<PathBuf>),
+    /// Offer these files as flat darks, subtracted from the flats.
+    AddFlatDarks(Vec<PathBuf>),
+    /// Combine the collected flats into a gain map.
+    BuildMasterFlat,
+    /// Use an existing master flat from disk.
+    LoadMasterFlat(PathBuf),
+    /// Write the current gain map to disk.
+    SaveMasterFlat(PathBuf),
+    /// Forget the collected flats and the gain map.
+    ClearFlats,
+    /// Turn flat division on or off.
+    ToggleApplyFlat,
     /// Write calibrated copies of every file in the folder into this folder.
     StartExport(PathBuf),
     /// Stop whatever background job is running.
@@ -169,6 +184,18 @@ pub struct Calibration {
     pub dark: Option<Arc<MasterFrame>>,
     /// Whether the master is subtracted from what is displayed.
     pub apply_dark: bool,
+    /// Files offered as flats, waiting to be combined.
+    pub flat_sources: Vec<PathBuf>,
+    /// Files offered as flat darks, subtracted from the flats before combining.
+    pub flat_dark_sources: Vec<PathBuf>,
+    /// Where the current master dark came from, for the folder's sidecar.
+    pub dark_path: Option<PathBuf>,
+    /// Where the current master flat came from, for the folder's sidecar.
+    pub flat_path: Option<PathBuf>,
+    /// The combined master flat, normalised into a gain map.
+    pub flat: Option<Arc<MasterFlat>>,
+    /// Whether the gain map is divided out of what is displayed.
+    pub apply_flat: bool,
     /// Reasons the master may not suit the current image.
     pub warnings: Vec<String>,
     /// Why the master cannot be applied at all, if it cannot.
@@ -176,19 +203,62 @@ pub struct Calibration {
 }
 
 impl Calibration {
-    /// Whether a master is available to apply.
+    /// Whether a master dark is available to apply.
     #[must_use]
     pub fn has_dark(&self) -> bool {
         self.dark.is_some()
     }
 
-    /// The master to use for display, or `None` when it is off or unusable.
+    /// Whether a master flat is available to apply.
+    #[must_use]
+    pub fn has_flat(&self) -> bool {
+        self.flat.is_some()
+    }
+
+    /// The dark to use for display, or `None` when it is off or unusable.
     #[must_use]
     pub fn active_dark(&self) -> Option<&MasterFrame> {
         if self.apply_dark && self.blocked.is_none() {
             self.dark.as_deref()
         } else {
             None
+        }
+    }
+
+    /// The flat to use for display, or `None` when it is off or unusable.
+    #[must_use]
+    pub fn active_flat(&self) -> Option<&MasterFlat> {
+        if self.apply_flat && self.blocked.is_none() {
+            self.flat.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Whether anything is actually being applied.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active_dark().is_some() || self.active_flat().is_some()
+    }
+
+    /// A one-line description of the flat, for the panel.
+    #[must_use]
+    pub fn flat_summary(&self) -> String {
+        match &self.flat {
+            None if self.flat_sources.is_empty() => "No flats".to_string(),
+            None => format!("{} flats, not yet combined", self.flat_sources.len()),
+            Some(flat) => {
+                let unusable = if flat.unusable == 0 {
+                    String::new()
+                } else {
+                    format!(", {} unusable pixels", flat.unusable)
+                };
+                format!(
+                    "Gain map from {} frame{}{unusable}",
+                    flat.source_count,
+                    if flat.source_count == 1 { "" } else { "s" }
+                )
+            }
         }
     }
 
@@ -409,6 +479,49 @@ impl Model {
                     "Dark not applied"
                 }));
             }
+            Action::AddFlats(paths) => {
+                let added = paths.len();
+                self.calibration.flat_sources.extend(paths);
+                self.calibration.flat_sources.sort();
+                self.calibration.flat_sources.dedup();
+                self.toast = Some(Toast::new(format!(
+                    "{added} flat{} added, {} in total",
+                    if added == 1 { "" } else { "s" },
+                    self.calibration.flat_sources.len()
+                )));
+            }
+            Action::AddFlatDarks(paths) => {
+                self.calibration.flat_dark_sources.extend(paths);
+                self.calibration.flat_dark_sources.sort();
+                self.calibration.flat_dark_sources.dedup();
+                self.toast = Some(Toast::new(format!(
+                    "{} flat darks",
+                    self.calibration.flat_dark_sources.len()
+                )));
+            }
+            Action::BuildMasterFlat => self.build_master_flat(),
+            Action::LoadMasterFlat(path) => self.load_master_flat(&path),
+            Action::SaveMasterFlat(path) => self.save_master_flat(&path),
+            Action::ClearFlats => {
+                self.calibration.flat = None;
+                self.calibration.flat_sources.clear();
+                self.calibration.flat_dark_sources.clear();
+                self.calibration.apply_flat = false;
+                self.refresh_after_calibration_change();
+                self.toast = Some(Toast::new("Flats cleared"));
+            }
+            Action::ToggleApplyFlat => {
+                if !self.calibration.has_flat() {
+                    return;
+                }
+                self.calibration.apply_flat = !self.calibration.apply_flat;
+                self.refresh_after_calibration_change();
+                self.toast = Some(Toast::new(if self.calibration.apply_flat {
+                    "Flat applied"
+                } else {
+                    "Flat not applied"
+                }));
+            }
             Action::StartExport(directory) => self.start_export(directory),
             Action::CancelJob => {
                 if let Some(job) = &self.job {
@@ -591,15 +704,92 @@ impl Model {
         self.job = Some(Job::build_master(self.calibration.dark_sources.clone()));
     }
 
+    /// Starts combining the collected flats on a background thread.
+    ///
+    /// Flat darks, if any, are combined first on this thread; there are usually
+    /// only a handful and they are short exposures.
+    fn build_master_flat(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        if self.calibration.flat_sources.is_empty() {
+            self.error = Some("Add some flat frames first".into());
+            return;
+        }
+
+        let flat_dark = if self.calibration.flat_dark_sources.is_empty() {
+            None
+        } else {
+            let frames: Result<Vec<Arc<FitsImage>>, _> = self
+                .calibration
+                .flat_dark_sources
+                .iter()
+                .map(|p| fits_core::read_fits(p).map(Arc::new))
+                .collect();
+            match frames
+                .map_err(|e| e.to_string())
+                .and_then(|f| calib::build_master_median(&f).map_err(|e| e.to_string()))
+            {
+                Ok(master) => Some(Arc::new(master)),
+                Err(message) => {
+                    self.error = Some(format!("Flat darks: {message}"));
+                    return;
+                }
+            }
+        };
+
+        self.job = Some(Job::build_flat(
+            self.calibration.flat_sources.clone(),
+            flat_dark,
+        ));
+    }
+
+    /// Loads a gain map saved earlier, or any frame to normalise into one.
+    fn load_master_flat(&mut self, path: &Path) {
+        match fits_core::read_fits(path) {
+            Ok(image) => {
+                self.calibration.flat = Some(Arc::new(MasterFlat::from_image(&image)));
+                self.calibration.flat_sources = vec![path.to_path_buf()];
+                self.calibration.flat_path = Some(path.to_path_buf());
+                self.calibration.apply_flat = true;
+                self.refresh_after_calibration_change();
+                self.remember_calibration();
+                self.toast = Some(Toast::new("Master flat loaded"));
+            }
+            Err(e) => self.error = Some(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Writes the gain map so it can be reused in another session.
+    fn save_master_flat(&mut self, path: &Path) {
+        let Some(flat) = self.calibration.flat.as_ref() else {
+            return;
+        };
+        let history = vec![format!(
+            "fitsview: master flat combined from {} frames",
+            flat.source_count
+        )];
+        match fits_core::write_fits(path, &flat.to_image(), &history) {
+            Ok(()) => {
+                self.calibration.flat_path = Some(path.to_path_buf());
+                self.remember_calibration();
+                self.toast = Some(Toast::new("Master flat saved"));
+            }
+            Err(e) => self.error = Some(format!("Could not save: {e}")),
+        }
+    }
+
     /// Loads a master that was saved earlier, or any single frame to use as one.
     fn load_master_dark(&mut self, path: &Path) {
         match fits_core::read_fits(path) {
             Ok(image) => {
                 self.calibration.dark = Some(Arc::new(MasterFrame::from_image(&image)));
                 self.calibration.dark_sources = vec![path.to_path_buf()];
+                self.calibration.dark_path = Some(path.to_path_buf());
                 self.calibration.apply_dark = true;
                 self.calibrated.clear();
                 self.refresh_after_calibration_change();
+                self.remember_calibration();
                 self.toast = Some(Toast::new("Master dark loaded"));
             }
             Err(e) => self.error = Some(format!("{}: {e}", path.display())),
@@ -616,7 +806,11 @@ impl Model {
             dark.source_count
         )];
         match fits_core::write_fits(path, &dark.to_image(), &history) {
-            Ok(()) => self.toast = Some(Toast::new("Master dark saved")),
+            Ok(()) => {
+                self.calibration.dark_path = Some(path.to_path_buf());
+                self.remember_calibration();
+                self.toast = Some(Toast::new("Master dark saved"));
+            }
             Err(e) => self.error = Some(format!("Could not save: {e}")),
         }
     }
@@ -633,7 +827,12 @@ impl Model {
             return;
         }
         let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
-        self.job = Some(Job::export(paths, self.calibration.dark.clone(), directory));
+        self.job = Some(Job::export(
+            paths,
+            self.calibration.dark.clone(),
+            self.calibration.flat.clone(),
+            directory,
+        ));
     }
 
     /// Collects progress from the background job. Called once per frame.
@@ -655,6 +854,15 @@ impl Model {
                     self.refresh_after_calibration_change();
                     self.toast = Some(Toast::new(self.calibration.summary()));
                 }
+                jobs::Update::Finished(jobs::Outcome::Flat(flat)) => {
+                    if flat.unusable > 0 {
+                        log::warn!("master flat has {} unusable pixels", flat.unusable);
+                    }
+                    self.calibration.flat = Some(Arc::new(*flat));
+                    self.calibration.apply_flat = true;
+                    self.refresh_after_calibration_change();
+                    self.toast = Some(Toast::new(self.calibration.flat_summary()));
+                }
                 jobs::Update::Finished(jobs::Outcome::Exported { written, directory }) => {
                     self.toast = Some(Toast::new(format!(
                         "Wrote {written} file{} to {}",
@@ -674,6 +882,56 @@ impl Model {
         true
     }
 
+    /// Records the master paths in the folder's sidecar, so reopening the
+    /// folder restores the calibration setup.
+    fn remember_calibration(&mut self) {
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        let mut existing = sidecar::load(&folder.dir);
+        existing.master_dark = self
+            .calibration
+            .dark_path
+            .as_ref()
+            .map(|p| p.display().to_string());
+        existing.master_flat = self
+            .calibration
+            .flat_path
+            .as_ref()
+            .map(|p| p.display().to_string());
+        if let Err(e) = sidecar::save(&folder.dir, &existing) {
+            log::warn!("could not record calibration paths: {e}");
+        }
+    }
+
+    /// Reloads the masters a previous session used with this folder.
+    ///
+    /// A path that no longer exists is skipped quietly: calibration frames get
+    /// moved and deleted, and refusing to open the folder over it would be
+    /// worse than starting without them.
+    fn restore_calibration(&mut self) {
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        let saved = sidecar::load(&folder.dir);
+        let existing_error = self.error.clone();
+
+        if let Some(path) = saved.master_dark.as_ref().map(PathBuf::from) {
+            if path.exists() {
+                self.load_master_dark(&path);
+            }
+        }
+        if let Some(path) = saved.master_flat.as_ref().map(PathBuf::from) {
+            if path.exists() {
+                self.load_master_flat(&path);
+            }
+        }
+        // Restoring is not itself news, so undo anything those loads announced.
+        // The scan's own message, such as an empty folder, must survive.
+        self.toast = None;
+        self.error = existing_error;
+    }
+
     /// Re-examines whether the master suits the current image, and redisplays.
     fn refresh_after_calibration_change(&mut self) {
         self.calibrated.clear();
@@ -687,23 +945,48 @@ impl Model {
         self.calibration.blocked = None;
         self.calibration.warnings.clear();
 
-        let (Some(dark), Some(loaded)) = (self.calibration.dark.as_ref(), self.loaded.as_ref())
-        else {
+        let Some(loaded) = self.loaded.as_ref() else {
             return;
         };
+        let shape = format!(
+            "{}x{}x{}",
+            loaded.image.width, loaded.image.height, loaded.image.channels
+        );
 
-        if dark.matches(&loaded.image) {
-            self.calibration.warnings = calib::check_compatibility(dark, &loaded.image).warnings;
-        } else {
-            // Dimensions are the one mismatch that cannot be worked around.
-            self.calibration.blocked = Some(format!(
-                "The master is {}, but this image is {}x{}x{}",
-                dark.shape(),
-                loaded.image.width,
-                loaded.image.height,
-                loaded.image.channels
-            ));
+        // Dimensions are the one mismatch that cannot be worked around, so they
+        // block. Everything else is advisory.
+        let mut blocked = None;
+        let mut warnings = Vec::new();
+
+        if let Some(dark) = self.calibration.dark.as_ref() {
+            if dark.matches(&loaded.image) {
+                warnings.extend(calib::check_compatibility(dark, &loaded.image).warnings);
+            } else {
+                blocked = Some(format!(
+                    "The dark is {}, but this image is {shape}",
+                    dark.shape()
+                ));
+            }
         }
+
+        if let Some(flat) = self.calibration.flat.as_ref() {
+            if flat.matches(&loaded.image) {
+                if flat.unusable > 0 {
+                    warnings.push(format!(
+                        "{} pixels of the flat carry too little signal and will show as blank",
+                        flat.unusable
+                    ));
+                }
+            } else {
+                blocked = Some(format!(
+                    "The flat is {}, but this image is {shape}",
+                    flat.shape()
+                ));
+            }
+        }
+
+        self.calibration.blocked = blocked;
+        self.calibration.warnings = warnings;
     }
 
     /// Marks the uploaded texture as stale without reloading the image.
@@ -756,6 +1039,7 @@ impl Model {
                 self.loader.reset();
                 self.folder = Some(folder);
                 self.show_selection();
+                self.restore_calibration();
             }
             Err(e) => {
                 log::warn!("could not scan {}: {e}", dir.display());
@@ -885,10 +1169,12 @@ impl Model {
 
     /// The image as it should be displayed: calibrated, or the original.
     fn calibrated_version(&mut self, path: &Path, image: &Arc<FitsImage>) -> Arc<FitsImage> {
-        let Some(dark) = self.calibration.active_dark() else {
+        if !self.calibration.is_active() {
             return Arc::clone(image);
-        };
-        if !dark.matches(image) {
+        }
+        let dark = self.calibration.active_dark().filter(|d| d.matches(image));
+        let flat = self.calibration.active_flat().filter(|f| f.matches(image));
+        if dark.is_none() && flat.is_none() {
             // Reported through `blocked`; showing the raw image beats showing
             // nothing.
             return Arc::clone(image);
@@ -896,7 +1182,7 @@ impl Model {
         if let Some(cached) = self.calibrated.get(path) {
             return cached;
         }
-        match calib::subtract_dark(image, dark) {
+        match calib::calibrate(image, dark, flat) {
             Ok(result) => {
                 let result = Arc::new(result);
                 self.calibrated
@@ -2058,6 +2344,307 @@ mod tests {
         let mut m = Model::new();
         m.handle(Action::StartExport(out.path().to_path_buf()));
         assert!(m.job.is_none());
+    }
+
+    /// Writes `count` flat frames with a vignetting pattern.
+    fn flats(count: usize, width: usize, height: usize, corner: f64) -> (TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(width, height, 16);
+        let (cx, cy) = ((width as f64 - 1.0) / 2.0, (height as f64 - 1.0) / 2.0);
+        let max_r = (cx * cx + cy * cy).sqrt().max(1.0);
+        let pixels: Vec<f64> = (0..width * height)
+            .map(|i| {
+                let (x, y) = ((i % width) as f64, (i / width) as f64);
+                let r = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() / max_r;
+                (1.0 - (1.0 - corner) * r) * 20_000.0
+            })
+            .collect();
+        let paths = (0..count)
+            .map(|i| {
+                write_synthetic(dir.path(), &format!("flat_{i}.fits"), &spec, &pixels).unwrap()
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    #[test]
+    fn building_a_master_flat_produces_a_gain_map() {
+        let dir = folder_of(1, 16, 16);
+        let (_flats_dir, flat_paths) = flats(3, 16, 16, 0.5);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddFlats(flat_paths));
+        assert_eq!(m.calibration.flat_sources.len(), 3);
+
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        let flat = m
+            .calibration
+            .flat
+            .as_ref()
+            .expect("a gain map should exist");
+        assert_eq!(flat.source_count, 3);
+        assert!(m.calibration.apply_flat, "building should switch it on");
+        assert!(m.calibration.flat_summary().contains("3 frames"));
+    }
+
+    #[test]
+    fn applying_a_flat_evens_out_the_frame() {
+        // A uniformly lit sky seen through vignetting comes back uniform.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 16usize);
+        let (cx, cy) = ((w as f64 - 1.0) / 2.0, (h as f64 - 1.0) / 2.0);
+        let max_r = (cx * cx + cy * cy).sqrt();
+        let gains: Vec<f64> = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f64, (i / w) as f64);
+                let r = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() / max_r;
+                1.0 - 0.5 * r
+            })
+            .collect();
+        let light: Vec<f64> = gains.iter().map(|g| g * 2000.0).collect();
+        let spec = SyntheticSpec::new(w, h, 16);
+        write_synthetic(dir.path(), "light.fits", &spec, &light).unwrap();
+
+        let (_flats_dir, flat_paths) = flats(1, w, h, 0.5);
+
+        let (mut m, _spy) = model_over(dir.path());
+        let before = m.loaded.as_ref().unwrap().image.data.clone();
+        let spread_before = before.iter().copied().fold(0.0f32, f32::max)
+            - before.iter().copied().fold(f32::MAX, f32::min);
+
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        let after = &m.loaded.as_ref().unwrap().image.data;
+        let spread_after = after.iter().copied().fold(0.0f32, f32::max)
+            - after.iter().copied().fold(f32::MAX, f32::min);
+
+        assert!(
+            spread_after < spread_before / 10.0,
+            "the flat should even the frame: spread {spread_before} became {spread_after}"
+        );
+    }
+
+    #[test]
+    fn dark_and_flat_can_be_applied_together() {
+        let dir = folder_of(1, 16, 16);
+        let (_darks_dir, dark_paths) = darks(1, 16, 16, 50.0);
+        let (_flats_dir, flat_paths) = flats(1, 16, 16, 0.8);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        assert!(m.calibration.apply_dark && m.calibration.apply_flat);
+        assert!(m.calibration.blocked.is_none());
+        assert!(m.loaded.is_some(), "the image should still display");
+    }
+
+    #[test]
+    fn the_flat_can_be_toggled_independently_of_the_dark() {
+        let dir = folder_of(1, 16, 16);
+        let (_flats_dir, flat_paths) = flats(1, 16, 16, 0.6);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        let generation = m.generation;
+        m.handle(Action::ToggleApplyFlat);
+        assert!(!m.calibration.apply_flat);
+        assert_ne!(m.generation, generation, "the texture must be rebuilt");
+
+        m.handle(Action::ToggleApplyFlat);
+        assert!(m.calibration.apply_flat);
+    }
+
+    #[test]
+    fn a_flat_cannot_be_toggled_before_one_is_built() {
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleApplyFlat);
+        assert!(!m.calibration.apply_flat);
+    }
+
+    #[test]
+    fn a_flat_of_the_wrong_size_blocks_calibration_with_a_reason() {
+        let dir = folder_of(1, 20, 15);
+        let (_flats_dir, flat_paths) = flats(1, 8, 8, 0.7);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        let reason = m.calibration.blocked.as_ref().expect("should be reported");
+        assert!(reason.contains("flat"), "{reason}");
+        assert!(m.calibration.active_flat().is_none());
+        assert!(m.loaded.is_some(), "the raw image should still show");
+    }
+
+    #[test]
+    fn a_blank_flat_is_reported_rather_than_producing_an_empty_image() {
+        let dir = folder_of(1, 8, 8);
+        let blanks = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(8, 8, 16);
+        let path = write_synthetic(blanks.path(), "cap_on.fits", &spec, &vec![0.0; 64]).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddFlats(vec![path]));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        assert!(m.calibration.flat.is_none(), "a blank flat must be refused");
+        assert!(m.error.is_some(), "the user should be told why");
+    }
+
+    #[test]
+    fn a_flat_with_unusable_pixels_warns() {
+        let dir = folder_of(1, 8, 8);
+        let flats_dir = tempfile::tempdir().unwrap();
+        let mut pixels = vec![10_000.0; 64];
+        pixels[0] = 0.0;
+        let spec = SyntheticSpec::new(8, 8, 16);
+        let path = write_synthetic(flats_dir.path(), "f.fits", &spec, &pixels).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddFlats(vec![path]));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        assert_eq!(m.calibration.flat.as_ref().unwrap().unusable, 1);
+        assert!(
+            m.calibration
+                .warnings
+                .iter()
+                .any(|w| w.contains("too little signal")),
+            "expected a warning, got {:?}",
+            m.calibration.warnings
+        );
+    }
+
+    #[test]
+    fn building_a_flat_with_no_flats_reports_it() {
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::BuildMasterFlat);
+        assert!(m.job.is_none());
+        assert!(m.error.is_some());
+    }
+
+    #[test]
+    fn a_gain_map_survives_being_saved_and_loaded() {
+        let dir = folder_of(1, 12, 12);
+        let (flats_dir, flat_paths) = flats(3, 12, 12, 0.5);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+        let original = m.calibration.flat.as_ref().unwrap().gain.clone();
+
+        let saved = flats_dir.path().join("master_flat.fits");
+        m.handle(Action::SaveMasterFlat(saved.clone()));
+        m.handle(Action::ClearFlats);
+        assert!(!m.calibration.has_flat());
+
+        m.handle(Action::LoadMasterFlat(saved));
+        let reloaded = m.calibration.flat.as_ref().expect("should have loaded");
+        assert_eq!(reloaded.source_count, 3);
+        for (a, b) in reloaded.gain.iter().zip(original.iter()) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn calibration_setup_is_restored_when_the_folder_is_reopened() {
+        // The sidecar remembers which masters were used with this folder.
+        let dir = folder_of(2, 12, 12);
+        let library = tempfile::tempdir().unwrap();
+
+        let (_darks_dir, dark_paths) = darks(2, 12, 12, 40.0);
+        let (_flats_dir, flat_paths) = flats(2, 12, 12, 0.6);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+        m.handle(Action::SaveMasterDark(library.path().join("dark.fits")));
+
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+        m.handle(Action::SaveMasterFlat(library.path().join("flat.fits")));
+
+        // Reopen, as though the application had been restarted.
+        let (m2, _spy2) = model_over(dir.path());
+        assert!(m2.calibration.has_dark(), "the dark should come back");
+        assert!(m2.calibration.has_flat(), "the flat should come back");
+        assert_eq!(m2.calibration.dark.as_ref().unwrap().source_count, 2);
+    }
+
+    #[test]
+    fn a_calibration_frame_that_has_been_moved_away_is_skipped_quietly() {
+        let dir = folder_of(1, 12, 12);
+        let library = tempfile::tempdir().unwrap();
+        let (_darks_dir, dark_paths) = darks(1, 12, 12, 40.0);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+        let saved = library.path().join("dark.fits");
+        m.handle(Action::SaveMasterDark(saved.clone()));
+
+        std::fs::remove_file(&saved).unwrap();
+
+        let (m2, _spy2) = model_over(dir.path());
+        assert!(!m2.calibration.has_dark());
+        assert!(m2.error.is_none(), "a missing master must not be an error");
+        assert!(m2.loaded.is_some(), "the folder should still open");
+    }
+
+    #[test]
+    fn exporting_applies_both_frames_in_the_right_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(8, 8, 16);
+        write_synthetic(dir.path(), "l.fits", &spec, &vec![600.0; 64]).unwrap();
+        let (_darks_dir, dark_paths) = darks(1, 8, 8, 100.0);
+        // A uniform flat has a gain of exactly 1, so the arithmetic is easy to
+        // check: 600 minus 100, then divided by 1.
+        let flats_dir = tempfile::tempdir().unwrap();
+        let flat_path =
+            write_synthetic(flats_dir.path(), "f.fits", &spec, &vec![5000.0; 64]).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+        m.handle(Action::AddFlats(vec![flat_path]));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        finish_job(&mut m);
+
+        let written = fits_core::read_fits(&out.path().join("l_cal.fits")).unwrap();
+        assert!(
+            (written.data[0] - 500.0).abs() < 1.0,
+            "got {}",
+            written.data[0]
+        );
+
+        let bytes = std::fs::read(out.path().join("l_cal.fits")).unwrap();
+        let text = String::from_utf8_lossy(&bytes[..2880]);
+        assert!(text.contains("dark subtracted"), "{text}");
+        assert!(text.contains("flat divided"));
     }
 
     #[test]

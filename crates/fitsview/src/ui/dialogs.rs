@@ -18,6 +18,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("F2", "Rename"),
     ("S", "Toggle the automatic stretch"),
     ("D", "Toggle dark calibration"),
+    ("Shift+F", "Toggle flat calibration"),
     ("F / 1", "Fit to window / actual size"),
     ("Scroll", "Zoom about the pointer"),
     ("Drag", "Pan"),

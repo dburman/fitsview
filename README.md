@@ -13,7 +13,7 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 6 complete. Phase 7 is next.
+**Status:** Phases 0 to 7 complete. Phase 8 is next.
 
 | Phase | State |
 |-------|-------|
@@ -24,7 +24,7 @@ criteria all pass.
 | 4 — Delete, rename, flag | Done |
 | 5 — Stretch | Done |
 | 6 — Dark calibration | Done |
-| 7 — Flat calibration | Not started |
+| 7 — Flat calibration | Done |
 | 8 — Packaging | Not started |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 8
@@ -362,7 +362,7 @@ fitsview/
 │   │       ├── image.rs    # FitsImage, Geometry, pixel conversion, statistics
 │   │       ├── reader.rs   # read_fits, is_fits_path (write_fits in Phase 6)
 │   │       ├── stretch.rs  # midtone transfer auto-stretch and lookup tables
-│   │       ├── calib.rs    # master frames, dark subtraction, flats in Phase 7
+│   │       ├── calib.rs    # master frames, dark subtraction, flat division
 │   │       └── testutil.rs # synthetic FITS generator (feature "test-util")
 │   │   ├── tests/
 │   │   │   └── properties.rs   # proptest: parser must never panic
@@ -1535,22 +1535,69 @@ pub fn calibrate(
 
 ### Acceptance criteria
 
-- [ ] Unit test: a master flat built from frames with a known gradient normalises
+- [x] Unit test: a master flat built from frames with a known gradient normalises
       to a mean of 1.0.
-- [ ] Unit test: dividing a light by a synthetic flat with known vignetting
+- [x] Unit test: dividing a light by a synthetic flat with known vignetting
       recovers a flat field, to within floating-point tolerance.
-- [ ] Unit test: calibration order. A light with both a dark offset and a gain
-      pattern is recovered correctly only when the dark is subtracted first.
-      Assert that dividing first gives a measurably different, wrong answer.
-- [ ] Unit test: gain below `MIN_GAIN` produces `NaN`, is counted in `unusable`,
+- [x] Unit test: calibration order. Dividing before subtracting leaves a
+      gradient more than ten times larger than doing it correctly.
+- [x] Unit test: gain below `MIN_GAIN` produces `NaN`, is counted in `unusable`,
       and does not produce an infinity.
-- [ ] Unit test: a flat whose mean is zero or negative is refused with an error
+- [x] Unit test: a flat whose mean is zero or negative is refused with an error
       rather than producing an all-`NaN` image.
-- [ ] Unit test: an RGB flat is normalised by one global mean, so a colour cast
+- [x] Unit test: an RGB flat is normalised by one global mean, so a colour cast
       in the flat is preserved rather than divided away.
-- [ ] Unit test: all four combinations of dark and flat, present or absent.
-- [ ] Sidecar restores calibration paths on reopen.
-- [ ] Applying dark and flat to a 24 MP image adds under 100 ms per image.
+- [x] Unit test: all four combinations of dark and flat, present or absent.
+- [x] Sidecar restores calibration paths on reopen.
+- [x] Applying dark and flat to a 24 MP image adds under 100 ms. Measured at
+      17.8 ms for both together.
+
+### What Phase 7 actually produced
+
+397 tests pass across the workspace, up from 391.
+
+**Two tests failed at first, and the tests were wrong, not the code.** Both
+concerned what a gain map does to overall brightness. Normalising a flat by its
+mean preserves the frame's **average** brightness, not its peak, so a vignetted
+frame calibrates to an even field sitting at the light's own mean rather than at
+its bright centre. That is the conventional and correct result. The assertions
+now state that relationship explicitly, with a comment, instead of asserting a
+number that merely looked plausible.
+
+**A bug in this phase's own plumbing, worth recording.** The function deciding
+whether a master can be applied still had its Phase 6 shape: it returned early
+unless a dark was present, so a flat-only setup silently produced no warnings
+and no size check. Two tests caught it. The rewritten version checks each frame
+independently, and a dimension mismatch in either one blocks.
+
+**Measured on a 6000 x 4000 frame:**
+
+| Operation | Time |
+|-----------|------|
+| Subtract a dark | 6.6 ms |
+| Dark and flat together | 17.8 ms |
+| Combine five frames into a master | 36 ms |
+
+**Decisions worth knowing:**
+
+- The order lives in one place, `calibrate`, so a caller cannot get it wrong:
+  subtract, clamp at zero, then divide.
+- A gain map is stored normalised, and files this crate writes are marked so
+  they are not normalised twice on reload. Any other image loaded as a flat is
+  normalised on the way in, so a single frame can serve as a flat without being
+  combined first.
+- A blank flat is refused with an explanation rather than producing an image of
+  entirely undefined pixels. Loading one from disk is the exception: it falls
+  back to no correction, because refusing to open a file the user asked for is
+  worse than applying nothing.
+- Flat darks are combined on the interface thread. There are usually only a
+  handful and they are short exposures; the flats themselves go to the
+  background worker.
+- `Shift+F` toggles the flat. Plain `F` fits the image to the window and is used
+  constantly, so it was not worth stealing.
+- The sidecar remembers which masters were used with a folder, by absolute path
+  since calibration frames live elsewhere. A master that has been moved or
+  deleted is skipped quietly on reopen rather than reported as an error.
 
 ### Note on bias frames
 

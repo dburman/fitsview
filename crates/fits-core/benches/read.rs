@@ -10,7 +10,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use fits_core::calib::{build_master_median, subtract_dark};
+use fits_core::calib::{build_master_flat, build_master_median, calibrate, subtract_dark};
 use fits_core::stretch::{build_lut, compute_stretch, StretchParams};
 use fits_core::testutil::{synthetic_fits, SyntheticSpec};
 use fits_core::{finite_min_max, read_fits_from_bytes};
@@ -85,6 +85,18 @@ fn bench_calibration(c: &mut Criterion) {
     group.bench_function("build master from 5 frames 24 MP", |b| {
         let frames: Vec<_> = (0..5).map(|_| image.clone()).collect();
         b.iter(|| black_box(build_master_median(black_box(&frames))));
+    });
+
+    // The plan requires dark and flat together to stay under 100 ms per image.
+    let flat = build_master_flat(std::slice::from_ref(&image), None).expect("flat");
+    group.bench_function("dark and flat together 24 MP", |b| {
+        b.iter(|| {
+            black_box(calibrate(
+                black_box(&image),
+                Some(black_box(&master)),
+                Some(black_box(&flat)),
+            ))
+        });
     });
     group.finish();
 }

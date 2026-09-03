@@ -180,18 +180,29 @@ Use real darks matching a real light if you have them. Work on a copy.
 
 ## Phase 7 — Flat calibration
 
-- [ ] A master flat built from real flats shows the expected vignetting pattern:
-      bright centre, darker corners.
-- [ ] Applying the flat visibly evens out corner brightness and removes dust
-      shadows.
-- [ ] Applying dark and flat together looks right. Dividing before subtracting
-      would smear the dark signal across the frame, which shows as an uneven
-      background that the stretch exaggerates.
-- [ ] A deliberately bad flat, for example one taken with the lens cap on,
-      produces a warning naming the number of unusable pixels rather than an
-      image full of bright speckles.
+Real flats matter here: synthetic ones cannot show dust shadows.
+
+- [ ] `Add flats…` and `Build master` produce a gain map, and the panel reports
+      the frame count.
+- [ ] Saving the gain map and viewing it shows the expected vignetting pattern:
+      bright centre, darker corners, with dust shadows as dark rings.
+- [ ] `Shift+F` applies it, and corner brightness visibly evens out. Turn the
+      stretch on first; vignetting is far easier to see stretched.
+- [ ] Dust shadows disappear.
+- [ ] Plain `F` still fits the image to the window and does not toggle the flat.
+- [ ] Applying dark and flat together looks right. An uneven background that the
+      stretch exaggerates would suggest the order is wrong.
+- [ ] Adding flat darks changes the result, and the panel says how many will be
+      subtracted.
+- [ ] A flat taken with the lens cap on is refused with an explanation, rather
+      than producing an image of bright speckles.
+- [ ] A flat with a very dark corner reports how many pixels are unusable, and
+      those pixels render black rather than as bright noise.
 - [ ] A colour flat does not turn the image grey.
-- [ ] Calibration settings are restored when the folder is reopened.
+- [ ] A flat of the wrong dimensions disables the toggle and says so.
+- [ ] Export applies both frames and the written files record it in HISTORY.
+- [ ] Calibration settings are restored when the folder is reopened. Moving a
+      master away and reopening skips it quietly rather than erroring.
 
 ---
 

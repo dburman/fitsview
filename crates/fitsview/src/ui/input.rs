@@ -84,6 +84,9 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             // View.
             Key::S => out.push(Action::ToggleStretch),
             Key::D => out.push(Action::ToggleApplyDark),
+            // Plain F fits the image to the window, so the flat takes Shift+F
+            // rather than stealing a key people use constantly.
+            Key::F if modifiers.shift => out.push(Action::ToggleApplyFlat),
             Key::F => out.push(Action::FitToWindow),
             Key::Num1 => out.push(Action::ActualSize),
             Key::Questionmark | Key::H => out.push(Action::ToggleHelp),
@@ -238,6 +241,21 @@ mod tests {
             vec![Action::RequestDelete],
             "an unmodified Delete must go through the confirmation path"
         );
+    }
+
+    #[test]
+    fn shift_f_toggles_the_flat_while_plain_f_still_fits() {
+        let plain = Frame {
+            keys: key(Key::F),
+            ..frame()
+        };
+        assert_eq!(actions_for(&plain), vec![Action::FitToWindow]);
+
+        let shifted = Frame {
+            keys: vec![(Key::F, Modifiers::SHIFT)],
+            ..frame()
+        };
+        assert_eq!(actions_for(&shifted), vec![Action::ToggleApplyFlat]);
     }
 
     #[test]

@@ -30,6 +30,17 @@ pub struct Sidecar {
     #[serde(default)]
     pub flagged: Vec<String>,
 
+    /// Master dark last used with this folder, as an absolute path.
+    ///
+    /// A path rather than a name, because calibration frames usually live
+    /// elsewhere. A stale one is ignored on load rather than reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_dark: Option<String>,
+
+    /// Master flat last used with this folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_flat: Option<String>,
+
     /// Anything this version does not recognise, kept so that settings written
     /// by a newer version are not silently discarded when this one saves.
     #[serde(flatten)]
@@ -93,7 +104,11 @@ pub fn save(dir: &Path, sidecar: &Sidecar) -> std::io::Result<()> {
 
     // If there is nothing to remember, remove the file rather than leaving an
     // empty one cluttering the user's folder.
-    if sidecar.flagged.is_empty() && sidecar.unknown.is_empty() {
+    if sidecar.flagged.is_empty()
+        && sidecar.unknown.is_empty()
+        && sidecar.master_dark.is_none()
+        && sidecar.master_flat.is_none()
+    {
         return match std::fs::remove_file(&target) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -188,6 +203,39 @@ mod tests {
         );
         assert!(text.contains("/darks/master.fits"));
         assert!(text.contains("b.fits"));
+    }
+
+    #[test]
+    fn calibration_paths_survive_a_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Sidecar {
+            master_dark: Some("/library/master_dark.fits".into()),
+            master_flat: Some("/library/master_flat.fits".into()),
+            ..Sidecar::default()
+        };
+        save(dir.path(), &s).unwrap();
+
+        let back = load(dir.path());
+        assert_eq!(
+            back.master_dark.as_deref(),
+            Some("/library/master_dark.fits")
+        );
+        assert_eq!(
+            back.master_flat.as_deref(),
+            Some("/library/master_flat.fits")
+        );
+    }
+
+    #[test]
+    fn a_sidecar_holding_only_calibration_paths_is_kept() {
+        // It is not empty just because nothing is flagged.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Sidecar {
+            master_dark: Some("/library/d.fits".into()),
+            ..Sidecar::default()
+        };
+        save(dir.path(), &s).unwrap();
+        assert!(path_for(dir.path()).exists());
     }
 
     #[test]

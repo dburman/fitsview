@@ -22,7 +22,7 @@ use crate::image::FitsImage;
 const ROW_CHUNK: usize = 64;
 
 /// Why calibration could not be carried out.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CalibError {
     /// No frames were supplied to combine.
@@ -47,6 +47,16 @@ pub enum CalibError {
         frame: String,
         /// Shape of the light frame.
         image: String,
+    },
+
+    /// The combined flat has no usable signal, so it cannot become a gain map.
+    ///
+    /// Seen when the frames were taken with the lens cap on, or when the flat
+    /// dark subtracted everything away.
+    #[error("the flat has an average level of {mean:.3}, so it carries no signal")]
+    FlatHasNoSignal {
+        /// The average level that was measured.
+        mean: f64,
     },
 }
 
@@ -129,6 +139,252 @@ impl MasterFrame {
                 .or_else(|| image.header.get_f64("SET-TEMP")),
         }
     }
+}
+
+/// Gain below this is treated as no data.
+///
+/// A heavily vignetted corner, or a flat taken with the lens cap left on,
+/// produces gain values near zero. Dividing by them turns read noise into
+/// enormous bright pixels, so those pixels are marked undefined instead. The
+/// value allows a corner at one hundredth of centre brightness, which is far
+/// darker than any usable optical system.
+pub const MIN_GAIN: f32 = 0.01;
+
+/// A master flat, normalised into a gain map whose average pixel is 1.0.
+///
+/// A flat records how sensitivity varies across the frame: vignetting, dust
+/// shadows, and pixel-to-pixel differences. Normalising turns it into a map
+/// that can be divided out, removing the variation while leaving overall
+/// brightness alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MasterFlat {
+    /// Width in pixels.
+    pub width: usize,
+    /// Height in pixels.
+    pub height: usize,
+    /// 1 for mono, 3 for colour.
+    pub channels: usize,
+    /// Gain per pixel, centred on 1.0. Pixels with no usable signal are `NaN`.
+    pub gain: Vec<f32>,
+    /// How many frames were combined.
+    pub source_count: usize,
+    /// Pixels whose gain was too low to use, and are therefore undefined.
+    pub unusable: usize,
+}
+
+impl MasterFlat {
+    /// A human-readable shape, for error messages.
+    #[must_use]
+    pub fn shape(&self) -> String {
+        format!("{}x{}x{}", self.width, self.height, self.channels)
+    }
+
+    /// Whether this flat can be applied to `image`.
+    #[must_use]
+    pub fn matches(&self, image: &FitsImage) -> bool {
+        self.width == image.width && self.height == image.height && self.channels == image.channels
+    }
+
+    /// The fraction of pixels that carry no usable signal.
+    #[must_use]
+    pub fn unusable_fraction(&self) -> f64 {
+        if self.gain.is_empty() {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.unusable as f64 / self.gain.len() as f64
+        }
+    }
+
+    /// Turns the gain map back into an image, so it can be displayed or saved.
+    #[must_use]
+    pub fn to_image(&self) -> FitsImage {
+        let (min, max) = crate::image::finite_min_max(&self.gain);
+        FitsImage {
+            width: self.width,
+            height: self.height,
+            channels: self.channels,
+            data: self.gain.clone(),
+            header: FitsHeader {
+                cards: vec![
+                    ("NCOMBINE".to_string(), self.source_count.to_string()),
+                    ("FITSVFLT".to_string(), "T".to_string()),
+                ],
+            },
+            min,
+            max,
+        }
+    }
+
+    /// Rebuilds a gain map from an image saved earlier.
+    ///
+    /// A file already normalised by this crate is used as it is. Anything else
+    /// is normalised on load, so that any single frame can serve as a flat.
+    #[must_use]
+    pub fn from_image(image: &FitsImage) -> Self {
+        let already_normalised = image.header.get_bool("FITSVFLT").unwrap_or(false);
+        let source_count = image.header.get_i64("NCOMBINE").unwrap_or(1).max(1) as usize;
+
+        let gain = if already_normalised {
+            image.data.clone()
+        } else {
+            match normalise(&image.data) {
+                Ok(gain) => gain,
+                // A file with no signal cannot be a gain map; a flat one at
+                // least leaves the image untouched rather than destroying it.
+                Err(_) => vec![1.0; image.data.len()],
+            }
+        };
+        let unusable = gain.iter().filter(|v| !v.is_finite()).count();
+
+        Self {
+            width: image.width,
+            height: image.height,
+            channels: image.channels,
+            gain,
+            source_count,
+            unusable,
+        }
+    }
+}
+
+/// Divides samples by their own average, producing a gain map centred on 1.0.
+///
+/// Colour images are normalised by a **single** average across all three
+/// planes, not one per plane. Normalising each plane separately would divide
+/// out the camera's colour response along with the vignetting and render the
+/// image grey, which is the same mistake the stretch had to be corrected for.
+///
+/// # Errors
+///
+/// Returns [`CalibError::FlatHasNoSignal`] if the average is not positive.
+fn normalise(data: &[f32]) -> Result<Vec<f32>, CalibError> {
+    let (sum, count) = data
+        .par_iter()
+        .filter(|v| v.is_finite())
+        .fold(|| (0.0f64, 0usize), |(s, n), v| (s + f64::from(*v), n + 1))
+        .reduce(|| (0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+
+    if count == 0 {
+        return Err(CalibError::FlatHasNoSignal { mean: 0.0 });
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mean = sum / count as f64;
+    if !mean.is_finite() || mean <= 0.0 {
+        return Err(CalibError::FlatHasNoSignal { mean });
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mean32 = mean as f32;
+    Ok(data
+        .par_iter()
+        .map(|v| {
+            let gain = v / mean32;
+            // Too little signal to divide by: mark it rather than amplifying
+            // noise into an enormous bright pixel.
+            if gain.is_finite() && gain >= MIN_GAIN {
+                gain
+            } else {
+                f32::NAN
+            }
+        })
+        .collect())
+}
+
+/// Combines flat frames into a gain map.
+///
+/// A flat must itself be calibrated before use: flats are short exposures that
+/// still carry the sensor's read offset, so `flat_dark` should be a dark of the
+/// same exposure as the flats, or a bias. Bias frames work in this slot exactly
+/// as flat darks do, because nothing here inspects the exposure time.
+///
+/// # Errors
+///
+/// Returns [`CalibError::NoFrames`] for an empty list,
+/// [`CalibError::Mismatched`] if the frames disagree in shape,
+/// [`CalibError::WrongSize`] if `flat_dark` does not match, and
+/// [`CalibError::FlatHasNoSignal`] if the combined flat is blank.
+pub fn build_master_flat(
+    flats: &[Arc<FitsImage>],
+    flat_dark: Option<&MasterFrame>,
+) -> Result<MasterFlat, CalibError> {
+    let combined = build_master_median(flats)?;
+
+    let mut data = combined.data;
+    if let Some(dark) = flat_dark {
+        if dark.width != combined.width
+            || dark.height != combined.height
+            || dark.channels != combined.channels
+        {
+            return Err(CalibError::WrongSize {
+                frame: dark.shape(),
+                image: format!(
+                    "{}x{}x{}",
+                    combined.width, combined.height, combined.channels
+                ),
+            });
+        }
+        data.par_iter_mut()
+            .zip(dark.data.par_iter())
+            .for_each(|(sample, offset)| {
+                if sample.is_finite() && offset.is_finite() {
+                    *sample = (*sample - *offset).max(0.0);
+                } else {
+                    *sample = f32::NAN;
+                }
+            });
+    }
+
+    let gain = normalise(&data)?;
+    let unusable = gain.iter().filter(|v| !v.is_finite()).count();
+
+    Ok(MasterFlat {
+        width: combined.width,
+        height: combined.height,
+        channels: combined.channels,
+        gain,
+        source_count: combined.source_count,
+        unusable,
+    })
+}
+
+/// Divides a light frame by a gain map.
+///
+/// Call this **after** subtracting the dark, never before. See [`calibrate`].
+///
+/// # Errors
+///
+/// Returns [`CalibError::WrongSize`] if the frames disagree in shape.
+pub fn divide_flat(light: &FitsImage, flat: &MasterFlat) -> Result<FitsImage, CalibError> {
+    if !flat.matches(light) {
+        return Err(CalibError::WrongSize {
+            frame: flat.shape(),
+            image: format!("{}x{}x{}", light.width, light.height, light.channels),
+        });
+    }
+
+    let mut data = light.data.clone();
+    data.par_iter_mut()
+        .zip(flat.gain.par_iter())
+        .for_each(|(sample, gain)| {
+            if sample.is_finite() && gain.is_finite() && *gain >= MIN_GAIN {
+                *sample /= *gain;
+            } else {
+                *sample = f32::NAN;
+            }
+        });
+
+    let (min, max) = crate::image::finite_min_max(&data);
+    Ok(FitsImage {
+        width: light.width,
+        height: light.height,
+        channels: light.channels,
+        data,
+        header: light.header.clone(),
+        min,
+        max,
+    })
 }
 
 /// How well a calibration frame matches the light it will be applied to.
@@ -339,22 +595,37 @@ pub fn subtract_dark(light: &FitsImage, dark: &MasterFrame) -> Result<FitsImage,
 /// Applies whatever calibration is available to a light frame.
 ///
 /// The single entry point the application calls, so the order of operations
-/// lives in one place. Flat division joins it in Phase 7, after the dark
-/// subtraction, never before.
+/// lives in exactly one place. That order is:
+///
+/// 1. subtract the dark, clamping at zero;
+/// 2. divide by the flat's gain map.
+///
+/// **Subtraction before division, always.** Dividing first would scale the
+/// dark's own signal by the gain map and smear it across the frame, in a way
+/// nothing later can undo. The mistake is silent, which is why there is a test
+/// asserting the wrong order gives a measurably different answer.
 ///
 /// # Errors
 ///
 /// Returns [`CalibError::WrongSize`] if a frame does not match the light.
-pub fn calibrate(light: &FitsImage, dark: Option<&MasterFrame>) -> Result<FitsImage, CalibError> {
-    match dark {
-        Some(dark) => subtract_dark(light, dark),
-        None => Ok(light.clone()),
+pub fn calibrate(
+    light: &FitsImage,
+    dark: Option<&MasterFrame>,
+    flat: Option<&MasterFlat>,
+) -> Result<FitsImage, CalibError> {
+    let subtracted = match dark {
+        Some(dark) => subtract_dark(light, dark)?,
+        None => light.clone(),
+    };
+    match flat {
+        Some(flat) => divide_flat(&subtracted, flat),
+        None => Ok(subtracted),
     }
 }
 
 /// The `HISTORY` lines describing what calibration was applied.
 #[must_use]
-pub fn history_for(dark: Option<&MasterFrame>) -> Vec<String> {
+pub fn history_for(dark: Option<&MasterFrame>, flat: Option<&MasterFlat>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(dark) = dark {
         let exposure = dark
@@ -364,6 +635,15 @@ pub fn history_for(dark: Option<&MasterFrame>) -> Vec<String> {
             "fitsview: dark subtracted (master of {} frame{}{exposure})",
             dark.source_count,
             if dark.source_count == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some(flat) = flat {
+        out.push(format!(
+            "fitsview: flat divided (master of {} frame{}, {} unusable pixel{})",
+            flat.source_count,
+            if flat.source_count == 1 { "" } else { "s" },
+            flat.unusable,
+            if flat.unusable == 1 { "" } else { "s" }
         ));
     }
     out
@@ -627,7 +907,7 @@ mod tests {
     #[test]
     fn calibrating_without_a_dark_returns_the_light_unchanged() {
         let light = image(2, 2, &[1.0, 2.0, 3.0, 4.0]);
-        let out = calibrate(&light, None).unwrap();
+        let out = calibrate(&light, None, None).unwrap();
         assert_eq!(out.data, light.data);
     }
 
@@ -699,6 +979,319 @@ mod tests {
         assert_eq!(back.temperature, Some(-10.0));
     }
 
+    /// A gain pattern shaped like vignetting: bright centre, dark corners.
+    fn vignette(width: usize, height: usize, corner: f64) -> Vec<f64> {
+        let (cx, cy) = ((width as f64 - 1.0) / 2.0, (height as f64 - 1.0) / 2.0);
+        let max_r = (cx * cx + cy * cy).sqrt().max(1.0);
+        (0..width * height)
+            .map(|i| {
+                let (x, y) = ((i % width) as f64, (i / width) as f64);
+                let r = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() / max_r;
+                1.0 - (1.0 - corner) * r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_master_flat_normalises_to_an_average_of_one() {
+        // The definition of a gain map: dividing by it must not change overall
+        // brightness, only even it out.
+        let (w, h) = (16, 16);
+        let pattern: Vec<f64> = vignette(w, h, 0.5).iter().map(|g| g * 20_000.0).collect();
+        let flat = build_master_flat(&[image(w, h, &pattern)], None).unwrap();
+
+        let mean: f64 =
+            flat.gain.iter().map(|v| f64::from(*v)).sum::<f64>() / flat.gain.len() as f64;
+        assert!((mean - 1.0).abs() < 1e-4, "average gain was {mean}");
+        assert_eq!(flat.unusable, 0);
+    }
+
+    #[test]
+    fn dividing_by_the_flat_recovers_an_even_field() {
+        // What flat calibration is for. A uniformly lit sky seen through a
+        // vignetting optical system comes back uniform.
+        let (w, h) = (24, 24);
+        let gains = vignette(w, h, 0.4);
+
+        let flat_pixels: Vec<f64> = gains.iter().map(|g| g * 30_000.0).collect();
+        let light_pixels: Vec<f64> = gains.iter().map(|g| g * 1000.0).collect();
+
+        let flat = build_master_flat(&[image(w, h, &flat_pixels)], None).unwrap();
+        let out = divide_flat(&image(w, h, &light_pixels), &flat).unwrap();
+
+        let first = out.data[0];
+        for (i, v) in out.data.iter().enumerate() {
+            assert!(
+                (v - first).abs() < first * 0.001,
+                "pixel {i} was {v}, expected about {first}"
+            );
+        }
+
+        // Normalising by the mean preserves the frame's AVERAGE brightness, not
+        // its peak. The even field therefore sits at the light's own mean, which
+        // is below the bright centre it started from. That is the correct and
+        // conventional result: a gain map centred on 1.0 neither brightens nor
+        // darkens the frame overall.
+        let light_mean: f64 = light_pixels.iter().sum::<f64>() / light_pixels.len() as f64;
+        assert!(
+            (f64::from(first) - light_mean).abs() < light_mean * 0.001,
+            "calibrated level {first} should equal the light's mean {light_mean}"
+        );
+    }
+
+    #[test]
+    fn the_dark_must_be_subtracted_before_the_flat_divides() {
+        // The order that matters. Dividing first scales the dark's own signal
+        // by the gain map and smears it across the frame. The mistake is
+        // silent, so this asserts the two orders really do differ.
+        let (w, h) = (16, 16);
+        let gains = vignette(w, h, 0.4);
+
+        let flat_pixels: Vec<f64> = gains.iter().map(|g| g * 20_000.0).collect();
+        let flat = build_master_flat(&[image(w, h, &flat_pixels)], None).unwrap();
+
+        // A light of even sky, seen through the vignetting, plus a constant
+        // dark offset that is NOT attenuated by the optics.
+        let offset = 500.0;
+        let light_pixels: Vec<f64> = gains.iter().map(|g| g * 1000.0 + offset).collect();
+        let light = image(w, h, &light_pixels);
+        let dark = build_master_median(&[image(w, h, &vec![offset; w * h])]).unwrap();
+
+        // Correct order: subtract, then divide.
+        let right = calibrate(&light, Some(&dark), Some(&flat)).unwrap();
+
+        // Wrong order: divide, then subtract.
+        let divided = divide_flat(&light, &flat).unwrap();
+        let wrong = subtract_dark(&divided, &dark).unwrap();
+
+        let spread = |img: &FitsImage| {
+            let finite: Vec<f32> = img.data.iter().copied().filter(|v| v.is_finite()).collect();
+            let mean = finite.iter().map(|v| f64::from(*v)).sum::<f64>() / finite.len() as f64;
+            let variance = finite
+                .iter()
+                .map(|v| (f64::from(*v) - mean).powi(2))
+                .sum::<f64>()
+                / finite.len() as f64;
+            variance.sqrt()
+        };
+
+        let right_spread = spread(&right);
+        let wrong_spread = spread(&wrong);
+
+        assert!(
+            right_spread < 1.0,
+            "the correct order should give an even field, spread was {right_spread}"
+        );
+        assert!(
+            wrong_spread > right_spread * 10.0,
+            "the wrong order should leave a visible gradient: right {right_spread}, wrong {wrong_spread}"
+        );
+    }
+
+    #[test]
+    fn a_flat_dark_is_subtracted_before_normalising() {
+        // Flats are short exposures and still carry the read offset, so the
+        // gain map must be built from the signal alone.
+        let (w, h) = (8, 8);
+        let signal: Vec<f64> = (0..w * h).map(|i| 1000.0 + i as f64 * 10.0).collect();
+        let offset = 200.0;
+        let raw: Vec<f64> = signal.iter().map(|v| v + offset).collect();
+
+        let flat_dark = build_master_median(&[image(w, h, &vec![offset; w * h])]).unwrap();
+        let with_dark = build_master_flat(&[image(w, h, &raw)], Some(&flat_dark)).unwrap();
+        let without_dark = build_master_flat(&[image(w, h, &signal)], None).unwrap();
+
+        for (a, b) in with_dark.gain.iter().zip(without_dark.gain.iter()) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn a_flat_dark_of_the_wrong_size_is_refused() {
+        let flat_dark = build_master_median(&[image(4, 4, &[1.0; 16])]).unwrap();
+        let err = build_master_flat(&[image(8, 8, &[100.0; 64])], Some(&flat_dark)).unwrap_err();
+        assert!(matches!(err, CalibError::WrongSize { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_blank_flat_is_refused_rather_than_producing_an_all_undefined_image() {
+        // The lens cap case. Every pixel would divide by nothing.
+        let err = build_master_flat(&[image(4, 4, &[0.0; 16])], None).unwrap_err();
+        assert!(
+            matches!(err, CalibError::FlatHasNoSignal { .. }),
+            "got {err:?}"
+        );
+
+        let err = build_master_flat(&[image(4, 4, &[-5.0; 16])], None).unwrap_err();
+        assert!(
+            matches!(err, CalibError::FlatHasNoSignal { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_flat_of_only_undefined_pixels_is_refused() {
+        let err = build_master_flat(&[image(2, 2, &[f64::NAN; 4])], None).unwrap_err();
+        assert!(
+            matches!(err, CalibError::FlatHasNoSignal { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pixels_with_too_little_gain_become_undefined_and_are_counted() {
+        // Dividing by a near-zero gain would turn read noise into an enormous
+        // bright pixel, which looks like a star.
+        let (w, h) = (4, 4);
+        let mut pixels = vec![10_000.0; w * h];
+        pixels[0] = 0.0; // a completely dead corner
+        pixels[1] = 1.0; // and one almost dead
+
+        let flat = build_master_flat(&[image(w, h, &pixels)], None).unwrap();
+        assert_eq!(flat.unusable, 2, "both should be marked unusable");
+        assert!(flat.gain[0].is_nan());
+        assert!(flat.gain[1].is_nan());
+        assert!(flat.unusable_fraction() > 0.0);
+
+        let out = divide_flat(&image(w, h, &vec![500.0; w * h]), &flat).unwrap();
+        assert!(out.data[0].is_nan(), "no gain means no calibrated value");
+        assert!(out.data[1].is_nan());
+        assert!(
+            out.data.iter().all(|v| !v.is_infinite()),
+            "dividing must never produce an infinity"
+        );
+
+        // The dead pixels drag the average down, so the surviving pixels have a
+        // gain slightly above 1 and come out correspondingly brighter. Assert
+        // against the gain map rather than against the input, since that is the
+        // relationship the division actually promises.
+        let expected = 500.0 / flat.gain[5];
+        assert!(
+            (out.data[5] - expected).abs() < 0.01,
+            "good pixel was {}, expected {expected}",
+            out.data[5]
+        );
+        assert!(out.data[5].is_finite());
+    }
+
+    #[test]
+    fn a_colour_flat_is_normalised_by_one_global_average() {
+        // Normalising each plane separately would divide out the camera's
+        // colour response and leave a grey image, the same mistake the stretch
+        // had to be corrected for.
+        let (w, h) = (8, 8);
+        let mut pixels = vec![0.0; w * h * 3];
+        for (i, v) in pixels.iter_mut().enumerate() {
+            *v = match i / (w * h) {
+                0 => 30_000.0,
+                1 => 20_000.0,
+                _ => 10_000.0,
+            };
+        }
+        let spec = SyntheticSpec::new(w, h, -32).with_channels(3);
+        let colour =
+            Arc::new(read_fits_from_bytes(&synthetic_fits(&spec, &pixels).unwrap()).unwrap());
+
+        let flat = build_master_flat(&[colour], None).unwrap();
+        assert_eq!(flat.channels, 3);
+
+        // Global mean is 20000, so the three planes keep their ratio.
+        assert!(
+            (flat.gain[0] - 1.5).abs() < 0.01,
+            "red gain {}",
+            flat.gain[0]
+        );
+        assert!(
+            (flat.gain[w * h] - 1.0).abs() < 0.01,
+            "green gain {}",
+            flat.gain[w * h]
+        );
+        assert!(
+            (flat.gain[2 * w * h] - 0.5).abs() < 0.01,
+            "blue gain {}",
+            flat.gain[2 * w * h]
+        );
+    }
+
+    #[test]
+    fn a_flat_of_the_wrong_size_is_refused_when_dividing() {
+        let flat = build_master_flat(&[image(2, 2, &[100.0; 4])], None).unwrap();
+        let err = divide_flat(&image(4, 4, &[1.0; 16]), &flat).unwrap_err();
+        assert!(matches!(err, CalibError::WrongSize { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn every_combination_of_dark_and_flat_behaves() {
+        let (w, h) = (8, 8);
+        let light = image(w, h, &vec![1000.0; w * h]);
+        let dark = build_master_median(&[image(w, h, &vec![100.0; w * h])]).unwrap();
+        // A uniform flat has a gain of exactly 1 everywhere, so it changes
+        // nothing and the four cases are easy to reason about.
+        let flat = build_master_flat(&[image(w, h, &vec![5000.0; w * h])], None).unwrap();
+
+        let neither = calibrate(&light, None, None).unwrap();
+        assert!((neither.data[0] - 1000.0).abs() < 0.01);
+
+        let dark_only = calibrate(&light, Some(&dark), None).unwrap();
+        assert!((dark_only.data[0] - 900.0).abs() < 0.01);
+
+        let flat_only = calibrate(&light, None, Some(&flat)).unwrap();
+        assert!((flat_only.data[0] - 1000.0).abs() < 0.01);
+
+        let both = calibrate(&light, Some(&dark), Some(&flat)).unwrap();
+        assert!((both.data[0] - 900.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_gain_map_round_trips_through_an_image() {
+        let (w, h) = (8, 8);
+        let pattern: Vec<f64> = vignette(w, h, 0.6).iter().map(|g| g * 15_000.0).collect();
+        let flat = build_master_flat(
+            &[
+                image(w, h, &pattern),
+                image(w, h, &pattern),
+                image(w, h, &pattern),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let encoded = crate::reader::encode_fits(&flat.to_image(), &[]).unwrap();
+        let reloaded = read_fits_from_bytes(&encoded).unwrap();
+        let back = MasterFlat::from_image(&reloaded);
+
+        assert_eq!(back.source_count, 3, "the frame count must survive saving");
+        for (a, b) in back.gain.iter().zip(flat.gain.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_image_loaded_as_a_flat_is_normalised_on_the_way_in() {
+        // So that any single frame can serve as a flat without being combined.
+        let img = image(4, 4, &[8000.0; 16]);
+        let flat = MasterFlat::from_image(&img);
+        for gain in &flat.gain {
+            assert!((gain - 1.0).abs() < 1e-4, "gain {gain}");
+        }
+    }
+
+    #[test]
+    fn a_blank_image_loaded_as_a_flat_falls_back_to_no_correction() {
+        // Refusing to open the file would be worse than applying nothing.
+        let img = image(4, 4, &[0.0; 16]);
+        let flat = MasterFlat::from_image(&img);
+        assert!(flat.gain.iter().all(|g| (g - 1.0).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn undefined_light_pixels_stay_undefined_through_the_flat() {
+        let flat = build_master_flat(&[image(1, 2, &[100.0, 100.0])], None).unwrap();
+        let out = divide_flat(&image(1, 2, &[f64::NAN, 500.0]), &flat).unwrap();
+        assert!(out.data[0].is_nan());
+        assert!((out.data[1] - 500.0).abs() < 0.01);
+    }
+
     #[test]
     fn history_describes_what_was_applied() {
         let dark = build_master_median(&[
@@ -707,11 +1300,30 @@ mod tests {
             image_with(1, 1, &[1.0], 300.0, -10.0),
         ])
         .unwrap();
-        let history = history_for(Some(&dark));
+        let history = history_for(Some(&dark), None);
         assert_eq!(history.len(), 1);
         assert!(history[0].contains("3 frames"), "{}", history[0]);
         assert!(history[0].contains("300.0 s"), "{}", history[0]);
 
-        assert!(history_for(None).is_empty());
+        assert!(history_for(None, None).is_empty());
+    }
+
+    #[test]
+    fn history_records_the_flat_and_its_unusable_pixels() {
+        let mut pixels = vec![10_000.0; 16];
+        pixels[0] = 0.0;
+        let flat = build_master_flat(&[image(4, 4, &pixels)], None).unwrap();
+
+        let history = history_for(None, Some(&flat));
+        assert_eq!(history.len(), 1);
+        assert!(history[0].contains("flat divided"), "{}", history[0]);
+        assert!(history[0].contains("1 unusable pixel"), "{}", history[0]);
+
+        // Both together, in the order they are applied.
+        let dark = build_master_median(&[image(4, 4, &[1.0; 16])]).unwrap();
+        let both = history_for(Some(&dark), Some(&flat));
+        assert_eq!(both.len(), 2);
+        assert!(both[0].contains("dark"), "dark should be recorded first");
+        assert!(both[1].contains("flat"));
     }
 }

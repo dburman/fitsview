@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
-use fits_core::calib::{self, MasterFrame};
+use fits_core::calib::{self, MasterFlat, MasterFrame};
 use fits_core::{read_fits, write_fits, FitsImage};
 
 /// What a finished job produced.
@@ -20,6 +20,8 @@ use fits_core::{read_fits, write_fits, FitsImage};
 pub enum Outcome {
     /// A master calibration frame was built.
     Master(Box<MasterFrame>),
+    /// A master flat, already normalised into a gain map, was built.
+    Flat(Box<MasterFlat>),
     /// Calibrated copies were written, and this many succeeded.
     Exported {
         /// Files written.
@@ -90,9 +92,41 @@ impl Job {
         }
     }
 
+    /// Combines the frames at `paths` into a master flat, subtracting
+    /// `flat_dark` from them first when one is supplied.
+    #[must_use]
+    pub fn build_flat(paths: Vec<PathBuf>, flat_dark: Option<Arc<MasterFrame>>) -> Self {
+        let (tx, updates) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let total = paths.len();
+
+        std::thread::Builder::new()
+            .name("fitsview-build-flat".into())
+            .spawn(move || {
+                build_flat_worker(&paths, flat_dark.as_deref(), &tx, &worker_cancel);
+            })
+            .ok();
+
+        Self {
+            label: "Building master flat".into(),
+            updates,
+            cancel,
+            done: 0,
+            total,
+            item: String::new(),
+            finished: false,
+        }
+    }
+
     /// Writes a calibrated copy of every file in `paths` into `directory`.
     #[must_use]
-    pub fn export(paths: Vec<PathBuf>, dark: Option<Arc<MasterFrame>>, directory: PathBuf) -> Self {
+    pub fn export(
+        paths: Vec<PathBuf>,
+        dark: Option<Arc<MasterFrame>>,
+        flat: Option<Arc<MasterFlat>>,
+        directory: PathBuf,
+    ) -> Self {
         let (tx, updates) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -100,7 +134,16 @@ impl Job {
 
         std::thread::Builder::new()
             .name("fitsview-export".into())
-            .spawn(move || export_worker(&paths, dark.as_deref(), &directory, &tx, &worker_cancel))
+            .spawn(move || {
+                export_worker(
+                    &paths,
+                    dark.as_deref(),
+                    flat.as_deref(),
+                    &directory,
+                    &tx,
+                    &worker_cancel,
+                );
+            })
             .ok();
 
         Self {
@@ -172,28 +215,9 @@ impl Job {
 
 /// Reads every frame, then combines them.
 fn build_master_worker(paths: &[PathBuf], tx: &mpsc::Sender<Update>, cancel: &AtomicBool) {
-    let mut frames: Vec<Arc<FitsImage>> = Vec::with_capacity(paths.len());
-
-    for (index, path) in paths.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(Update::Cancelled);
-            return;
-        }
-        let _ = tx.send(Update::Progress {
-            done: index,
-            total: paths.len(),
-            item: file_name_of(path),
-        });
-
-        match read_fits(path) {
-            Ok(image) => frames.push(Arc::new(image)),
-            Err(e) => {
-                let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(path))));
-                return;
-            }
-        }
-    }
-
+    let Some(frames) = read_all(paths, tx, cancel) else {
+        return;
+    };
     match calib::build_master_median(&frames) {
         Ok(master) => {
             let _ = tx.send(Update::Progress {
@@ -209,6 +233,59 @@ fn build_master_worker(paths: &[PathBuf], tx: &mpsc::Sender<Update>, cancel: &At
     }
 }
 
+/// Reads every flat, then combines and normalises them.
+fn build_flat_worker(
+    paths: &[PathBuf],
+    flat_dark: Option<&MasterFrame>,
+    tx: &mpsc::Sender<Update>,
+    cancel: &AtomicBool,
+) {
+    let Some(frames) = read_all(paths, tx, cancel) else {
+        return;
+    };
+    match calib::build_master_flat(&frames, flat_dark) {
+        Ok(flat) => {
+            let _ = tx.send(Update::Progress {
+                done: paths.len(),
+                total: paths.len(),
+                item: "normalising".into(),
+            });
+            let _ = tx.send(Update::Finished(Outcome::Flat(Box::new(flat))));
+        }
+        Err(e) => {
+            let _ = tx.send(Update::Failed(e.to_string()));
+        }
+    }
+}
+
+/// Reads every path, reporting progress. Returns `None` if it stopped early.
+fn read_all(
+    paths: &[PathBuf],
+    tx: &mpsc::Sender<Update>,
+    cancel: &AtomicBool,
+) -> Option<Vec<Arc<FitsImage>>> {
+    let mut frames = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(Update::Cancelled);
+            return None;
+        }
+        let _ = tx.send(Update::Progress {
+            done: index,
+            total: paths.len(),
+            item: file_name_of(path),
+        });
+        match read_fits(path) {
+            Ok(image) => frames.push(Arc::new(image)),
+            Err(e) => {
+                let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(path))));
+                return None;
+            }
+        }
+    }
+    Some(frames)
+}
+
 /// Calibrates each file and writes it into the output folder.
 ///
 /// Originals are never opened for writing, and the output name always differs
@@ -216,6 +293,7 @@ fn build_master_worker(paths: &[PathBuf], tx: &mpsc::Sender<Update>, cancel: &At
 fn export_worker(
     paths: &[PathBuf],
     dark: Option<&MasterFrame>,
+    flat: Option<&MasterFlat>,
     directory: &Path,
     tx: &mpsc::Sender<Update>,
     cancel: &AtomicBool,
@@ -225,7 +303,7 @@ fn export_worker(
         return;
     }
 
-    let history = calib::history_for(dark);
+    let history = calib::history_for(dark, flat);
     let mut written = 0usize;
 
     for (index, path) in paths.iter().enumerate() {
@@ -247,7 +325,7 @@ fn export_worker(
             }
         };
 
-        let calibrated = match calib::calibrate(&light, dark) {
+        let calibrated = match calib::calibrate(&light, dark, flat) {
             Ok(image) => image,
             Err(e) => {
                 let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(path))));
@@ -399,6 +477,7 @@ mod tests {
         let mut job = Job::export(
             paths.clone(),
             Some(Arc::new(dark)),
+            None,
             out_dir.path().to_path_buf(),
         );
         let updates = run(&mut job);
@@ -429,7 +508,7 @@ mod tests {
         let (_dir, paths) = frames(2, 42.0);
         let out_dir = tempfile::tempdir().unwrap();
 
-        let mut job = Job::export(paths, None, out_dir.path().to_path_buf());
+        let mut job = Job::export(paths, None, None, out_dir.path().to_path_buf());
         run(&mut job);
 
         let image = fits_core::read_fits(&out_dir.path().join("f0_cal.fits")).unwrap();
@@ -444,7 +523,12 @@ mod tests {
             calib::build_master_median(&[Arc::new(fits_core::read_fits(&paths[0]).unwrap())])
                 .unwrap();
 
-        let mut job = Job::export(paths, Some(Arc::new(dark)), out_dir.path().to_path_buf());
+        let mut job = Job::export(
+            paths,
+            Some(Arc::new(dark)),
+            None,
+            out_dir.path().to_path_buf(),
+        );
         run(&mut job);
 
         let bytes = std::fs::read(out_dir.path().join("f0_cal.fits")).unwrap();
@@ -457,7 +541,7 @@ mod tests {
         // The output name always differs from the input name, so exporting in
         // place is safe rather than destructive.
         let (dir, paths) = frames(2, 77.0);
-        let mut job = Job::export(paths.clone(), None, dir.path().to_path_buf());
+        let mut job = Job::export(paths.clone(), None, None, dir.path().to_path_buf());
         run(&mut job);
 
         for path in &paths {
@@ -476,7 +560,7 @@ mod tests {
         let (_dir, paths) = frames(40, 100.0);
         let out_dir = tempfile::tempdir().unwrap();
 
-        let mut job = Job::export(paths, None, out_dir.path().to_path_buf());
+        let mut job = Job::export(paths, None, None, out_dir.path().to_path_buf());
         job.cancel();
         let updates = run(&mut job);
 
@@ -497,7 +581,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("new").join("nested");
 
-        let mut job = Job::export(paths, None, target.clone());
+        let mut job = Job::export(paths, None, None, target.clone());
         run(&mut job);
         assert!(target.join("f0_cal.fits").exists());
     }

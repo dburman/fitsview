@@ -20,6 +20,8 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
             ui.separator();
 
             actions.extend(darks_section(ui, model));
+            ui.separator();
+            actions.extend(flats_section(ui, model));
 
             if let Some(job) = &model.job {
                 ui.separator();
@@ -130,6 +132,106 @@ fn darks_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 .color(Color32::from_rgb(240, 200, 80))
                 .small(),
         );
+    }
+
+    actions
+}
+
+/// The flat frames section.
+fn flats_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let calibration = &model.calibration;
+    let busy = model.job.is_some();
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("Flats").strong());
+    ui.label(RichText::new(calibration.flat_summary()).weak().small());
+    if !calibration.flat_dark_sources.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "{} flat darks will be subtracted first",
+                calibration.flat_dark_sources.len()
+            ))
+            .weak()
+            .small(),
+        );
+    }
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!busy, Button::new("Add flats…"))
+            .on_hover_text("Evenly lit frames through the same optics as the lights")
+            .clicked()
+        {
+            if let Some(paths) = pick_files("Choose flat frames") {
+                actions.push(Action::AddFlats(paths));
+            }
+        }
+        if ui
+            .add_enabled(!busy, Button::new("Add flat darks…"))
+            .on_hover_text(
+                "Darks of the same exposure as the flats, or bias frames. \
+                 Flats are short exposures and still carry the read offset.",
+            )
+            .clicked()
+        {
+            if let Some(paths) = pick_files("Choose flat darks or bias frames") {
+                actions.push(Action::AddFlatDarks(paths));
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !busy && !calibration.flat_sources.is_empty(),
+                Button::new("Build master"),
+            )
+            .on_hover_text("Combine the flats into a gain map centred on 1.0")
+            .clicked()
+        {
+            actions.push(Action::BuildMasterFlat);
+        }
+        if ui
+            .add_enabled(!busy, Button::new("Load…"))
+            .on_hover_text("Use a gain map saved earlier")
+            .clicked()
+        {
+            if let Some(path) = pick_file("Open a master flat") {
+                actions.push(Action::LoadMasterFlat(path));
+            }
+        }
+        if ui
+            .add_enabled(!busy && calibration.has_flat(), Button::new("Save…"))
+            .clicked()
+        {
+            if let Some(path) = save_file("Save the master flat", "master_flat.fits") {
+                actions.push(Action::SaveMasterFlat(path));
+            }
+        }
+        if ui
+            .add_enabled(
+                !busy && (calibration.has_flat() || !calibration.flat_sources.is_empty()),
+                Button::new("Clear"),
+            )
+            .clicked()
+        {
+            actions.push(Action::ClearFlats);
+        }
+    });
+
+    ui.add_space(6.0);
+    let mut apply = calibration.apply_flat;
+    if ui
+        .add_enabled(
+            calibration.has_flat() && calibration.blocked.is_none(),
+            egui::Checkbox::new(&mut apply, "Apply flat (Shift+F)"),
+        )
+        .on_hover_text("Divided out after the dark is subtracted, never before")
+        .changed()
+    {
+        actions.push(Action::ToggleApplyFlat);
     }
 
     actions
