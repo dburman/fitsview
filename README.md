@@ -1,49 +1,55 @@
-# fitsview — Execution Plan
+# fitsview
 
-`fitsview` is a fast, cross-platform (Linux, macOS, Windows) desktop viewer for FITS
-files used in astrophotography. It is written in Rust.
-
-This README is an **execution plan**. It is self-contained: a developer can pick it
-up and build the application phase by phase without needing additional context.
-Work through the phases **in order**. Each phase ends with a checklist of
-acceptance criteria. Do not begin the next phase until the current phase's
-criteria all pass.
+A fast desktop viewer for the FITS images astrophotography produces. Written in
+Rust, it runs on Linux, macOS and Windows, and it is built for the job that
+follows a night's capture: going through a folder of frames, throwing out the
+ones ruined by cloud or tracking, calibrating the rest, and seeing what you
+actually caught.
 
 ---
 
-## 0. Product Summary
+## Features
 
-**Status:** All phases complete. Two gaps remain that need a human rather than
-more code: the application has never been tried against real capture files, and
-the manual checklist has never been run on Linux or Windows. See section 10.
+**Opening images.** Reads every common FITS format an astronomy camera writes:
+8, 16, 32 and 64-bit integers and 32 and 64-bit floats, signed or unsigned, mono
+or colour. A 24-megapixel frame decodes in about **5 ms**. Images are read on a
+background thread and neighbours are fetched before you ask for them, so holding
+down the arrow key through a folder never makes the window wait.
 
-| Phase | State |
-|-------|-------|
-| 0 — Bootstrap | Done |
-| 1 — FITS reader | Done |
-| 2 — Minimal viewer | Done |
-| 3 — Folder browsing | Done |
-| 4 — Delete, rename, flag | Done |
-| 5 — Stretch | Done |
-| 6 — Dark calibration | Done |
-| 7 — Flat calibration | Done |
-| 8 — Packaging | Done |
-| 9 — Debayering | Done |
+**Going through a folder.** Opens a folder and lists only the FITS files in it,
+in the order a human would expect: `light_2` before `light_10`. Step through with
+the arrow keys, Space, or Page Up and Down. The file list collapses to the edge
+when you want the image to fill the screen.
 
-Keep this table current. Phase 0 is project bootstrap; phases 1 through 8
-deliver the features below.
+**Culling.** Mark a frame to keep with `K`, delete one with `Delete`. Deleting
+always moves the file to the system trash, never destroys it, and a frame marked
+to keep always asks first. Rename with `F2`. Keep marks are stored beside the
+images, so they survive restarting and travel with the folder if you copy it.
 
-| # | Requirement | Phase |
-|---|-------------|-------|
-| a | Open FITS files quickly. Performance is the top priority. | 1, 2 |
-| b | Open a folder of FITS files; ignore non-FITS files. | 3 |
-| c1 | Delete files with a toggle button **and** a keyboard shortcut. | 4 |
-| c2 | Rename files quickly. | 4 |
-| d | Flag images to "keep". Flagged files need extra confirmation before deletion. | 4 |
-| e | Button to apply a standard astro stretch to all viewed images; can be turned off. | 5 |
-| f | Dark-frame calibration applied to all files in the folder. | 6 |
-| g | Flat-frame calibration applied to all files in the folder. | 7 |
-| h | Show one-shot colour frames in colour. | 9 |
+**Seeing the image.** A raw frame is almost black; `S` applies the standard
+midtone stretch that puts the sky background at a sensible brightness and brings
+the faint signal into view. Zoom with the wheel about the pointer, drag to pan,
+`F` to fit, `1` for actual size.
+
+**Calibration.** Combine dark frames into a master, using the median so a cosmic
+ray on one frame is discarded rather than smeared across every result, and
+subtract it with `D`. Do the same with flats to remove vignetting and dust
+shadows, applied with `Shift+F`. Both can be saved and reused, and each folder
+remembers which were used with it. Export writes calibrated copies of a whole
+folder in the background, never touching the originals.
+
+**One-shot colour.** A raw frame from a colour camera is a mosaic behind a grid
+of filters and displays as grey. `B` reconstructs the colour, automatically when
+the file records which filter pattern it used. Exports stay as mosaics, because
+that is what a stacker wants.
+
+**Knowing what you are looking at.** The metadata panel shows the FITS header,
+with the keywords that identify a frame pinned to the top and a filter for
+finding the rest.
+
+**Throughout.** Everything is reachable from the keyboard; press `?` for the
+list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
+by 498 automated tests that run on all three operating systems.
 
 ---
 
@@ -232,6 +238,52 @@ Windows-only build failure was caught during development:
 rustup target add x86_64-pc-windows-msvc
 cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 ```
+
+---
+
+## The plan behind it
+
+Everything below is the **execution plan** this application was built from, kept
+as the record of how and why. It is self-contained: a developer can pick it up
+and continue phase by phase without other context. Each phase ends with a
+checklist of acceptance criteria, and what the phase actually produced,
+including what went wrong, is written up beneath it.
+
+---
+
+## 0. Product Summary
+
+**Status:** All phases complete. Two gaps remain that need a human rather than
+more code: the application has never been tried against real capture files, and
+the manual checklist has never been run on Linux or Windows. See section 10.
+
+| Phase | State |
+|-------|-------|
+| 0 — Bootstrap | Done |
+| 1 — FITS reader | Done |
+| 2 — Minimal viewer | Done |
+| 3 — Folder browsing | Done |
+| 4 — Delete, rename, flag | Done |
+| 5 — Stretch | Done |
+| 6 — Dark calibration | Done |
+| 7 — Flat calibration | Done |
+| 8 — Packaging | Done |
+| 9 — Debayering | Done |
+
+Keep this table current. Phase 0 is project bootstrap; phases 1 through 8
+deliver the features below.
+
+| # | Requirement | Phase |
+|---|-------------|-------|
+| a | Open FITS files quickly. Performance is the top priority. | 1, 2 |
+| b | Open a folder of FITS files; ignore non-FITS files. | 3 |
+| c1 | Delete files with a toggle button **and** a keyboard shortcut. | 4 |
+| c2 | Rename files quickly. | 4 |
+| d | Flag images to "keep". Flagged files need extra confirmation before deletion. | 4 |
+| e | Button to apply a standard astro stretch to all viewed images; can be turned off. | 5 |
+| f | Dark-frame calibration applied to all files in the folder. | 6 |
+| g | Flat-frame calibration applied to all files in the folder. | 7 |
+| h | Show one-shot colour frames in colour. | 9 |
 
 ---
 
