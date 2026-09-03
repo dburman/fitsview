@@ -222,6 +222,12 @@ Real flats matter here: synthetic ones cannot show dust shadows.
       and agree with each other.
 - [ ] The filter narrows the cards as you type, matching keywords and values,
       and the count beside it updates.
+- [ ] The identifying keywords are at the top, above a rule, in this order where
+      the file has them: OBJECT, TELESCOP, CAMERAID, IMAGETYP, FILTER, EXPOSURE,
+      GAIN, CCD_TEMP, BAYERPAT, DATE-OBS. Everything else follows in the order
+      the file wrote it.
+- [ ] A file writing CCD-TEMP with a hyphen is pinned just the same as one
+      writing CCD_TEMP.
 - [ ] The metadata follows the selection when you step through a folder, and the
       filter stays put.
 - [ ] A file with a long header scrolls within its section rather than pushing

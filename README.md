@@ -1820,7 +1820,7 @@ after this one.
 3. **App icon** and window title.
 4. **Settings persistence**: stretch toggle, stretch params, last folder — via `eframe` `Storage`.
 5. **Error handling**: every failure surfaces as a non-blocking toast; never a panic. Add `std::panic::set_hook` that logs and shows a message box before exit.
-6. **Header viewer**: key `I` toggles a metadata section listing the header cards of the current file. It sits in the right-hand panel above the calibration controls, because deciding whether a dark suits a light is a question about exposure and temperature, and those are header values.
+6. **Header viewer**: key `I` toggles a metadata section listing the header cards of the current file. It sits in the right-hand panel above the calibration controls, because deciding whether a dark suits a light is a question about exposure and temperature, and those are header values. The keywords that identify a frame are pinned above the rest, in `ui::header::PINNED`: `OBJECT`, `TELESCOP`, `CAMERAID`, `IMAGETYP`, `FILTER`, `EXPOSURE`, `GAIN`, `CCD_TEMP`, `BAYERPAT`, `DATE-OBS`. Hyphen and underscore are treated as the same separator when matching, since programs disagree about which they write.
 7. **Histogram**: small histogram widget under the viewer. Optional.
 
 ### Acceptance criteria
