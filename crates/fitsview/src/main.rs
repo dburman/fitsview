@@ -169,7 +169,7 @@ mod tests {
         for expected in [
             "Next file",
             "Toggle the automatic stretch",
-            "Show the FITS header",
+            "Show or hide the image metadata",
         ] {
             assert!(text.contains(expected), "usage is missing {expected}");
         }

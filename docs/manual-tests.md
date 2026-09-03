@@ -216,7 +216,16 @@ Real flats matter here: synthetic ones cannot show dust shadows.
 
 - [ ] The release binary runs on a machine without a Rust toolchain.
 - [ ] The application icon appears in the dock, taskbar or launcher.
-- [ ] `I` shows the header, and the filter narrows it as you type.
+- [ ] The right panel shows the image metadata above the calibration controls,
+      and both sections collapse independently.
+- [ ] `I`, and clicking the section heading, both open and close the metadata,
+      and agree with each other.
+- [ ] The filter narrows the cards as you type, matching keywords and values,
+      and the count beside it updates.
+- [ ] The metadata follows the selection when you step through a folder, and the
+      filter stays put.
+- [ ] A file with a long header scrolls within its section rather than pushing
+      the calibration controls off the bottom.
 - [ ] Quitting and reopening restores the folder you were in, the stretch
       setting, and the stretch parameters.
 - [ ] `fitsview --help` lists every key that actually works.

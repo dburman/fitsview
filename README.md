@@ -583,8 +583,8 @@ fitsview/
 │       │       ├── toolbar.rs
 │       │       ├── viewer.rs
 │       │       ├── filelist.rs
-│       │       ├── calibration.rs # the darks, flats and export panel
-│       │       ├── header.rs  # the FITS header viewer
+│       │       ├── calibration.rs # the right panel: metadata and calibration
+│       │       ├── header.rs  # the metadata section of that panel
 │       │       └── dialogs.rs  # confirmation, rename editor, help, toasts
 │       └── tests/
 │           ├── rendering.rs    # end-to-end: file on disk -> texture
@@ -1298,7 +1298,7 @@ model, not the renderer.
 | `F2` | Rename |
 | `Ctrl+Z` | Undo last delete (where supported) |
 | `L` | Hide or show the file list |
-| `I` | Show the FITS header |
+| `I` | Show or hide the image metadata |
 | `S` | Toggle stretch (Phase 5) |
 | `D` | Toggle dark calibration (Phase 6) |
 | `Shift+F` | Toggle flat calibration (Phase 7) |
@@ -1816,7 +1816,7 @@ after this one.
 3. **App icon** and window title.
 4. **Settings persistence**: stretch toggle, stretch params, last folder — via `eframe` `Storage`.
 5. **Error handling**: every failure surfaces as a non-blocking toast; never a panic. Add `std::panic::set_hook` that logs and shows a message box before exit.
-6. **Header viewer**: key `I` toggles a panel listing all header cards of the current file.
+6. **Header viewer**: key `I` toggles a metadata section listing the header cards of the current file. It sits in the right-hand panel above the calibration controls, because deciding whether a dark suits a light is a question about exposure and temperature, and those are header values.
 7. **Histogram**: small histogram widget under the viewer. Optional.
 
 ### Acceptance criteria
@@ -1831,7 +1831,8 @@ after this one.
 - [x] The window carries an icon.
 - [x] Settings persist, including the folder from last time.
 - [x] A panic writes a log and shows a dialog rather than closing silently.
-- [x] `I` shows the FITS header, with a filter.
+- [x] `I` shows the image metadata, with a filter, in the same panel as the
+      calibration controls.
 - [ ] **Histogram: not built.** It was the one item marked optional in this
       phase, and the header viewer covers the same need — knowing what is in a
       frame — with more of the information a capture session actually raises

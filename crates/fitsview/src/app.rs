@@ -354,7 +354,7 @@ pub struct Model {
     /// scrolls to follow it. Clicking a row must not scroll it under the
     /// pointer, which is why this is not simply always on.
     pub scroll_to_selection: bool,
-    /// Whether the FITS header panel is showing.
+    /// Whether the metadata section of the right-hand panel is expanded.
     pub show_header: bool,
     /// Text narrowing the header panel.
     pub header_filter: String,
@@ -405,7 +405,7 @@ impl Model {
             show_help: false,
             show_filelist: true,
             scroll_to_selection: false,
-            show_header: false,
+            show_header: true,
             header_filter: String::new(),
             calibration: Calibration::default(),
             job: None,
@@ -2759,6 +2759,49 @@ mod tests {
         m.handle(Action::PreviousFile);
         settle(&mut m);
         assert_eq!(m.position_label(), "1 / 3");
+    }
+
+    #[test]
+    fn the_metadata_section_is_open_by_default_and_toggles() {
+        let mut m = Model::new();
+        assert!(
+            m.show_header,
+            "metadata should be visible without being asked for"
+        );
+
+        m.handle(Action::ToggleHeader);
+        assert!(!m.show_header);
+        m.handle(Action::ToggleHeader);
+        assert!(m.show_header);
+    }
+
+    #[test]
+    fn the_metadata_filter_is_remembered_while_stepping_through_files() {
+        // Looking for the same keyword across several frames is the reason to
+        // have a filter at all.
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::SetHeaderFilter("bitpix".into()));
+        assert_eq!(m.header_filter, "bitpix");
+
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        assert_eq!(m.header_filter, "bitpix", "the filter should persist");
+    }
+
+    #[test]
+    fn the_metadata_of_the_displayed_image_is_what_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(8, 8, 16)
+            .with_card("OBJECT", "'M31     '")
+            .with_card("EXPTIME", "               300.0");
+        write_synthetic(dir.path(), "light.fits", &spec, &vec![1.0; 64]).unwrap();
+
+        let (m, _spy) = model_over(dir.path());
+        let header = &m.loaded.as_ref().unwrap().image.header;
+        assert_eq!(header.get("OBJECT"), Some("M31"));
+        assert_eq!(header.get_f64("EXPTIME"), Some(300.0));
     }
 
     #[test]

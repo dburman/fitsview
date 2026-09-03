@@ -1,42 +1,68 @@
 //! The calibration panel, on the right.
 
-use egui::{Button, Color32, Panel, ProgressBar, RichText, Ui};
+use egui::{Button, CollapsingHeader, Color32, Panel, ProgressBar, RichText, ScrollArea, Ui};
 
 use crate::app::{Action, Model};
+use crate::ui::header;
 
 /// Width of the panel.
 const PANEL_WIDTH: f32 = 280.0;
 
-/// Draws the calibration panel and returns whatever the user asked for.
+/// Draws the right-hand panel: what is in the current image, and what is being
+/// applied to it.
+///
+/// Both live here because they answer the same question. Deciding whether a
+/// dark suits a light means comparing exposure and temperature, and those are
+/// header values; having them in a different panel meant looking away from the
+/// controls to check.
 pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
     let mut actions = Vec::new();
 
-    Panel::right("calibration")
+    Panel::right("inspector")
         .default_size(PANEL_WIDTH)
         .resizable(true)
         .show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.heading("Calibration");
-            ui.separator();
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .id_salt("inspector-scroll")
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
 
-            actions.extend(darks_section(ui, model));
-            ui.separator();
-            actions.extend(flats_section(ui, model));
+                    // The metadata section is opened and closed by the model, so
+                    // that the I key and a click on the header agree.
+                    let metadata = CollapsingHeader::new("Image metadata")
+                        .id_salt("metadata")
+                        .open(Some(model.show_header))
+                        .show(ui, |ui| actions.extend(header::section(ui, model)));
+                    if metadata.header_response.clicked() {
+                        actions.push(Action::ToggleHeader);
+                    }
 
-            if let Some(job) = &model.job {
-                ui.separator();
-                ui.label(RichText::new(&job.label).strong());
-                ui.add(ProgressBar::new(job.fraction()).show_percentage());
-                if !job.item.is_empty() {
-                    ui.label(RichText::new(&job.item).weak().small());
-                }
-                if ui.button("Stop").clicked() {
-                    actions.push(Action::CancelJob);
-                }
-            }
+                    ui.add_space(4.0);
+                    CollapsingHeader::new("Calibration")
+                        .id_salt("calibration")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            actions.extend(darks_section(ui, model));
+                            ui.separator();
+                            actions.extend(flats_section(ui, model));
 
-            ui.separator();
-            actions.extend(export_section(ui, model));
+                            if let Some(job) = &model.job {
+                                ui.separator();
+                                ui.label(RichText::new(&job.label).strong());
+                                ui.add(ProgressBar::new(job.fraction()).show_percentage());
+                                if !job.item.is_empty() {
+                                    ui.label(RichText::new(&job.item).weak().small());
+                                }
+                                if ui.button("Stop").clicked() {
+                                    actions.push(Action::CancelJob);
+                                }
+                            }
+
+                            ui.separator();
+                            actions.extend(export_section(ui, model));
+                        });
+                });
         });
 
     actions

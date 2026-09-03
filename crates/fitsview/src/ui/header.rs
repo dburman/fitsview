@@ -1,75 +1,77 @@
-//! The FITS header viewer.
+//! The metadata section of the right-hand panel.
 //!
 //! Every question about a frame that the image itself cannot answer, such as
-//! what exposure it was, which filter, what the sensor temperature was, is in
-//! the header. Showing it is a few lines and saves reaching for another tool.
+//! what exposure it was, which filter, or what the sensor temperature was, is
+//! in the FITS header. It sits beside the calibration controls because those
+//! are the questions calibration raises: whether this dark matches this light
+//! is a question about exposure and temperature, and the answer is here.
 
-use egui::{Panel, RichText, ScrollArea, TextEdit, Ui};
+use egui::{Grid, RichText, ScrollArea, TextEdit, Ui};
 
 use crate::app::{Action, Model};
 
-/// Width of the panel.
-const PANEL_WIDTH: f32 = 320.0;
+/// Height beyond which the card list scrolls rather than growing.
+///
+/// A capture program can write a hundred cards, which would push the
+/// calibration controls off the bottom of the panel.
+const MAX_HEIGHT: f32 = 320.0;
 
-/// Draws the header panel when it is showing.
-pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
+/// Draws the metadata section into an existing panel.
+pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
     let mut actions = Vec::new();
-    if !model.show_header {
+
+    let Some(loaded) = model.loaded.as_ref() else {
+        ui.label(RichText::new("No image").weak());
+        return actions;
+    };
+
+    let mut filter = model.header_filter.clone();
+    if ui
+        .add(
+            TextEdit::singleline(&mut filter)
+                .hint_text("Filter by keyword or value")
+                .desired_width(f32::INFINITY),
+        )
+        .changed()
+    {
+        actions.push(Action::SetHeaderFilter(filter.clone()));
+    }
+
+    let cards = matching_cards(&loaded.image.header, &filter);
+    ui.label(
+        RichText::new(if filter.trim().is_empty() {
+            format!("{} cards", cards.len())
+        } else {
+            format!(
+                "{} of {} cards",
+                cards.len(),
+                loaded.image.header.cards.len()
+            )
+        })
+        .weak()
+        .small(),
+    );
+
+    if cards.is_empty() {
+        ui.label(RichText::new("Nothing matches").weak());
         return actions;
     }
 
-    Panel::right("header")
-        .default_size(PANEL_WIDTH)
-        .resizable(true)
+    ScrollArea::vertical()
+        .max_height(MAX_HEIGHT)
+        .auto_shrink([false, true])
+        .id_salt("header-cards")
         .show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("Header");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text("Close (I)").clicked() {
-                        actions.push(Action::ToggleHeader);
-                    }
-                });
-            });
-
-            let Some(loaded) = model.loaded.as_ref() else {
-                ui.label(RichText::new("No image").weak());
-                return;
-            };
-
-            let mut filter = model.header_filter.clone();
-            if ui
-                .add(
-                    TextEdit::singleline(&mut filter)
-                        .hint_text("Filter by keyword or value")
-                        .desired_width(f32::INFINITY),
-                )
-                .changed()
-            {
-                actions.push(Action::SetHeaderFilter(filter.clone()));
-            }
-            ui.separator();
-
-            let cards = matching_cards(&loaded.image.header, &filter);
-            if cards.is_empty() {
-                ui.label(RichText::new("Nothing matches").weak());
-                return;
-            }
-
-            ScrollArea::vertical()
-                .auto_shrink([false, false])
+            Grid::new("header-grid")
+                .num_columns(2)
+                .spacing([12.0, 2.0])
+                .striped(true)
                 .show(ui, |ui| {
-                    egui::Grid::new("header-grid")
-                        .num_columns(2)
-                        .spacing([12.0, 2.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for (keyword, value) in cards {
-                                ui.label(RichText::new(keyword).monospace().strong());
-                                ui.label(RichText::new(value).monospace());
-                                ui.end_row();
-                            }
-                        });
+                    for (keyword, value) in cards {
+                        ui.label(RichText::new(keyword).monospace().strong());
+                        ui.label(RichText::new(value).monospace());
+                        ui.end_row();
+                    }
                 });
         });
 

@@ -26,6 +26,7 @@ const KEY_STRETCH_TARGET: &str = "stretch_target_bg";
 const KEY_CONFIRM_EVERY_DELETE: &str = "confirm_every_delete";
 const KEY_LAST_FOLDER: &str = "last_folder";
 const KEY_SHOW_FILELIST: &str = "show_filelist";
+const KEY_SHOW_HEADER: &str = "show_header";
 
 /// The `eframe` application: a model, a cached texture, and the glue between
 /// them.
@@ -75,6 +76,7 @@ impl FitsViewApp {
         app.model.confirm_every_delete =
             eframe::get_value(storage, KEY_CONFIRM_EVERY_DELETE).unwrap_or(false);
         app.model.show_filelist = eframe::get_value(storage, KEY_SHOW_FILELIST).unwrap_or(true);
+        app.model.show_header = eframe::get_value(storage, KEY_SHOW_HEADER).unwrap_or(true);
 
         // Reopen the folder from last time, but only when the command line did
         // not name something, and only if it is still there.
@@ -158,6 +160,7 @@ impl eframe::App for FitsViewApp {
             &self.model.confirm_every_delete,
         );
         eframe::set_value(storage, KEY_SHOW_FILELIST, &self.model.show_filelist);
+        eframe::set_value(storage, KEY_SHOW_HEADER, &self.model.show_header);
         if let Some(folder) = self.model.folder.as_ref() {
             eframe::set_value(storage, KEY_LAST_FOLDER, &folder.dir.display().to_string());
         }
@@ -183,9 +186,6 @@ impl eframe::App for FitsViewApp {
             self.model.handle(action);
         }
         for action in calibration::show(ui, &self.model) {
-            self.model.handle(action);
-        }
-        for action in header::show(ui, &self.model) {
             self.model.handle(action);
         }
 
@@ -279,6 +279,19 @@ mod tests {
 
         let restored = FitsViewApp::with_storage(None, Some(&storage));
         assert!(!restored.model.show_filelist);
+    }
+
+    #[test]
+    fn the_metadata_section_state_is_remembered() {
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::ToggleHeader);
+        assert!(!app.model.show_header);
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(!restored.model.show_header);
     }
 
     #[test]
