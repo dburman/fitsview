@@ -39,7 +39,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # On a private repository, Actions minutes bill at 2x for Windows and
+        # 10x for macOS, so the full matrix would make those two roughly 80% of
+        # the cost of every push. They run on the default branch, where a
+        # cross-platform break matters, and on demand. Branches and pull
+        # requests get Linux, which catches nearly everything.
+        #
+        # Run the full matrix on a branch with: gh workflow run CI --ref <branch>
+        os: ${{ fromJSON(github.ref == 'refs/heads/main' && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

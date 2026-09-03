@@ -270,6 +270,61 @@ it silently pick old releases rather than reporting a conflict. Raise
 | `cargo flamegraph` | Profile before optimising. |
 | `cargo-bundle` (macOS), `winres` (Windows) | Phase 8 packaging. Optional. |
 
+### 3.6 Continuous integration
+
+The workflow runs on every push. Four jobs: `checks` (format, lints, the unsafe
+guard), `test` (tests and a release build), `docs` (mermaid diagrams), and
+`msrv` (the declared minimum Rust version really builds).
+
+**Which platforms run when.** On a private repository, Actions minutes bill at
+2x for Windows and 10x for macOS, which made those two roughly 80% of the cost
+of every push. The full matrix therefore runs **only on `main`**. Branches and
+pull requests get Linux, which catches nearly everything. To run the full matrix
+on a branch:
+
+```bash
+gh workflow run CI --ref my-branch
+```
+
+Making the repository public would make all of it free and this restriction
+unnecessary.
+
+**Check locally before pushing.** A failed run still costs minutes, so run what
+CI runs first. This is the whole set:
+
+```bash
+cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-features && ./scripts/check-unsafe.sh
+```
+
+**Keep the toolchain current.** `rust-toolchain.toml` names `stable`, and CI
+installs whatever stable is newest. If the local toolchain is older, new lints
+fail in CI on code that was clean locally, which is exactly what happened
+between Rust 1.94 and 1.98. Run `rustup update` before starting work, and
+`rustup check` to see whether you are behind.
+
+**Checking a cross-platform build without pushing.** The Windows build broke
+once in a way no Linux or macOS job could catch. `cargo check` can compile for
+another target without a linker for it:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo check --target x86_64-pc-windows-msvc --workspace --all-features
+```
+
+**The Windows failure, recorded because the cause is not obvious.** `eframe`
+pulls in `wgpu`, whose Direct3D backend shares types with `gpu-allocator`.
+`gpu-allocator` declares its dependency on the `windows` crate as a *range*,
+`>=0.53, <=0.62`. While the workspace declared a minimum Rust of 1.78, Cargo's
+version-aware resolver picked `windows` 0.56 from that range, while `wgpu-hal`
+used 0.62. Two incompatible copies of the same Direct3D types meant the
+application would not compile on Windows at all. Raising the minimum to 1.92 for
+`egui` 0.35 allowed 0.62 to be chosen, but the lock file kept the old choice
+until unrelated dependency changes in Phase 4 forced a re-resolve. A fresh
+resolve now selects 0.62 for both, so the fix is stable rather than luck; the
+committed `Cargo.lock` records it. A second copy of `windows` 0.56 remains in
+the graph for the `trash` crate, which is harmless because it shares no types
+with the graphics stack.
+
 ### 3.4 Summary of fixed decisions
 
 | Concern | Choice | Why |
@@ -680,8 +735,10 @@ every later phase starts from a green build.
 - [x] The unsafe guard is present, and is itself tested against a real `unsafe`
       block and against a deleted `forbid` attribute.
 - [x] `Cargo.lock` is committed.
-- [ ] CI is green on Linux, macOS, and Windows. **Cannot be confirmed until the
-      repository has a remote and the workflow has run at least once.**
+- [x] CI is green on Linux, macOS, and Windows. Not true when Phase 0 was
+      written: the workflow ran on every push from the first one and failed
+      every time, unnoticed, until the failures were investigated after Phase 4.
+      See "Continuous integration" below for what was wrong and what it cost.
 
 ### What Phase 0 actually produced
 
@@ -1056,8 +1113,9 @@ model, not the renderer.
       `ConfirmDelete` solely for `Shift+Delete`.
 - [x] Flags survive app restart, verified by reopening the folder in a fresh model.
 - [x] Rename rejects duplicates and bad names; the extension is preserved.
-- [x] `actions.rs` unit tests pass locally. **CI has still never run**, so
-      "on Linux, macOS, Windows" remains unverified.
+- [x] `actions.rs` unit tests pass locally, and on Linux and macOS in CI. The
+      Windows job could not build the application at all until the dependency
+      problem described under "Continuous integration" was found.
 
 ### What Phase 4 actually produced
 

@@ -125,7 +125,7 @@ pub fn parse_at(bytes: &[u8], offset: usize) -> Result<(FitsHeader, ParsedHeader
                 found: bytes.len(),
             })?;
 
-        for card in block.chunks_exact(CARD_SIZE) {
+        for card in block.as_chunks::<CARD_SIZE>().0 {
             let keyword = keyword_of(card);
             if keyword == "END" {
                 let data_start = pos + BLOCK_SIZE;

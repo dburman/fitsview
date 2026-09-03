@@ -248,6 +248,10 @@ pub fn convert_pixels(geom: &Geometry, raw: &[u8], out: &mut [f32]) {
 /// Converts one chunk. Split out so each `BITPIX` arm is its own tight loop.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn convert_chunk(bitpix: i64, fast_u16: bool, src: &[u8], dst: &mut [f32]) {
+    // `as_chunks` yields fixed-size arrays rather than slices, so each
+    // `from_be_bytes` takes the array whole: no indexing, no bounds checks, and
+    // the compiler can see the width is constant. The remainder is always empty
+    // here, because the reader sizes `src` as an exact multiple.
     match bitpix {
         8 => {
             for (d, s) in dst.iter_mut().zip(src.iter()) {
@@ -255,33 +259,39 @@ fn convert_chunk(bitpix: i64, fast_u16: bool, src: &[u8], dst: &mut [f32]) {
             }
         }
         16 if fast_u16 => {
-            for (d, s) in dst.iter_mut().zip(src.chunks_exact(2)) {
-                *d = (i32::from(i16::from_be_bytes([s[0], s[1]])) + 32_768) as f32;
+            let (chunks, _) = src.as_chunks::<2>();
+            for (d, s) in dst.iter_mut().zip(chunks) {
+                *d = (i32::from(i16::from_be_bytes(*s)) + 32_768) as f32;
             }
         }
         16 => {
-            for (d, s) in dst.iter_mut().zip(src.chunks_exact(2)) {
-                *d = f32::from(i16::from_be_bytes([s[0], s[1]]));
+            let (chunks, _) = src.as_chunks::<2>();
+            for (d, s) in dst.iter_mut().zip(chunks) {
+                *d = f32::from(i16::from_be_bytes(*s));
             }
         }
         32 => {
-            for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                *d = i32::from_be_bytes([s[0], s[1], s[2], s[3]]) as f32;
+            let (chunks, _) = src.as_chunks::<4>();
+            for (d, s) in dst.iter_mut().zip(chunks) {
+                *d = i32::from_be_bytes(*s) as f32;
             }
         }
         64 => {
-            for (d, s) in dst.iter_mut().zip(src.chunks_exact(8)) {
-                *d = i64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32;
+            let (chunks, _) = src.as_chunks::<8>();
+            for (d, s) in dst.iter_mut().zip(chunks) {
+                *d = i64::from_be_bytes(*s) as f32;
             }
         }
         -32 => {
-            for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                *d = f32::from_be_bytes([s[0], s[1], s[2], s[3]]);
+            let (chunks, _) = src.as_chunks::<4>();
+            for (d, s) in dst.iter_mut().zip(chunks) {
+                *d = f32::from_be_bytes(*s);
             }
         }
         -64 => {
-            for (d, s) in dst.iter_mut().zip(src.chunks_exact(8)) {
-                *d = f64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32;
+            let (chunks, _) = src.as_chunks::<8>();
+            for (d, s) in dst.iter_mut().zip(chunks) {
+                *d = f64::from_be_bytes(*s) as f32;
             }
         }
         // `Geometry::from_header` rejects every other value, so this is dead
