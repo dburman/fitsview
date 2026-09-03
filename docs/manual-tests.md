@@ -1,6 +1,6 @@
 # Manual test checklist
 
-Some acceptance criteria in `README.md` cannot be asserted in code: whether a
+Some acceptance criteria in `phasedbuild.md` cannot be asserted in code: whether a
 dialog appears, whether an image looks right way up, whether dragging feels
 smooth. Those live here.
 
@@ -116,7 +116,7 @@ cargo test -p fitsview --all-features -- --ignored real_delete
 - [ ] **The deleted file is in the trash or recycle bin, not gone.** Open the
       trash and confirm it is really there.
 - [ ] Deleting is immediate. If it hangs for even a second, the trash back end
-      is wrong for this platform; see the Phase 4 notes in `README.md`.
+      is wrong for this platform; see the Phase 4 notes in `phasedbuild.md`.
 - [ ] `K` flags the file, the star appears in the list and the toolbar button
       changes.
 - [ ] Deleting a flagged file always shows the confirmation dialog.
@@ -146,7 +146,7 @@ structure that makes a stretch worth looking at.
 - [ ] Toggling off returns to the previous appearance.
 - [ ] Toggling is immediate on a 24 MP frame, with no visible pause.
 - [ ] A colour frame keeps its colour when stretched. If it turns grey, each
-      plane is being measured separately; see the Phase 5 notes in `README.md`.
+      plane is being measured separately; see the Phase 5 notes in `phasedbuild.md`.
 - [ ] The ⚙ menu adjusts the background level and black point, and the image
       responds as you drag.
 - [ ] Reset returns both settings to their defaults.

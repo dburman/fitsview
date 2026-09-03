@@ -93,7 +93,7 @@ jobs:
       - name: Install the mermaid parser
         run: npm install --no-save mermaid@11 jsdom
       - name: Check mermaid diagrams
-        run: node scripts/check-mermaid.mjs README.md docs/*.md
+        run: node scripts/check-mermaid.mjs README.md phasedbuild.md docs/*.md
 
   # The minimum supported Rust version declared in Cargo.toml must actually
   # build, otherwise the claim is decoration.
