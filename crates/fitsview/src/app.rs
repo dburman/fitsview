@@ -18,7 +18,7 @@ use fits_core::stretch::StretchParams;
 use fits_core::FitsImage;
 
 use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
-use crate::folder::{scan_folder, Folder};
+use crate::folder::{scan_folder, Folder, SortKey};
 use crate::jobs::{self, Job};
 use crate::loader::{Cache, Loader};
 use crate::sidecar;
@@ -149,6 +149,10 @@ pub enum Action {
     /// Read the pattern the other way up, for a file whose header refers to the
     /// sensor rather than to the stored row order.
     ToggleBayerFlip,
+    /// Measure every file in the folder, so bad frames can be sorted out.
+    MeasureFolder,
+    /// Order the file list by this measure.
+    SortBy(SortKey),
     /// Write calibrated copies of every file in the folder into this folder.
     StartExport(PathBuf),
     /// Stop whatever background job is running.
@@ -421,6 +425,8 @@ pub struct Model {
     pub confirm_every_delete: bool,
     /// Whether the shortcut overlay is showing.
     pub show_help: bool,
+    /// What the file list is ordered by.
+    pub sort_key: SortKey,
     /// Whether the file list is showing. Collapsing it gives the image the
     /// whole window, which matters when culling on a laptop screen.
     pub show_filelist: bool,
@@ -485,6 +491,7 @@ impl Model {
             pending: Pending::None,
             confirm_every_delete: false,
             show_help: false,
+            sort_key: SortKey::default(),
             show_filelist: true,
             scroll_to_selection: false,
             show_header: true,
@@ -671,6 +678,16 @@ impl Model {
                 self.bayer.flip_rows = !self.bayer.flip_rows;
                 self.refresh_after_calibration_change();
                 self.remember_calibration();
+            }
+            Action::MeasureFolder => self.measure_folder(),
+            Action::SortBy(key) => {
+                if self.sort_key != key {
+                    self.sort_key = key;
+                    if let Some(folder) = self.folder.as_mut() {
+                        folder.sort_by(key);
+                    }
+                    self.scroll_to_selection = true;
+                }
             }
             Action::StartExport(directory) => self.start_export(directory),
             Action::CancelJob => {
@@ -989,6 +1006,21 @@ impl Model {
         ));
     }
 
+    /// Starts measuring every file in the folder.
+    fn measure_folder(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        if folder.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
+        self.job = Some(Job::measure(paths));
+    }
+
     /// Collects progress from the background job. Called once per frame.
     ///
     /// Returns true if anything changed.
@@ -1016,6 +1048,18 @@ impl Model {
                     self.calibration.apply_flat = true;
                     self.refresh_after_calibration_change();
                     self.toast = Some(Toast::new(self.calibration.flat_summary()));
+                }
+                jobs::Update::Finished(jobs::Outcome::Measured(measured)) => {
+                    let count = measured.len();
+                    if let Some(folder) = self.folder.as_mut() {
+                        for (path, quality) in measured {
+                            folder.set_quality(&path, quality);
+                        }
+                        // Keep whatever ordering is in force, now that more
+                        // files have a value to order by.
+                        folder.sort_by(self.sort_key);
+                    }
+                    self.toast = Some(Toast::new(format!("Measured {count} frames")));
                 }
                 jobs::Update::Finished(jobs::Outcome::Exported { written, directory }) => {
                     self.toast = Some(Toast::new(format!(
@@ -1291,6 +1335,12 @@ impl Model {
         let mut changed = job_changed;
         for arrival in arrivals {
             let is_selected = selected.as_deref() == Some(arrival.path.as_path());
+            // The worker measured it while it had the samples to hand, so this
+            // costs nothing here.
+            if let (Some(quality), Some(folder)) = (arrival.quality, self.folder.as_mut()) {
+                folder.set_quality(&arrival.path, quality);
+            }
+
             match arrival.result {
                 Ok(image) => {
                     if is_selected {
@@ -1340,6 +1390,7 @@ impl Model {
     fn display(&mut self, path: PathBuf, image: Arc<FitsImage>, millis: Option<f64>) {
         let load_ms = millis.unwrap_or(0.0);
         self.adopt_bayer_pattern(&image);
+
         let shown = self.calibrated_version(&path, &image);
         let image = Arc::clone(&image);
 
@@ -3182,6 +3233,119 @@ mod tests {
             written.channels, 1,
             "the exported file should still be a mosaic"
         );
+    }
+
+    #[test]
+    fn a_frame_is_measured_as_soon_as_it_is_displayed() {
+        // It has already been read, so measuring costs almost nothing and the
+        // numbers fill in as the folder is browsed.
+        let dir = folder_of(3, 32, 32);
+        let (mut m, _spy) = model_over(dir.path());
+
+        let quality = m.folder.as_ref().unwrap().files[0]
+            .quality
+            .expect("the displayed frame should be measured");
+        assert!(quality.background > 0.0);
+        assert!(quality.sharpness.is_finite());
+
+        // Prefetched neighbours are measured too, since the worker has already
+        // read them. Browsing therefore fills the folder in without asking.
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        assert_eq!(
+            m.folder.as_ref().unwrap().measured(),
+            3,
+            "browsing should have measured the whole folder"
+        );
+    }
+
+    #[test]
+    fn measuring_the_folder_fills_in_every_frame() {
+        let dir = folder_of(5, 24, 24);
+        let (mut m, _spy) = model_over(dir.path());
+        assert!(
+            m.folder.as_ref().unwrap().measured() < 5,
+            "opening a folder measures only what it reads"
+        );
+
+        m.handle(Action::MeasureFolder);
+        assert!(m.job.is_some(), "measuring should run in the background");
+        finish_job(&mut m);
+
+        assert_eq!(m.folder.as_ref().unwrap().measured(), 5);
+    }
+
+    #[test]
+    fn measuring_never_changes_a_file() {
+        // The whole point is that it advises. Nothing is deleted or flagged.
+        let dir = folder_of(6, 16, 16);
+        let (mut m, spy) = model_over(dir.path());
+        m.handle(Action::MeasureFolder);
+        finish_job(&mut m);
+
+        assert!(
+            spy.trashed.lock().unwrap().is_empty(),
+            "measuring must not delete anything"
+        );
+        let folder = m.folder.as_ref().unwrap();
+        assert_eq!(folder.len(), 6, "no file was removed");
+        assert!(folder.files.iter().all(|e| !e.flagged), "none was flagged");
+        for i in 1..=6 {
+            assert!(dir.path().join(format!("light_{i}.fits")).exists());
+        }
+    }
+
+    #[test]
+    fn sorting_reorders_the_list_and_keeps_the_selection() {
+        let dir = folder_of(4, 16, 16);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::MeasureFolder);
+        finish_job(&mut m);
+
+        let before = m.loaded.as_ref().unwrap().path.clone();
+        m.handle(Action::SortBy(SortKey::Background));
+        assert_eq!(m.sort_key, SortKey::Background);
+        assert_eq!(
+            m.folder.as_ref().unwrap().selected_path(),
+            Some(before.as_path()),
+            "the selection should follow the file through a re-sort"
+        );
+
+        // And the ordering really is by the measure.
+        let values: Vec<f64> = m
+            .folder
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .filter_map(|e| SortKey::Background.value_of(e))
+            .collect();
+        let mut sorted = values.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values, sorted);
+    }
+
+    #[test]
+    fn sorting_does_not_change_which_image_is_displayed() {
+        let dir = folder_of(4, 16, 16);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::MeasureFolder);
+        finish_job(&mut m);
+
+        let shown = m.loaded.as_ref().unwrap().path.clone();
+        m.handle(Action::SortBy(SortKey::Sharpness));
+        assert_eq!(m.loaded.as_ref().unwrap().path, shown);
+    }
+
+    #[test]
+    fn measuring_and_sorting_do_nothing_without_a_folder() {
+        let mut m = Model::new();
+        m.handle(Action::MeasureFolder);
+        m.handle(Action::SortBy(SortKey::Background));
+        assert!(m.job.is_none());
+        assert!(m.folder.is_none());
     }
 
     #[test]

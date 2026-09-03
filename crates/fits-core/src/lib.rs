@@ -15,6 +15,7 @@ pub mod debayer;
 pub mod error;
 pub mod header;
 pub mod image;
+pub mod quality;
 pub mod reader;
 pub mod stretch;
 
@@ -26,6 +27,7 @@ pub use debayer::{debayer, BayerPattern};
 pub use error::FitsError;
 pub use header::FitsHeader;
 pub use image::{convert_pixels, finite_min_max, FitsImage, Geometry};
+pub use quality::{measure, Quality};
 pub use reader::{is_fits_path, read_fits, read_fits_from_bytes, write_fits};
 pub use stretch::{build_lut, compute_stretch, Stretch, StretchParams};
 

@@ -266,3 +266,25 @@ filter grid and nothing here applies to it.
 - [ ] Exported files are still mosaics. Open one and confirm it is greyscale
       until debayered, which is what a stacker expects.
 - [ ] A mono frame shows the Debayer control disabled.
+
+---
+
+## Phase 13 — Frame quality
+
+Needs a real session, ideally one with a few frames spoiled by cloud or wind.
+
+- [ ] The file list has a sort control, and choosing Background or Sharpness
+      reorders it and shows the value in place of the file size.
+- [ ] The selection stays on the same frame through a re-sort, and the image on
+      screen does not change.
+- [ ] Browsing the folder fills the values in as you go, without pressing
+      Measure.
+- [ ] Measure fills in the rest, with a progress bar, and the window stays
+      responsive.
+- [ ] Sorting by Background puts the frames taken through cloud together, and
+      they do look worse.
+- [ ] Sorting by Sharpness puts the blurred or trailed frames together.
+- [ ] Frames unlike the rest are marked in a different colour, and nothing is
+      deleted or flagged by it.
+- [ ] The metadata panel shows Background, Noise and Sharpness for the current
+      frame, above the header cards.

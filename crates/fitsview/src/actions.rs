@@ -421,6 +421,7 @@ mod tests {
                     name: (*n).to_string(),
                     size: 100,
                     flagged: false,
+                    quality: None,
                 })
                 .collect(),
             selected: if names.is_empty() { None } else { Some(0) },

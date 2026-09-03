@@ -5,13 +5,13 @@
 
 use std::path::{Path, PathBuf};
 
-use fits_core::is_fits_path;
+use fits_core::{is_fits_path, Quality};
 
 use crate::natsort;
 use crate::sidecar;
 
 /// One file in the browsed folder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FileEntry {
     /// Full path on disk.
     pub path: PathBuf,
@@ -22,10 +22,70 @@ pub struct FileEntry {
     /// Marked to keep. Phase 4 gives this meaning; the column exists now so the
     /// list layout does not change later.
     pub flagged: bool,
+    /// What the frame looks like, once it has been measured.
+    ///
+    /// `None` until the file has been opened or the folder measured, since
+    /// measuring means reading the file.
+    pub quality: Option<Quality>,
 }
 
+/// What the file list is ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortKey {
+    /// Natural name order, which is capture order for most cameras.
+    #[default]
+    Name,
+    /// Sky background: cloud, moonlight and dawn raise it.
+    Background,
+    /// Structure relative to noise: blur and cloud reduce it.
+    Sharpness,
+}
+
+impl SortKey {
+    /// Every ordering, for offering a choice.
+    pub const ALL: [SortKey; 3] = [SortKey::Name, SortKey::Background, SortKey::Sharpness];
+
+    /// What to call it in the interface.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "Name",
+            SortKey::Background => "Background",
+            SortKey::Sharpness => "Sharpness",
+        }
+    }
+
+    /// The measured value this key orders by.
+    #[must_use]
+    pub fn value_of(self, entry: &FileEntry) -> Option<f64> {
+        let quality = entry.quality?;
+        match self {
+            SortKey::Name => None,
+            SortKey::Background => Some(quality.background),
+            SortKey::Sharpness => Some(quality.sharpness),
+        }
+    }
+}
+
+/// The range of a measure that counts as ordinary for a folder.
+///
+/// Anything outside it is worth a second look. Derived from the median and the
+/// median absolute deviation rather than the mean and standard deviation, so
+/// that a handful of ruined frames do not widen the range enough to hide
+/// themselves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsualRange {
+    /// Below this is unusual.
+    pub low: f64,
+    /// Above this is unusual.
+    pub high: f64,
+}
+
+/// How many deviations from the median count as unusual.
+const OUTLIER_DEVIATIONS: f64 = 3.0;
+
 /// A folder of FITS files and the current position within it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Folder {
     /// The folder that was scanned.
     pub dir: PathBuf,
@@ -76,6 +136,7 @@ pub fn scan_folder(dir: &Path) -> std::io::Result<Folder> {
             path,
             size,
             flagged: false,
+            quality: None,
         });
     }
 
@@ -103,6 +164,106 @@ impl Folder {
     pub fn sort(&mut self) {
         self.files
             .sort_by(|a, b| natsort::natural_cmp(&a.name, &b.name));
+    }
+
+    /// Re-orders the list by a measure, keeping the selection on the same file.
+    ///
+    /// Files not yet measured sort last, in name order among themselves, since
+    /// an unmeasured frame is not evidence of anything and should not displace
+    /// one that has been looked at.
+    pub fn sort_by(&mut self, key: SortKey) {
+        let selected = self.selected_path().map(Path::to_path_buf);
+
+        match key {
+            SortKey::Name => self.sort(),
+            _ => self.files.sort_by(|a, b| {
+                match (key.value_of(a), key.value_of(b)) {
+                    (Some(x), Some(y)) => x
+                        .partial_cmp(&y)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // Ties, and they happen, fall back to the name so the
+                        // order is stable rather than arbitrary.
+                        .then_with(|| natsort::natural_cmp(&a.name, &b.name)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => natsort::natural_cmp(&a.name, &b.name),
+                }
+            }),
+        }
+
+        if let Some(path) = selected {
+            self.select_path(&path);
+        }
+    }
+
+    /// Records a measurement against the file at `path`.
+    ///
+    /// Returns whether the file was found, since a folder can be rescanned
+    /// while a measurement job is still running.
+    pub fn set_quality(&mut self, path: &Path, quality: Quality) -> bool {
+        if let Some(entry) = self.files.iter_mut().find(|e| e.path == path) {
+            entry.quality = Some(quality);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// How many files have been measured.
+    #[must_use]
+    pub fn measured(&self) -> usize {
+        self.files.iter().filter(|e| e.quality.is_some()).count()
+    }
+
+    /// The range of a measure that counts as ordinary for this folder.
+    ///
+    /// `None` until enough files have been measured for a comparison to mean
+    /// anything: with two or three frames, every one of them is an outlier.
+    #[must_use]
+    pub fn usual_range(&self, key: SortKey) -> Option<UsualRange> {
+        let mut values: Vec<f64> = self
+            .files
+            .iter()
+            .filter_map(|e| key.value_of(e))
+            .filter(|v| v.is_finite())
+            .collect();
+        if values.len() < 5 {
+            return None;
+        }
+
+        let middle = values.len() / 2;
+        values.select_nth_unstable_by(middle, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let median = values[middle];
+
+        let mut deviations: Vec<f64> = values.iter().map(|v| (v - median).abs()).collect();
+        deviations.select_nth_unstable_by(middle, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // The same scaling the stretch uses, turning a median deviation into a
+        // standard-deviation equivalent.
+        let spread = deviations[middle] * 1.482_602_218_505_602;
+        if spread <= 0.0 {
+            return None;
+        }
+
+        Some(UsualRange {
+            low: median - OUTLIER_DEVIATIONS * spread,
+            high: median + OUTLIER_DEVIATIONS * spread,
+        })
+    }
+
+    /// Whether a file stands out from the rest of the folder by this measure.
+    ///
+    /// Advisory only. **Nothing is ever deleted or flagged because of it**; the
+    /// tool points, the user decides.
+    #[must_use]
+    pub fn is_unusual(&self, entry: &FileEntry, key: SortKey, range: Option<UsualRange>) -> bool {
+        let (Some(value), Some(range)) = (key.value_of(entry), range) else {
+            return false;
+        };
+        value < range.low || value > range.high
     }
 
     /// Number of files.
@@ -246,6 +407,7 @@ impl Folder {
 mod tests {
     use super::*;
     use fits_core::testutil::{write_synthetic, SyntheticSpec};
+    use fits_core::Quality;
     use tempfile::TempDir;
 
     /// Creates a folder holding the named FITS files plus some decoys.
@@ -372,6 +534,7 @@ mod tests {
                     name: format!("f{i}.fits"),
                     size: 100,
                     flagged: false,
+                    quality: None,
                 })
                 .collect(),
             selected: if n == 0 { None } else { Some(0) },
@@ -470,6 +633,159 @@ mod tests {
         let mut single = fake(1);
         single.select_first();
         assert_eq!(single.prefetch_paths().len(), 1);
+    }
+
+    /// A folder with measurements attached, built without touching the disk.
+    fn measured(values: &[(f64, f64)]) -> Folder {
+        let mut folder = fake(values.len());
+        for (entry, (background, sharpness)) in folder.files.iter_mut().zip(values) {
+            entry.quality = Some(Quality {
+                background: *background,
+                noise: 10.0,
+                sharpness: *sharpness,
+            });
+        }
+        folder
+    }
+
+    #[test]
+    fn sorting_by_a_measure_orders_the_list_by_it() {
+        let mut f = measured(&[(3000.0, 1.1), (1000.0, 2.5), (2000.0, 0.4)]);
+
+        f.sort_by(SortKey::Background);
+        let backgrounds: Vec<f64> = f
+            .files
+            .iter()
+            .filter_map(|e| SortKey::Background.value_of(e))
+            .collect();
+        assert_eq!(backgrounds, vec![1000.0, 2000.0, 3000.0]);
+
+        f.sort_by(SortKey::Sharpness);
+        let sharpness: Vec<f64> = f
+            .files
+            .iter()
+            .filter_map(|e| SortKey::Sharpness.value_of(e))
+            .collect();
+        assert_eq!(sharpness, vec![0.4, 1.1, 2.5]);
+    }
+
+    #[test]
+    fn sorting_by_name_still_works_after_sorting_by_a_measure() {
+        let mut f = measured(&[(3000.0, 1.0), (1000.0, 2.0), (2000.0, 3.0)]);
+        f.sort_by(SortKey::Background);
+        f.sort_by(SortKey::Name);
+        let names: Vec<&str> = f.files.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["f0.fits", "f1.fits", "f2.fits"]);
+    }
+
+    #[test]
+    fn sorting_keeps_the_selection_on_the_same_file() {
+        let mut f = measured(&[(3000.0, 1.0), (1000.0, 2.0), (2000.0, 3.0)]);
+        f.select(0);
+        let before = f.selected_entry().unwrap().name.clone();
+
+        f.sort_by(SortKey::Background);
+        assert_eq!(
+            f.selected_entry().unwrap().name,
+            before,
+            "the selection should follow the file, not the position"
+        );
+        assert_eq!(f.selected, Some(2), "which has moved to the end");
+    }
+
+    #[test]
+    fn unmeasured_files_sort_last_rather_than_first() {
+        // An unmeasured frame is not evidence of anything and must not displace
+        // one that has been looked at.
+        let mut f = measured(&[(3000.0, 1.0), (1000.0, 2.0), (2000.0, 3.0)]);
+        f.files[1].quality = None;
+
+        f.sort_by(SortKey::Background);
+        assert!(f.files[0].quality.is_some());
+        assert!(f.files[1].quality.is_some());
+        assert!(f.files[2].quality.is_none(), "the unmeasured one goes last");
+    }
+
+    #[test]
+    fn ties_fall_back_to_the_name_so_the_order_is_stable() {
+        let mut f = measured(&[(1000.0, 1.0), (1000.0, 1.0), (1000.0, 1.0)]);
+        f.sort_by(SortKey::Background);
+        let names: Vec<&str> = f.files.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["f0.fits", "f1.fits", "f2.fits"]);
+    }
+
+    #[test]
+    fn a_frame_unlike_the_rest_of_the_folder_is_marked() {
+        // Nine ordinary frames and one taken through cloud.
+        let mut values: Vec<(f64, f64)> = (0..9).map(|i| (1000.0 + f64::from(i), 2.0)).collect();
+        values.push((9000.0, 2.0));
+        let f = measured(&values);
+
+        let range = f.usual_range(SortKey::Background);
+        assert!(range.is_some(), "ten frames is enough to compare");
+        assert!(
+            f.is_unusual(&f.files[9], SortKey::Background, range),
+            "the cloudy frame should stand out"
+        );
+        for ordinary in &f.files[..9] {
+            assert!(
+                !f.is_unusual(ordinary, SortKey::Background, range),
+                "{} should not be marked",
+                ordinary.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_too_small_to_compare_marks_nothing() {
+        // With three frames every one of them is an outlier, which is useless.
+        let f = measured(&[(1000.0, 1.0), (5000.0, 2.0), (9000.0, 3.0)]);
+        assert_eq!(f.usual_range(SortKey::Background), None);
+        assert!(!f.is_unusual(&f.files[1], SortKey::Background, None));
+    }
+
+    #[test]
+    fn a_folder_of_identical_frames_marks_nothing() {
+        // No spread means no basis for calling anything unusual.
+        let f = measured(&[(1000.0, 1.0); 8]);
+        assert_eq!(f.usual_range(SortKey::Background), None);
+    }
+
+    #[test]
+    fn marking_a_frame_never_changes_it() {
+        // The tool points; the user decides. Nothing is deleted or flagged.
+        let mut values: Vec<(f64, f64)> = (0..9).map(|i| (1000.0 + f64::from(i), 2.0)).collect();
+        values.push((9000.0, 2.0));
+        let f = measured(&values);
+        let range = f.usual_range(SortKey::Background);
+
+        for entry in &f.files {
+            let _ = f.is_unusual(entry, SortKey::Background, range);
+        }
+        assert_eq!(f.len(), 10, "no file was removed");
+        assert!(
+            f.files.iter().all(|e| !e.flagged),
+            "no file was flagged either"
+        );
+    }
+
+    #[test]
+    fn a_measurement_can_be_recorded_against_a_file() {
+        let mut f = fake(3);
+        assert_eq!(f.measured(), 0);
+        let q = Quality {
+            background: 500.0,
+            noise: 5.0,
+            sharpness: 1.2,
+        };
+        assert!(f.set_quality(Path::new("/tmp/x/f1.fits"), q));
+        assert_eq!(f.measured(), 1);
+        assert_eq!(f.files[1].quality, Some(q));
+
+        assert!(
+            !f.set_quality(Path::new("/tmp/x/gone.fits"), q),
+            "a file that has since disappeared is reported, not panicked over"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use egui::{Color32, Label, Panel, RichText, ScrollArea, Sense, Ui};
 
 use crate::app::{Action, Model};
-use crate::folder::FileEntry;
+use crate::folder::{FileEntry, SortKey};
 
 /// Width of the panel. Wide enough for a typical capture file name.
 const PANEL_WIDTH: f32 = 260.0;
@@ -45,14 +45,51 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                     }
                 });
             });
+            // Ordering, and the measurement that makes ordering useful.
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("sort-key")
+                    .selected_text(model.sort_key.label())
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for key in SortKey::ALL {
+                            if ui
+                                .selectable_label(model.sort_key == key, key.label())
+                                .clicked()
+                            {
+                                actions.push(Action::SortBy(key));
+                            }
+                        }
+                    });
+
+                let measured = folder.measured();
+                let all = folder.len();
+                if measured < all
+                    && ui
+                        .add_enabled(model.job.is_none(), egui::Button::new("Measure"))
+                        .on_hover_text(
+                            "Read every frame and measure its background and sharpness, \
+                             so the poor ones can be sorted to the top.\n\
+                             Nothing is deleted or flagged; the numbers only advise.",
+                        )
+                        .clicked()
+                {
+                    actions.push(Action::MeasureFolder);
+                }
+                if measured > 0 && measured < all {
+                    ui.label(RichText::new(format!("{measured}/{all}")).weak().small());
+                }
+            });
             ui.separator();
 
             let selected = folder.selected;
+            let range = folder.usual_range(model.sort_key);
             ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (index, entry) in folder.files.iter().enumerate() {
-                        let response = row(ui, entry, Some(index) == selected);
+                        let unusual = folder.is_unusual(entry, model.sort_key, range);
+                        let response =
+                            row(ui, entry, Some(index) == selected, model.sort_key, unusual);
                         if response.clicked {
                             actions.push(Action::Select(index));
                         }
@@ -83,7 +120,7 @@ pub struct RowResponse {
 }
 
 /// Draws one row.
-fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> RowResponse {
+fn row(ui: &mut Ui, entry: &FileEntry, selected: bool, key: SortKey, unusual: bool) -> RowResponse {
     let response = ui
         .scope(|ui| {
             ui.horizontal(|ui| {
@@ -97,7 +134,26 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> RowResponse {
                 ui.add(Label::new(text).truncate());
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(human_size(entry.size)).weak().small());
+                    // The measure being sorted by, where there is one, in place
+                    // of the size, which matters less once frames are compared.
+                    match measure_text(entry, key) {
+                        Some(text) => {
+                            let colour = if unusual {
+                                Color32::from_rgb(240, 170, 90)
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            ui.label(RichText::new(text).color(colour).small())
+                                .on_hover_text(if unusual {
+                                    "Unlike the rest of this folder"
+                                } else {
+                                    "Compares within this folder only"
+                                });
+                        }
+                        None => {
+                            ui.label(RichText::new(human_size(entry.size)).weak().small());
+                        }
+                    }
                 });
             });
         })
@@ -115,6 +171,20 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> RowResponse {
         clicked: response.clicked(),
         rect: Some(response.rect),
     }
+}
+
+/// The measurement shown in the list, formatted for a narrow column.
+///
+/// `None` when the list is ordered by name, or the file has not been measured,
+/// in which case the size is shown instead.
+#[must_use]
+pub fn measure_text(entry: &FileEntry, key: SortKey) -> Option<String> {
+    let value = key.value_of(entry)?;
+    Some(match key {
+        SortKey::Name => return None,
+        SortKey::Background => format!("{value:.0}"),
+        SortKey::Sharpness => format!("{value:.2}"),
+    })
 }
 
 /// Formats a byte count for the list, in the units an astrophotographer thinks
@@ -139,6 +209,47 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::folder::FileEntry;
+    use fits_core::Quality;
+    use std::path::PathBuf;
+
+    fn entry(quality: Option<Quality>) -> FileEntry {
+        FileEntry {
+            path: PathBuf::from("/x/a.fits"),
+            name: "a.fits".into(),
+            size: 1024,
+            flagged: false,
+            quality,
+        }
+    }
+
+    #[test]
+    fn ordering_by_name_shows_no_measurement() {
+        let measured = entry(Some(Quality {
+            background: 1000.0,
+            noise: 20.0,
+            sharpness: 1.5,
+        }));
+        assert_eq!(measure_text(&measured, SortKey::Name), None);
+    }
+
+    #[test]
+    fn an_unmeasured_file_shows_no_measurement() {
+        assert_eq!(measure_text(&entry(None), SortKey::Background), None);
+        assert_eq!(measure_text(&entry(None), SortKey::Sharpness), None);
+    }
+
+    #[test]
+    fn measurements_are_formatted_for_a_narrow_column() {
+        let e = entry(Some(Quality {
+            background: 1234.56,
+            noise: 20.0,
+            sharpness: 1.4567,
+        }));
+        assert_eq!(measure_text(&e, SortKey::Background).unwrap(), "1235");
+        assert_eq!(measure_text(&e, SortKey::Sharpness).unwrap(), "1.46");
+    }
 
     #[test]
     fn sizes_are_shown_in_readable_units() {

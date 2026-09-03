@@ -12,6 +12,7 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fits_core::calib::{build_master_flat, build_master_median, calibrate, subtract_dark};
 use fits_core::debayer::{debayer, BayerPattern};
+use fits_core::quality;
 use fits_core::stretch::{build_lut, compute_stretch, StretchParams};
 use fits_core::testutil::{synthetic_fits, SyntheticSpec};
 use fits_core::{finite_min_max, read_fits_from_bytes};
@@ -124,12 +125,26 @@ fn bench_debayer(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measuring a frame, which the loader worker does alongside decoding so the
+/// interface thread never pays for it.
+fn bench_quality(c: &mut Criterion) {
+    let bytes = full_frame_bytes();
+    let image = read_fits_from_bytes(&bytes).expect("decode");
+    let mut group = c.benchmark_group("quality");
+    group.sample_size(20);
+    group.bench_function("measure 24 MP", |b| {
+        b.iter(|| black_box(quality::measure(black_box(&image))));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read,
     bench_stats,
     bench_stretch,
     bench_calibration,
-    bench_debayer
+    bench_debayer,
+    bench_quality
 );
 criterion_main!(benches);

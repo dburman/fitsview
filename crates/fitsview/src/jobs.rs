@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use fits_core::calib::{self, MasterFlat, MasterFrame};
-use fits_core::{read_fits, write_fits, FitsImage};
+use fits_core::{quality, read_fits, write_fits, FitsImage, Quality};
 
 /// What a finished job produced.
 #[derive(Debug)]
@@ -22,6 +22,8 @@ pub enum Outcome {
     Master(Box<MasterFrame>),
     /// A master flat, already normalised into a gain map, was built.
     Flat(Box<MasterFlat>),
+    /// Every file in the folder was measured.
+    Measured(Vec<(PathBuf, Quality)>),
     /// Calibrated copies were written, and this many succeeded.
     Exported {
         /// Files written.
@@ -110,6 +112,33 @@ impl Job {
 
         Self {
             label: "Building master flat".into(),
+            updates,
+            cancel,
+            done: 0,
+            total,
+            item: String::new(),
+            finished: false,
+        }
+    }
+
+    /// Measures every file in `paths`, so bad frames can be found by sorting.
+    ///
+    /// Measurement is on the raw frame, before any calibration, so the numbers
+    /// stay comparable however the display is configured.
+    #[must_use]
+    pub fn measure(paths: Vec<PathBuf>) -> Self {
+        let (tx, updates) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let total = paths.len();
+
+        std::thread::Builder::new()
+            .name("fitsview-measure".into())
+            .spawn(move || measure_worker(&paths, &tx, &worker_cancel))
+            .ok();
+
+        Self {
+            label: "Measuring frames".into(),
             updates,
             cancel,
             done: 0,
@@ -256,6 +285,40 @@ fn build_flat_worker(
             let _ = tx.send(Update::Failed(e.to_string()));
         }
     }
+}
+
+/// Measures each file in turn.
+///
+/// A file that cannot be read is skipped rather than failing the run: one
+/// corrupt frame in two hundred should not deny the user the other 199
+/// measurements.
+fn measure_worker(paths: &[PathBuf], tx: &mpsc::Sender<Update>, cancel: &AtomicBool) {
+    let mut measured = Vec::with_capacity(paths.len());
+
+    for (index, path) in paths.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            // Report what was measured before stopping; the work is not wasted.
+            let _ = tx.send(Update::Finished(Outcome::Measured(measured)));
+            return;
+        }
+        let _ = tx.send(Update::Progress {
+            done: index,
+            total: paths.len(),
+            item: file_name_of(path),
+        });
+
+        match read_fits(path) {
+            Ok(image) => measured.push((path.clone(), quality::measure(&image))),
+            Err(e) => log::warn!("could not measure {}: {e}", file_name_of(path)),
+        }
+    }
+
+    let _ = tx.send(Update::Progress {
+        done: paths.len(),
+        total: paths.len(),
+        item: String::new(),
+    });
+    let _ = tx.send(Update::Finished(Outcome::Measured(measured)));
 }
 
 /// Reads every path, reporting progress. Returns `None` if it stopped early.
@@ -597,6 +660,59 @@ mod tests {
             "light_1_cal.fits"
         );
         assert_ne!(output_name_for(Path::new("/x/a.fits")), "a.fits");
+    }
+
+    #[test]
+    fn measuring_reports_a_value_for_every_readable_file() {
+        let (_dir, paths) = frames(3, 100.0);
+        let mut job = Job::measure(paths.clone());
+        let updates = run(&mut job);
+
+        match updates.into_iter().next() {
+            Some(Update::Finished(Outcome::Measured(measured))) => {
+                assert_eq!(measured.len(), 3);
+                for (path, quality) in measured {
+                    assert!(paths.contains(&path));
+                    assert!((quality.background - 100.0).abs() < 0.01);
+                    assert!(quality.sharpness.is_finite());
+                }
+            }
+            other => panic!("expected measurements, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_unreadable_file_does_not_deny_the_measurements_of_the_rest() {
+        let (dir, mut paths) = frames(3, 50.0);
+        let bad = dir.path().join("broken.fits");
+        std::fs::write(&bad, b"SIMPLE but nonsense").unwrap();
+        paths.push(bad);
+
+        let mut job = Job::measure(paths);
+        let updates = run(&mut job);
+        match updates.into_iter().next() {
+            Some(Update::Finished(Outcome::Measured(measured))) => {
+                assert_eq!(measured.len(), 3, "the readable ones should survive");
+            }
+            other => panic!("expected measurements, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelling_a_measurement_keeps_what_was_already_done() {
+        // Throwing the finished work away would make cancelling costly, and
+        // there is no reason for it: partial measurements are still useful.
+        let (_dir, paths) = frames(30, 10.0);
+        let mut job = Job::measure(paths);
+        job.cancel();
+        let updates = run(&mut job);
+
+        match updates.into_iter().next() {
+            Some(Update::Finished(Outcome::Measured(measured))) => {
+                assert!(measured.len() < 30, "it should have stopped early");
+            }
+            other => panic!("expected partial measurements, got {other:?}"),
+        }
     }
 
     #[test]

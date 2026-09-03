@@ -25,6 +25,39 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
         return actions;
     };
 
+    // The measurements first: they are about this frame rather than in it, and
+    // they are what a decision to keep or discard actually rests on.
+    if let Some(quality) = model
+        .folder
+        .as_ref()
+        .and_then(crate::folder::Folder::selected_entry)
+        .and_then(|e| e.quality)
+    {
+        Grid::new("quality-grid")
+            .num_columns(2)
+            .spacing([12.0, 2.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Background").strong());
+                ui.label(format!("{:.0}", quality.background));
+                ui.end_row();
+                ui.label(RichText::new("Noise").strong());
+                ui.label(format!("{:.1}", quality.noise));
+                ui.end_row();
+                ui.label(RichText::new("Sharpness").strong());
+                ui.label(format!("{:.2}", quality.sharpness));
+                ui.end_row();
+            });
+        ui.label(
+            RichText::new(
+                "Compares within this folder only. Sharpness near 1 is mostly \
+                 noise; higher means more structure.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.separator();
+    }
+
     let mut filter = model.header_filter.clone();
     if ui
         .add(

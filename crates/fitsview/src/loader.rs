@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
-use fits_core::{read_fits, FitsImage};
+use fits_core::{quality, read_fits, FitsImage, Quality};
 
 /// Default number of decoded images held in memory.
 pub const DEFAULT_MAX_ENTRIES: usize = 8;
@@ -162,6 +162,7 @@ struct Response {
     generation: u64,
     result: Result<Arc<FitsImage>, String>,
     millis: f64,
+    quality: Option<Quality>,
 }
 
 /// The worker's queue, replaced wholesale whenever the UI's wishes change.
@@ -186,6 +187,13 @@ pub struct Arrival {
     pub result: Result<Arc<FitsImage>, String>,
     /// How long the read took, in milliseconds.
     pub millis: f64,
+    /// What the frame looks like, measured here rather than on the interface
+    /// thread.
+    ///
+    /// The worker has just read the image, so measuring costs it little, and
+    /// doing it here keeps a step through a folder free of the statistics work
+    /// that would otherwise drop frames.
+    pub quality: Option<Quality>,
 }
 
 /// Loads images on a worker thread and caches the results.
@@ -325,6 +333,7 @@ impl Loader {
                 path: response.path,
                 result: response.result,
                 millis: response.millis,
+                quality: response.quality,
             });
         }
         out
@@ -392,10 +401,12 @@ fn worker_loop(queue: &Arc<(Mutex<Queue>, Condvar)>, tx: &mpsc::Sender<Response>
         };
 
         let started = std::time::Instant::now();
-        let result = read_fits(&request.path)
-            .map(Arc::new)
-            .map_err(|e| e.to_string());
+        let decoded = read_fits(&request.path);
         let millis = started.elapsed().as_secs_f64() * 1000.0;
+
+        // Measured here, on the worker, while the samples are to hand.
+        let quality = decoded.as_ref().ok().map(quality::measure);
+        let result = decoded.map(Arc::new).map_err(|e| e.to_string());
 
         if let Ok(mut guard) = lock.lock() {
             guard.current = None;
@@ -407,6 +418,7 @@ fn worker_loop(queue: &Arc<(Mutex<Queue>, Condvar)>, tx: &mpsc::Sender<Response>
                 generation: request.generation,
                 result,
                 millis,
+                quality,
             })
             .is_err()
         {
@@ -589,6 +601,35 @@ mod tests {
             !loader.cache().contains(&bad),
             "failures must not be cached"
         );
+    }
+
+    #[test]
+    fn a_decoded_frame_arrives_already_measured() {
+        // Measuring on the worker is what keeps stepping through a folder free
+        // of statistics work on the interface thread.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(16, 16, -32);
+        let p = write_synthetic(dir.path(), "a.fits", &spec, &vec![250.0; 256]).unwrap();
+
+        let mut loader = Loader::default();
+        loader.request(std::slice::from_ref(&p));
+
+        let arrivals = pump(&mut loader, Duration::from_secs(5), |l| !l.is_busy());
+        let arrival = arrivals.first().expect("no arrival");
+        let quality = arrival.quality.expect("should have been measured");
+        assert!((quality.background - 250.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_failed_read_carries_no_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("broken.fits");
+        std::fs::write(&bad, b"SIMPLE but nonsense").unwrap();
+
+        let mut loader = Loader::default();
+        loader.request(std::slice::from_ref(&bad));
+        let arrivals = pump(&mut loader, Duration::from_secs(5), |l| !l.is_busy());
+        assert!(arrivals[0].quality.is_none());
     }
 
     #[test]

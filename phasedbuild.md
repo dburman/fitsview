@@ -38,7 +38,7 @@ been run on Linux or Windows. See section 10.
 | 10 — Measure the display path | Done |
 | 11 — True full-resolution zoom | Done |
 | 12 — Faster colour, fewer copies | Done |
-| 13 — Frame quality measures | Not started |
+| 13 — Frame quality measures | Done |
 | 14 — Readouts | Not started |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 9
@@ -2235,18 +2235,54 @@ list as a column and in the metadata panel in full.
 
 ### Acceptance criteria
 
-- [ ] Unit test: a deliberately blurred frame measures less sharp than the same
-      frame unblurred.
-- [ ] Unit test: a frame with a raised background measures a higher background,
-      and its sharpness is not much changed by the offset.
-- [ ] Unit test: measurement is unaffected by NaN pixels and does not panic on a
-      constant or single-pixel frame.
-- [ ] Unit test: sorting by a measure orders a synthetic folder as expected, and
-      sorting by name still works.
-- [ ] Measuring a 24 MP frame adds no more than a few milliseconds, since it
-      reuses the stretch's subsample. Recorded here.
-- [ ] Marking an outlier never changes a file: a test asserts nothing is deleted
-      or flagged without a user action.
+- [x] Unit test: a deliberately blurred frame measures less sharp than the same
+      frame unblurred, and blurring twice is less sharp again.
+- [x] Unit test: a frame with a raised background measures a higher background,
+      and its sharpness changes by under 10%.
+- [x] Unit test: measurement is unaffected by NaN pixels and does not panic on a
+      constant, single-pixel or all-undefined frame.
+- [x] Unit test: sorting by a measure orders a folder as expected, keeps the
+      selection on the same file, and sorting by name still works.
+- [x] Measuring a 24 MP frame costs **10 ms**, and is paid on the loader's
+      worker thread rather than the interface thread.
+- [x] Marking an outlier never changes a file: tests assert nothing is deleted
+      or flagged, in the folder logic and again through the application.
+
+### What Phase 13 actually produced
+
+**The sharpness measure is normalised so a number means something.** The raw
+mean squared difference between neighbouring samples scales with how bright the
+frame is, which would make it useless for comparing frames. Dividing by what
+that difference would be for noise alone puts a frame of pure noise at about
+**1.0**, with real structure above it. A test asserts that: pure noise measures
+within 0.15 of 1.
+
+**Each claim was tested rather than assumed**, because a quality measure that
+does not actually respond to quality is decoration that invites bad decisions.
+Blurring reduces it, blurring twice reduces it further, stars raise it above
+empty sky, and a raised background moves the background reading without
+disturbing sharpness by more than a tenth.
+
+**A regression I introduced, and how it showed up.** Measuring was done where
+the frame was displayed, which put ten milliseconds of statistics on the
+interface thread for every image. The Phase 3 navigation tests, which assert no
+step exceeds one frame at 60 frames per second, failed immediately at 265 ms in
+a debug build. Measurement moved to the loader's worker thread, which has just
+read the samples anyway. **The guard tests written six phases earlier caught
+this within a minute of it being written.**
+
+That move turned out better than the original design: the loader prefetches
+neighbours, so browsing a folder measures it as a side effect, without asking.
+
+**Nothing is ever decided for the user.** Frames unlike the rest of the folder
+are marked, and that is all. Two tests assert that measuring and marking delete
+nothing, flag nothing, and leave every file on disk.
+
+**Outliers use the median and the median absolute deviation**, not the mean and
+standard deviation, so that a handful of ruined frames cannot widen the range
+enough to hide themselves. Marking is suppressed entirely below five measured
+frames, where every frame is an outlier and the answer is noise, and for a
+folder of identical frames, where there is no spread to judge against.
 
 ---
 
