@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use egui::{Pos2, Rect, Vec2};
 use fits_core::calib::{self, MasterFlat, MasterFrame};
+use fits_core::debayer::{self, BayerPattern};
 use fits_core::stretch::StretchParams;
 use fits_core::FitsImage;
 
@@ -28,8 +29,15 @@ use crate::view::ViewState;
 pub struct Loaded {
     /// Where it came from.
     pub path: PathBuf,
-    /// The decoded samples.
+    /// The samples as displayed: calibrated, and debayered when that is on.
     pub image: Arc<FitsImage>,
+    /// The samples as they came off the disk.
+    ///
+    /// Calibration frames describe this, not the displayed image. A dark for a
+    /// one-shot colour camera is a single-channel mosaic, and comparing it
+    /// against a debayered three-channel display would report a mismatch that
+    /// is not real.
+    pub raw: Arc<FitsImage>,
     /// How long the read took, in milliseconds, for the status bar.
     pub load_ms: f64,
 }
@@ -134,6 +142,13 @@ pub enum Action {
     ClearFlats,
     /// Turn flat division on or off.
     ToggleApplyFlat,
+    /// Turn colour reconstruction on or off.
+    ToggleDebayer,
+    /// Use this filter pattern.
+    SetBayerPattern(BayerPattern),
+    /// Read the pattern the other way up, for a file whose header refers to the
+    /// sensor rather than to the stored row order.
+    ToggleBayerFlip,
     /// Write calibrated copies of every file in the folder into this folder.
     StartExport(PathBuf),
     /// Stop whatever background job is running.
@@ -290,6 +305,52 @@ impl Calibration {
     }
 }
 
+/// How a one-shot colour mosaic is turned back into colour.
+#[derive(Debug, Clone, Default)]
+pub struct Bayer {
+    /// Whether colour reconstruction is applied.
+    pub enabled: bool,
+    /// The filter pattern in use, once one is known.
+    pub pattern: Option<BayerPattern>,
+    /// Whether the pattern is read with its rows the other way up.
+    ///
+    /// FITS stores the bottom row first, and capture programs disagree about
+    /// which end `BAYERPAT` describes. The symptom of needing this is an image
+    /// in the wrong colours rather than a broken one.
+    pub flip_rows: bool,
+    /// True when the pattern came from the file rather than from the user.
+    pub from_header: bool,
+}
+
+impl Bayer {
+    /// The pattern to actually use, or `None` when reconstruction is off.
+    #[must_use]
+    pub fn active(&self) -> Option<BayerPattern> {
+        if !self.enabled {
+            return None;
+        }
+        self.pattern
+            .map(|p| if self.flip_rows { p.flipped_rows() } else { p })
+    }
+
+    /// A one-line description for the panel.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self.pattern {
+            None => "No filter pattern known".to_string(),
+            Some(pattern) => {
+                let source = if self.from_header {
+                    "from the file"
+                } else {
+                    "chosen"
+                };
+                let flipped = if self.flip_rows { ", rows flipped" } else { "" };
+                format!("{} {source}{flipped}", pattern.name())
+            }
+        }
+    }
+}
+
 /// A short-lived message shown after an action.
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -360,6 +421,8 @@ pub struct Model {
     pub header_filter: String,
     /// Calibration frames and whether they are applied.
     pub calibration: Calibration,
+    /// How a one-shot colour mosaic is turned back into colour.
+    pub bayer: Bayer,
     /// The background job in progress, if any.
     pub job: Option<Job>,
     /// Calibrated images, so stepping back and forth does not recalibrate.
@@ -408,6 +471,7 @@ impl Model {
             show_header: true,
             header_filter: String::new(),
             calibration: Calibration::default(),
+            bayer: Bayer::default(),
             job: None,
             calibrated: Cache::new(4, 512 * 1024 * 1024),
             stretch_enabled: false,
@@ -560,6 +624,34 @@ impl Model {
                 } else {
                     "Flat not applied"
                 }));
+            }
+            Action::ToggleDebayer => {
+                if self.bayer.pattern.is_none() {
+                    // Nothing to reconstruct with; the panel offers a chooser.
+                    self.bayer.pattern = Some(BayerPattern::Rggb);
+                    self.bayer.from_header = false;
+                }
+                self.bayer.enabled = !self.bayer.enabled;
+                self.refresh_after_calibration_change();
+                self.remember_calibration();
+                self.toast = Some(Toast::new(if self.bayer.enabled {
+                    "Colour reconstruction on"
+                } else {
+                    "Colour reconstruction off"
+                }));
+            }
+            Action::SetBayerPattern(pattern) => {
+                if self.bayer.pattern != Some(pattern) {
+                    self.bayer.pattern = Some(pattern);
+                    self.bayer.from_header = false;
+                    self.refresh_after_calibration_change();
+                    self.remember_calibration();
+                }
+            }
+            Action::ToggleBayerFlip => {
+                self.bayer.flip_rows = !self.bayer.flip_rows;
+                self.refresh_after_calibration_change();
+                self.remember_calibration();
             }
             Action::StartExport(directory) => self.start_export(directory),
             Action::CancelJob => {
@@ -942,6 +1034,9 @@ impl Model {
             .flat_path
             .as_ref()
             .map(|p| p.display().to_string());
+        existing.bayer_pattern = self.bayer.pattern.map(|p| p.name().to_string());
+        existing.bayer_flip_rows = self.bayer.flip_rows;
+        existing.debayer = self.bayer.enabled;
         if let Err(e) = sidecar::save(&folder.dir, &existing) {
             log::warn!("could not record calibration paths: {e}");
         }
@@ -969,6 +1064,15 @@ impl Model {
                 self.load_master_flat(&path);
             }
         }
+
+        // A remembered pattern was a deliberate choice, so it wins over
+        // whatever the next file's header happens to say.
+        if let Some(pattern) = saved.bayer_pattern.as_deref().and_then(BayerPattern::parse) {
+            self.bayer.pattern = Some(pattern);
+            self.bayer.from_header = false;
+            self.bayer.flip_rows = saved.bayer_flip_rows;
+            self.bayer.enabled = saved.debayer;
+        }
         // Restoring is not itself news, so undo anything those loads announced.
         // The scan's own message, such as an empty folder, must survive.
         self.toast = None;
@@ -991,10 +1095,10 @@ impl Model {
         let Some(loaded) = self.loaded.as_ref() else {
             return;
         };
-        let shape = format!(
-            "{}x{}x{}",
-            loaded.image.width, loaded.image.height, loaded.image.channels
-        );
+        // Against the frame as it came off the disk, since that is what a
+        // calibration frame describes.
+        let raw = &loaded.raw;
+        let shape = format!("{}x{}x{}", raw.width, raw.height, raw.channels);
 
         // Dimensions are the one mismatch that cannot be worked around, so they
         // block. Everything else is advisory.
@@ -1002,8 +1106,8 @@ impl Model {
         let mut warnings = Vec::new();
 
         if let Some(dark) = self.calibration.dark.as_ref() {
-            if dark.matches(&loaded.image) {
-                warnings.extend(calib::check_compatibility(dark, &loaded.image).warnings);
+            if dark.matches(raw) {
+                warnings.extend(calib::check_compatibility(dark, raw).warnings);
             } else {
                 blocked = Some(format!(
                     "The dark is {}, but this image is {shape}",
@@ -1013,7 +1117,7 @@ impl Model {
         }
 
         if let Some(flat) = self.calibration.flat.as_ref() {
-            if flat.matches(&loaded.image) {
+            if flat.matches(raw) {
                 if flat.unusable > 0 {
                     warnings.push(format!(
                         "{} pixels of the flat carry too little signal and will show as blank",
@@ -1191,17 +1295,39 @@ impl Model {
         changed
     }
 
+    /// Adopts the filter pattern a file declares, if none has been chosen.
+    ///
+    /// Done once rather than per image: every frame in a folder comes from the
+    /// same camera, and re-reading it each time would undo a deliberate choice.
+    /// A file that says it is a colour raw is displayed as one without being
+    /// asked, since that is plainly what it wants.
+    fn adopt_bayer_pattern(&mut self, image: &FitsImage) {
+        if self.bayer.pattern.is_some() || image.channels != 1 {
+            return;
+        }
+        let Some(pattern) = debayer::detect(&image.header) else {
+            return;
+        };
+        log::debug!("the file declares a {} filter pattern", pattern.name());
+        self.bayer.pattern = Some(pattern);
+        self.bayer.from_header = true;
+        self.bayer.enabled = true;
+    }
+
     /// Puts an image on screen, calibrated if a master is in use.
     ///
     /// The calibrated result is cached, so stepping back to a file already
     /// visited does not subtract the dark a second time.
     fn display(&mut self, path: PathBuf, image: Arc<FitsImage>, millis: Option<f64>) {
         let load_ms = millis.unwrap_or(0.0);
+        self.adopt_bayer_pattern(&image);
         let shown = self.calibrated_version(&path, &image);
+        let image = Arc::clone(&image);
 
         self.loaded = Some(Loaded {
             path,
             image: shown,
+            raw: image,
             load_ms,
         });
         self.error = None;
@@ -1212,12 +1338,13 @@ impl Model {
 
     /// The image as it should be displayed: calibrated, or the original.
     fn calibrated_version(&mut self, path: &Path, image: &Arc<FitsImage>) -> Arc<FitsImage> {
-        if !self.calibration.is_active() {
+        if !self.calibration.is_active() && self.bayer.active().is_none() {
             return Arc::clone(image);
         }
         let dark = self.calibration.active_dark().filter(|d| d.matches(image));
         let flat = self.calibration.active_flat().filter(|f| f.matches(image));
-        if dark.is_none() && flat.is_none() {
+        let pattern = self.bayer.active();
+        if dark.is_none() && flat.is_none() && pattern.is_none() {
             // Reported through `blocked`; showing the raw image beats showing
             // nothing.
             return Arc::clone(image);
@@ -1225,7 +1352,7 @@ impl Model {
         if let Some(cached) = self.calibrated.get(path) {
             return cached;
         }
-        match calib::calibrate(image, dark, flat) {
+        match calib::calibrate_and_debayer(image, dark, flat, pattern) {
             Ok(result) => {
                 let result = Arc::new(result);
                 self.calibrated
@@ -2802,6 +2929,186 @@ mod tests {
         let header = &m.loaded.as_ref().unwrap().image.header;
         assert_eq!(header.get("OBJECT"), Some("M31"));
         assert_eq!(header.get_f64("EXPTIME"), Some(300.0));
+    }
+
+    /// Writes a one-shot colour mosaic sampled from a flat colour.
+    fn osc_folder(colour: [f64; 3], pattern: &str) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 16usize);
+        let bayer = BayerPattern::parse(pattern).unwrap();
+        let pixels: Vec<f64> = (0..w * h)
+            .map(|i| colour[bayer.colour_at(i % w, i / w).plane()])
+            .collect();
+        let spec = SyntheticSpec::new(w, h, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("BAYERPAT", &format!("'{pattern}    '"));
+        write_synthetic(dir.path(), "osc.fits", &spec, &pixels).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_file_declaring_a_filter_pattern_is_shown_in_colour_without_being_asked() {
+        // A file that says it is a colour raw plainly wants to be seen as one.
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let (m, _spy) = model_over(dir.path());
+
+        assert_eq!(m.bayer.pattern, Some(BayerPattern::Rggb));
+        assert!(m.bayer.from_header, "the pattern came from the file");
+        assert!(m.bayer.enabled);
+
+        let shown = &m.loaded.as_ref().unwrap().image;
+        assert_eq!(shown.channels, 3, "it should be displayed in colour");
+
+        let plane = shown.width * shown.height;
+        let index = 5 * shown.width + 5;
+        assert!((shown.data[index] - 2000.0).abs() < 1.0, "red");
+        assert!((shown.data[plane + index] - 800.0).abs() < 1.0, "green");
+        assert!((shown.data[2 * plane + index] - 300.0).abs() < 1.0, "blue");
+    }
+
+    #[test]
+    fn a_mono_file_without_a_pattern_is_left_alone() {
+        let dir = folder_of(1, 16, 16);
+        let (m, _spy) = model_over(dir.path());
+        assert_eq!(m.bayer.pattern, None);
+        assert!(!m.bayer.enabled);
+        assert_eq!(m.loaded.as_ref().unwrap().image.channels, 1);
+    }
+
+    #[test]
+    fn colour_reconstruction_can_be_turned_off_and_on() {
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let (mut m, _spy) = model_over(dir.path());
+        assert_eq!(m.loaded.as_ref().unwrap().image.channels, 3);
+
+        m.handle(Action::ToggleDebayer);
+        assert!(!m.bayer.enabled);
+        assert_eq!(
+            m.loaded.as_ref().unwrap().image.channels,
+            1,
+            "turning it off should show the mosaic again"
+        );
+
+        m.handle(Action::ToggleDebayer);
+        assert_eq!(m.loaded.as_ref().unwrap().image.channels, 3);
+    }
+
+    #[test]
+    fn choosing_the_wrong_pattern_changes_the_colours() {
+        // So the chooser is worth having, and a wrong guess is visible.
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let (mut m, _spy) = model_over(dir.path());
+        let red_of = |m: &Model| m.loaded.as_ref().unwrap().image.data[5 * 16 + 5];
+        assert!((red_of(&m) - 2000.0).abs() < 1.0);
+
+        m.handle(Action::SetBayerPattern(BayerPattern::Bggr));
+        assert!(!m.bayer.from_header, "the user has overridden the file");
+        assert!(
+            (red_of(&m) - 300.0).abs() < 1.0,
+            "red and blue should swap, got {}",
+            red_of(&m)
+        );
+    }
+
+    #[test]
+    fn flipping_the_pattern_rows_changes_the_result() {
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let (mut m, _spy) = model_over(dir.path());
+        let before = m.loaded.as_ref().unwrap().image.data.clone();
+
+        m.handle(Action::ToggleBayerFlip);
+        assert!(m.bayer.flip_rows);
+        let after = &m.loaded.as_ref().unwrap().image.data;
+        assert_ne!(&before, after, "the flip should do something visible");
+
+        m.handle(Action::ToggleBayerFlip);
+        assert_eq!(&before, &m.loaded.as_ref().unwrap().image.data);
+    }
+
+    #[test]
+    fn the_pattern_choice_is_restored_when_the_folder_is_reopened() {
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::SetBayerPattern(BayerPattern::Grbg));
+        m.handle(Action::ToggleBayerFlip);
+
+        let (m2, _spy2) = model_over(dir.path());
+        assert_eq!(
+            m2.bayer.pattern,
+            Some(BayerPattern::Grbg),
+            "a deliberate choice should win over the file's own header"
+        );
+        assert!(m2.bayer.flip_rows);
+        assert!(m2.bayer.enabled);
+    }
+
+    #[test]
+    fn a_dark_is_subtracted_from_the_mosaic_before_colour_is_reconstructed() {
+        // The Phase 9 ordering rule, checked through the whole application: the
+        // dark is a mosaic, so it must reach the image while it is still one.
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let darks_dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(16, 16, 16).with_scaling(32768.0, 1.0);
+        let dark_path =
+            write_synthetic(darks_dir.path(), "d.fits", &spec, &vec![100.0; 256]).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(vec![dark_path]));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        let shown = &m.loaded.as_ref().unwrap().image;
+        assert_eq!(shown.channels, 3, "still in colour after calibrating");
+
+        // Every channel drops by the dark's level, which only works if the
+        // subtraction happened on the mosaic.
+        let plane = shown.width * shown.height;
+        let index = 5 * shown.width + 5;
+        assert!((shown.data[index] - 1900.0).abs() < 1.0, "red");
+        assert!((shown.data[plane + index] - 700.0).abs() < 1.0, "green");
+        assert!((shown.data[2 * plane + index] - 200.0).abs() < 1.0, "blue");
+    }
+
+    #[test]
+    fn a_mono_calibration_frame_is_not_reported_as_mismatched_while_colour_is_shown() {
+        // The displayed image has three channels once debayered, but the dark
+        // describes the single-channel mosaic it came from. Comparing against
+        // the display would block calibration that is perfectly valid.
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let darks_dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(16, 16, 16).with_scaling(32768.0, 1.0);
+        let dark_path =
+            write_synthetic(darks_dir.path(), "d.fits", &spec, &vec![50.0; 256]).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(vec![dark_path]));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        assert_eq!(
+            m.calibration.blocked, None,
+            "a mono dark matches the mosaic it is for"
+        );
+        assert!(m.calibration.active_dark().is_some());
+    }
+
+    #[test]
+    fn exports_stay_as_mosaics_even_while_colour_is_shown() {
+        // A stacker wants raw calibrated frames and does its own debayering.
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let out = tempfile::tempdir().unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        assert_eq!(m.loaded.as_ref().unwrap().image.channels, 3);
+
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        finish_job(&mut m);
+
+        let written = fits_core::read_fits(&out.path().join("osc_cal.fits")).unwrap();
+        assert_eq!(
+            written.channels, 1,
+            "the exported file should still be a mosaic"
+        );
     }
 
     #[test]

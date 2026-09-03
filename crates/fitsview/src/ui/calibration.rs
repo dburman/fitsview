@@ -46,6 +46,8 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                             actions.extend(darks_section(ui, model));
                             ui.separator();
                             actions.extend(flats_section(ui, model));
+                            ui.separator();
+                            actions.extend(colour_section(ui, model));
 
                             if let Some(job) = &model.job {
                                 ui.separator();
@@ -263,6 +265,71 @@ fn flats_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
     actions
 }
 
+/// The one-shot colour section.
+fn colour_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let bayer = &model.bayer;
+
+    // Only a single-channel image can be a mosaic.
+    let is_mosaic = model.loaded.as_ref().is_some_and(|l| l.image.channels == 1);
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("One-shot colour").strong());
+    ui.label(RichText::new(bayer.summary()).weak().small());
+    ui.add_space(4.0);
+
+    let mut enabled = bayer.enabled;
+    if ui
+        .add_enabled(is_mosaic, egui::Checkbox::new(&mut enabled, "Debayer (B)"))
+        .on_hover_text(
+            "Reconstruct colour from the sensor's filter grid.\n\
+             Applied after the dark and flat, never before, and only to the \
+             display: exported files stay as mosaics.",
+        )
+        .on_disabled_hover_text("This image already has colour channels")
+        .changed()
+    {
+        actions.push(Action::ToggleDebayer);
+    }
+
+    if !bayer.enabled {
+        return actions;
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Pattern");
+        let current = bayer.pattern.unwrap_or(fits_core::BayerPattern::Rggb);
+        egui::ComboBox::from_id_salt("bayer-pattern")
+            .selected_text(current.name())
+            .show_ui(ui, |ui| {
+                for pattern in fits_core::BayerPattern::ALL {
+                    if ui
+                        .selectable_label(current == pattern, pattern.name())
+                        .clicked()
+                    {
+                        actions.push(Action::SetBayerPattern(pattern));
+                    }
+                }
+            });
+    });
+
+    let mut flip = bayer.flip_rows;
+    if ui
+        .checkbox(&mut flip, "Flip pattern rows")
+        .on_hover_text(
+            "FITS stores the bottom row of an image first, and capture programs \
+             disagree about which end the pattern describes.\n\
+             Turn this on if the colours look wrong, for instance red and blue \
+             swapped or a magenta cast. The image itself is fine either way.",
+        )
+        .changed()
+    {
+        actions.push(Action::ToggleBayerFlip);
+    }
+
+    actions
+}
+
 /// The export section.
 fn export_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -273,12 +340,23 @@ fn export_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
     ui.label(RichText::new("Export").strong());
     ui.label(
         RichText::new(format!(
-            "Writes a calibrated copy of all {count} file{} as _cal.fits. Originals are never changed.",
+            "Writes a calibrated copy of all {count} file{} as _cal.fits. \
+             Originals are never changed.",
             if count == 1 { "" } else { "s" }
         ))
         .weak()
         .small(),
     );
+    if model.bayer.enabled {
+        ui.label(
+            RichText::new(
+                "Exports stay as mosaics, undebayered, which is what a stacker \
+                 wants and what it does better.",
+            )
+            .weak()
+            .small(),
+        );
+    }
     ui.add_space(4.0);
 
     if ui

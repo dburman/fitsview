@@ -274,3 +274,84 @@ fn a_stretched_colour_image_keeps_its_colour() {
         "channel order should survive the stretch: r={r:.1} g={g:.1} b={b:.1}"
     );
 }
+
+#[test]
+fn a_one_shot_colour_mosaic_renders_in_colour() {
+    // The Phase 9 claim, checked all the way to the texture that would be
+    // uploaded: a red subject on a colour sensor must come out red, not grey.
+    use fits_core::debayer::{self, BayerPattern};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (w, h) = (64usize, 64usize);
+    let pattern = BayerPattern::Rggb;
+    let source = [50_000.0, 20_000.0, 5_000.0];
+
+    let pixels: Vec<f64> = (0..w * h)
+        .map(|i| source[pattern.colour_at(i % w, i / w).plane()])
+        .collect();
+    let spec = SyntheticSpec::new(w, h, 16)
+        .with_scaling(32768.0, 1.0)
+        .with_card("BAYERPAT", "'RGGB    '");
+    let path = write_synthetic(dir.path(), "osc.fits", &spec, &pixels).unwrap();
+
+    let mosaic = read_fits(&path).unwrap();
+    assert_eq!(mosaic.channels, 1, "the file itself is a mosaic");
+
+    // Without reconstruction it is grey: every texel has equal components.
+    let grey = texture::to_color_image(&mosaic, &Mapping::linear(&mosaic), 1);
+    assert!(
+        grey.pixels.iter().all(|p| p.r() == p.g() && p.g() == p.b()),
+        "an undebayered mosaic should render grey"
+    );
+
+    // The pattern is read from the file rather than assumed.
+    let detected = debayer::detect(&mosaic.header).expect("the header declares one");
+    assert_eq!(detected, pattern);
+
+    let colour = debayer::debayer(&mosaic, detected).unwrap();
+    let rendered = texture::to_color_image(&colour, &Mapping::linear(&colour), 1);
+
+    let middle = rendered.pixels[(h / 2) * w + w / 2];
+    assert!(
+        middle.r() > middle.g() && middle.g() > middle.b(),
+        "a red subject should render red: {middle:?}"
+    );
+    assert_eq!(middle.r(), 255, "the brightest channel should be saturated");
+}
+
+#[test]
+fn the_wrong_bayer_pattern_shows_as_wrong_colour_not_as_damage() {
+    // What the flip control is for: the symptom is colour, not corruption.
+    use fits_core::debayer::{debayer, BayerPattern};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (w, h) = (32usize, 32usize);
+    let source = [50_000.0, 20_000.0, 5_000.0];
+    let pixels: Vec<f64> = (0..w * h)
+        .map(|i| source[BayerPattern::Rggb.colour_at(i % w, i / w).plane()])
+        .collect();
+    let spec = SyntheticSpec::new(w, h, 16).with_scaling(32768.0, 1.0);
+    let path = write_synthetic(dir.path(), "osc.fits", &spec, &pixels).unwrap();
+    let mosaic = read_fits(&path).unwrap();
+
+    let right = debayer(&mosaic, BayerPattern::Rggb).unwrap();
+    let wrong = debayer(&mosaic, BayerPattern::Bggr).unwrap();
+
+    let render = |image: &fits_core::FitsImage| {
+        texture::to_color_image(image, &Mapping::linear(image), 1).pixels[(h / 2) * w + w / 2]
+    };
+    let (right_px, wrong_px) = (render(&right), render(&wrong));
+
+    assert!(right_px.r() > right_px.b(), "correct: red dominant");
+    assert!(wrong_px.b() > wrong_px.r(), "wrong pattern: blue dominant");
+
+    // Both are well-formed images; only the colours differ. The channel that
+    // was brightest is still saturated, and nothing is undefined, so a user
+    // seeing this knows to change the pattern rather than suspect the file.
+    assert_eq!(right_px.r(), 255, "correct: red saturated");
+    assert_eq!(wrong_px.b(), 255, "wrong: blue saturated instead");
+    assert!(
+        wrong.data.iter().all(|v| v.is_finite()),
+        "swapping the pattern must not undefine anything"
+    );
+}

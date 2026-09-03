@@ -13,9 +13,9 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** All phases complete. Two gaps remain, both needing a human rather
-than more code: the application has never been tried against real capture files,
-and the manual checklist has never been run on Linux or Windows. See section 10.
+**Status:** All phases complete. Two gaps remain that need a human rather than
+more code: the application has never been tried against real capture files, and
+the manual checklist has never been run on Linux or Windows. See section 10.
 
 | Phase | State |
 |-------|-------|
@@ -28,6 +28,7 @@ and the manual checklist has never been run on Linux or Windows. See section 10.
 | 6 — Dark calibration | Done |
 | 7 — Flat calibration | Done |
 | 8 — Packaging | Done |
+| 9 — Debayering | Done |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 8
 deliver the features below.
@@ -42,6 +43,7 @@ deliver the features below.
 | e | Button to apply a standard astro stretch to all viewed images; can be turned off. | 5 |
 | f | Dark-frame calibration applied to all files in the folder. | 6 |
 | g | Flat-frame calibration applied to all files in the folder. | 7 |
+| h | Show one-shot colour frames in colour. | 9 |
 
 ---
 
@@ -553,6 +555,7 @@ fitsview/
 │   │       ├── reader.rs   # read_fits, is_fits_path (write_fits in Phase 6)
 │   │       ├── stretch.rs  # midtone transfer auto-stretch and lookup tables
 │   │       ├── calib.rs    # master frames, dark subtraction, flat division
+│   │       ├── debayer.rs  # one-shot colour reconstruction
 │   │       └── testutil.rs # synthetic FITS generator (feature "test-util")
 │   │   ├── tests/
 │   │   │   └── properties.rs   # proptest: parser must never panic
@@ -622,7 +625,7 @@ extension instead; handle that as a fallback.
 - Required keywords for an image: `SIMPLE`, `BITPIX`, `NAXIS`, `NAXIS1`, `NAXIS2`, optionally `NAXIS3`.
 - Scaling keywords: `BZERO` (default 0.0), `BSCALE` (default 1.0). Physical value = `BZERO + BSCALE * raw`.
   - Common case: `BITPIX=16`, `BZERO=32768` → this means the data is really unsigned 16-bit.
-- Optional: `BAYERPAT` (e.g. `RGGB`) means it is a color camera raw. For this plan we display it as mono. Debayering is out of scope.
+- `BAYERPAT` (for example `RGGB`) means the file is a one-shot colour raw: a single-channel mosaic taken through a grid of colour filters. Phase 9 reconstructs colour from it; every other phase treats it as the mono frame it physically is, which is correct, since calibration must happen before reconstruction.
 
 **Data:**
 - Starts right after the padded header.
@@ -1298,6 +1301,7 @@ model, not the renderer.
 | `F2` | Rename |
 | `Ctrl+Z` | Undo last delete (where supported) |
 | `L` | Hide or show the file list |
+| `B` | Toggle colour reconstruction |
 | `I` | Show or hide the image metadata |
 | `S` | Toggle stretch (Phase 5) |
 | `D` | Toggle dark calibration (Phase 6) |
@@ -1870,6 +1874,180 @@ acts on. Documentation that is derived cannot drift.
 
 ---
 
+## Phase 9 — Debayering for One-Shot Colour Cameras
+
+**Goal:** Show a one-shot colour frame in colour.
+
+A one-shot colour camera has a monochrome sensor under a grid of tiny colour
+filters, so a raw frame is a single-channel mosaic in which each pixel measured
+only red, green or blue. Without reconstruction it displays as greyscale, with a
+fine checkerboard visible when zoomed in. Phases 1 to 8 handle such a file
+correctly in every other respect; this phase makes it look right.
+
+### Concepts
+
+- The filter grid repeats every two pixels. `BAYERPAT` names the arrangement of
+  that 2x2 tile: `RGGB`, `BGGR`, `GRBG` or `GBRG`.
+- **Reconstructing the missing two channels is interpolation, so it invents
+  detail.** That is acceptable for looking at an image and wrong for measuring
+  one, which is why calibration happens first and why exported files stay as
+  mosaics. See the ordering rule below.
+- Some cameras offset the pattern by a pixel and record it in `XBAYROFF` and
+  `YBAYROFF`. Shifting the tile by one in either direction turns one pattern
+  into another, so offsets are handled by picking a different pattern rather
+  than by special-casing them.
+
+### The ordering rule
+
+```text
+raw mosaic
+  → subtract the dark        (Phase 6)
+  → divide by the flat       (Phase 7)
+  → debayer                  (this phase)
+  → stretch and display      (Phase 5)
+```
+
+**Calibration acts on the mosaic, before debayering, always.** A dark and a flat
+are themselves mosaics taken through the same filter grid, so subtracting and
+dividing pixel by pixel is exactly right. Debayering first would mix
+neighbouring filter sites together, and the calibration frames would no longer
+correspond to what they are correcting.
+
+This is the same ordering trap as Phase 7's, one level out, and it is enforced
+the same way: in one function, with a test asserting the wrong order gives a
+measurably different answer.
+
+### The row-order problem, which is the hard part
+
+FITS stores the bottom row of an image first (section 4). A capture program
+writing `BAYERPAT = 'RGGB'` may mean the top-left of the sensor as it reads it
+out, or the first pixel as stored in the file. **These differ by a vertical
+flip, and the two conventions are both common.** Getting it wrong does not fail:
+it silently swaps red and blue, or shifts the tile by a row, and the image comes
+out magenta or green.
+
+There is no reliable way to tell from the file which convention was used. So:
+
+- Interpret `BAYERPAT` against the data **as stored**, which is the more literal
+  reading.
+- Offer a **Flip pattern rows** control, and say in its tooltip that the symptom
+  of needing it is wrong colour rather than a broken image.
+- Remember the choice per folder in the sidecar, since one camera and one
+  capture program will always need the same answer.
+
+### Implementation in `fits-core/src/debayer.rs`
+
+```rust
+/// The 2x2 filter tile, named by its top-left pixel reading across then down.
+pub enum BayerPattern { Rggb, Bggr, Grbg, Gbrg }
+
+impl BayerPattern {
+    /// Parses a `BAYERPAT` value.
+    pub fn parse(value: &str) -> Option<Self>;
+    /// The pattern seen when the tile is shifted by this many pixels.
+    pub fn shifted(self, dx: usize, dy: usize) -> Self;
+    /// The pattern seen when the rows are read in the opposite order.
+    pub fn flipped_rows(self) -> Self;
+    /// Which filter sits over the pixel at these coordinates.
+    pub fn colour_at(self, x: usize, y: usize) -> Colour;
+}
+
+/// Reads `BAYERPAT`, `XBAYROFF` and `YBAYROFF` from a header.
+pub fn detect(header: &FitsHeader) -> Option<BayerPattern>;
+
+/// Reconstructs three channels from a mosaic.
+pub fn debayer(image: &FitsImage, pattern: BayerPattern) -> Result<FitsImage, DebayerError>;
+```
+
+Interpolation is bilinear: a pixel keeps its own measurement, and each missing
+channel is the average of the neighbours in the surrounding 3x3 that carry it.
+That is the standard starting point, it is what "bilinear demosaic" means, and
+it degrades gracefully at the edges where fewer neighbours exist. Better
+algorithms exist and produce fewer artefacts along sharp edges; none of them is
+worth the complexity for a viewer, and none of them would change what a stacker
+receives, because exports stay as mosaics.
+
+Undefined pixels propagate: a `NaN` contributes nothing to an average, and a
+pixel with no usable neighbour of a channel is undefined in that channel.
+
+### UI
+
+1. A **Debayer** toggle in the right-hand panel, on `B`, enabled only when the
+   image is a single-channel mosaic.
+2. Turn it on automatically when `BAYERPAT` is present, since a file that says
+   it is a colour raw almost certainly wants to be seen as one. Leave it off for
+   a file without the keyword, where a pattern would have to be guessed.
+3. A pattern chooser, defaulting to whatever the header said, so a file that
+   omits `BAYERPAT` can still be debayered by naming the pattern.
+4. A **Flip pattern rows** checkbox, for the ambiguity above.
+5. Both choices persist per folder in the sidecar.
+6. **Export is unaffected and stays a mosaic.** A stacker wants raw calibrated
+   frames and does its own debayering, usually better than this. The export
+   description says so, because writing debayered files would triple their size
+   and quietly degrade the data anyone stacks them with.
+
+### Acceptance criteria
+
+- [x] Unit test: each of the four patterns reports the right filter at the four
+      positions of its tile.
+- [x] Unit test: shifting a pattern by one pixel in each direction, and flipping
+      its rows, produce the patterns they should, and doing either twice is the
+      identity.
+- [x] Unit test: a synthetic mosaic built from a known colour image debayers
+      back to approximately that image.
+- [x] Unit test: a flat field of one colour debayers to that colour, with no
+      colour cast at the edges.
+- [x] Unit test: the wrong pattern gives a measurably different, wrong answer.
+- [x] Unit test: calibration order, checked both in `fits-core` and through the
+      whole application.
+- [x] Unit test: `NaN` pixels propagate rather than poisoning their neighbours.
+- [x] Unit test: a three-channel image is refused rather than debayered twice.
+- [x] `detect` reads `BAYERPAT` with and without quotes, in either case, and
+      applies `XBAYROFF` and `YBAYROFF`.
+- [x] Debayering a 24 MP frame takes **77 ms**, alongside 6.6 ms for a dark and
+      17.8 ms for a dark and flat together. It happens once per image and is
+      cached with the calibrated result.
+- [x] The pattern and flip choices are restored when a folder is reopened.
+
+### What Phase 9 actually produced
+
+487 tests pass across the workspace, up from 453 before this phase.
+
+**A bug this phase was always going to introduce, caught by its own test.** The
+check deciding whether a master matches the current image compared it against
+the **displayed** frame. Once a mosaic is debayered that frame has three
+channels, so a perfectly valid single-channel dark was reported as the wrong
+size and calibration was blocked. `Loaded` now keeps the raw frame alongside the
+displayed one, and every calibration comparison uses the raw. The same applies
+to deciding whether an image is a mosaic at all, which is otherwise false as
+soon as reconstruction is switched on.
+
+**Offsets need no special handling.** Shifting a Bayer tile by a pixel always
+yields another valid Bayer tile, so `XBAYROFF` and `YBAYROFF` are applied by
+selecting a different pattern rather than by threading an offset through the
+interpolation. The same trick expresses the row-flip: flipping the rows of
+`RGGB` is `GBRG`.
+
+**Decisions worth knowing:**
+
+- Reconstruction is turned on automatically when the file declares a pattern,
+  because a file that says it is a colour raw plainly wants to be seen as one.
+  It stays off for a file without the keyword, where the pattern would have to
+  be guessed.
+- The pattern is adopted once per folder rather than per image. Every frame in a
+  session comes from the same camera, and re-reading it each time would undo a
+  deliberate choice.
+- A remembered choice wins over the file's own header, for the same reason.
+- Interpolation is bilinear: a pixel keeps its measurement, and each missing
+  channel is the mean of the neighbours carrying it. Undefined pixels contribute
+  nothing rather than poisoning their neighbours.
+- **Exports stay as mosaics.** A stacker wants raw calibrated frames and
+  debayers them better than this does. Writing debayered files would triple
+  their size and quietly degrade what anyone stacks with them. The export
+  description says so when reconstruction is on.
+
+---
+
 ## 9. Performance Checklist (apply throughout)
 
 - Read files with a single `std::fs::read`; do not use `BufReader` per-element reads, and do not use `mmap` (unsafe).
@@ -1895,6 +2073,14 @@ acts on. Documentation that is derived cannot drift.
 - [x] Zero `unsafe` in `crates/`: both crates carry `#![forbid(unsafe_code)]`
       and the CI guard step passes.
 - [x] Every module in the test plan table (5.5) has the listed tests.
+- [x] `./scripts/check.sh` passes: formatting, lints, the full test suite, the
+      unsafe guard, a build at the minimum Rust version, and a Windows compile.
+
+**On the test counts quoted in earlier phases.** Those were produced by summing
+the "N passed" lines by hand, which both undercounted and, worse, ignored
+failures; a broken test survived two phases that way. The figures up to Phase 8
+are therefore low. `scripts/check.sh` exists because of it, and the only number
+worth trusting is its exit status.
 - [x] A 24 MP file opens and displays in well under one second: 4.4 ms to
       decode, 11.6 ms to compute a stretch, 17.8 ms to apply dark and flat.
 - [x] Delete, rename, flag, stretch, dark and flat all work from the keyboard

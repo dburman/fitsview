@@ -17,6 +17,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("S", "Toggle the automatic stretch"),
     ("D", "Toggle dark calibration"),
     ("Shift+F", "Toggle flat calibration"),
+    ("B", "Toggle colour reconstruction"),
     ("I", "Show or hide the image metadata"),
     ("L", "Hide or show the file list"),
     ("F / 1", "Fit to window / actual size"),

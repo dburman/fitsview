@@ -234,3 +234,29 @@ Real flats matter here: synthetic ones cannot show dust shadows.
       temporary `panic!` early in `main`.
 - [ ] Pushing a `v0.1.0` tag produces a draft release with three binaries
       attached. Check each downloads and runs.
+
+---
+
+## Phase 9 — One-shot colour
+
+Needs a raw frame from a colour camera. A frame from a mono camera has no
+filter grid and nothing here applies to it.
+
+- [ ] Opening a raw frame from a colour camera shows it in colour without being
+      asked, and the panel names the pattern as coming from the file.
+- [ ] `B` turns reconstruction off, and the image becomes greyscale with a fine
+      checkerboard visible when zoomed in. That checkerboard is the filter grid.
+- [ ] The colours are right. If red and blue are swapped, or there is a magenta
+      or green cast, turn on **Flip pattern rows**; that is the symptom it is
+      for.
+- [ ] If the flip does not fix it, try the other patterns in the chooser. One of
+      the four will be correct.
+- [ ] Whatever combination works is still in force after quitting and reopening
+      the folder.
+- [ ] A dark and a flat from the same camera still apply, and are not reported
+      as the wrong size once colour is being shown.
+- [ ] Calibration visibly works: hot pixels go, vignetting evens out, and the
+      colours stay right rather than developing a cast.
+- [ ] Exported files are still mosaics. Open one and confirm it is greyscale
+      until debayered, which is what a stacker expects.
+- [ ] A mono frame shows the Debayer control disabled.

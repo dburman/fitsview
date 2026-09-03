@@ -11,6 +11,7 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use fits_core::calib::{build_master_flat, build_master_median, calibrate, subtract_dark};
+use fits_core::debayer::{debayer, BayerPattern};
 use fits_core::stretch::{build_lut, compute_stretch, StretchParams};
 use fits_core::testutil::{synthetic_fits, SyntheticSpec};
 use fits_core::{finite_min_max, read_fits_from_bytes};
@@ -101,11 +102,26 @@ fn bench_calibration(c: &mut Criterion) {
     group.finish();
 }
 
+/// Debayering, which happens once per image when a one-shot colour frame is
+/// displayed and is cached alongside the calibrated result.
+fn bench_debayer(c: &mut Criterion) {
+    let bytes = full_frame_bytes();
+    let image = read_fits_from_bytes(&bytes).expect("decode");
+
+    let mut group = c.benchmark_group("debayer");
+    group.sample_size(10);
+    group.bench_function("24 MP mosaic", |b| {
+        b.iter(|| black_box(debayer(black_box(&image), BayerPattern::Rggb)));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read,
     bench_stats,
     bench_stretch,
-    bench_calibration
+    bench_calibration,
+    bench_debayer
 );
 criterion_main!(benches);

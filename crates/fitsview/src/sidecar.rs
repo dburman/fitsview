@@ -41,6 +41,18 @@ pub struct Sidecar {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_flat: Option<String>,
 
+    /// Filter pattern chosen for this folder's one-shot colour frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bayer_pattern: Option<String>,
+
+    /// Whether that pattern is read with its rows the other way up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bayer_flip_rows: bool,
+
+    /// Whether colour reconstruction is applied to this folder.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub debayer: bool,
+
     /// Anything this version does not recognise, kept so that settings written
     /// by a newer version are not silently discarded when this one saves.
     #[serde(flatten)]
@@ -108,6 +120,7 @@ pub fn save(dir: &Path, sidecar: &Sidecar) -> std::io::Result<()> {
         && sidecar.unknown.is_empty()
         && sidecar.master_dark.is_none()
         && sidecar.master_flat.is_none()
+        && sidecar.bayer_pattern.is_none()
     {
         return match std::fs::remove_file(&target) {
             Ok(()) => Ok(()),

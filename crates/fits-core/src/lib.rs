@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod calib;
+pub mod debayer;
 pub mod error;
 pub mod header;
 pub mod image;
@@ -21,6 +22,7 @@ pub mod stretch;
 pub mod testutil;
 
 pub use calib::{build_master_median, calibrate, CalibError, MasterFrame};
+pub use debayer::{debayer, BayerPattern};
 pub use error::FitsError;
 pub use header::FitsHeader;
 pub use image::{convert_pixels, finite_min_max, FitsImage, Geometry};

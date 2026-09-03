@@ -598,7 +598,8 @@ pub fn subtract_dark(light: &FitsImage, dark: &MasterFrame) -> Result<FitsImage,
 /// lives in exactly one place. That order is:
 ///
 /// 1. subtract the dark, clamping at zero;
-/// 2. divide by the flat's gain map.
+/// 2. divide by the flat's gain map;
+/// 3. debayer, if the frame is a one-shot colour mosaic and one was asked for.
 ///
 /// **Subtraction before division, always.** Dividing first would scale the
 /// dark's own signal by the gain map and smear it across the frame, in a way
@@ -620,6 +621,43 @@ pub fn calibrate(
     match flat {
         Some(flat) => divide_flat(&subtracted, flat),
         None => Ok(subtracted),
+    }
+}
+
+/// Calibrates a frame and, if asked, reconstructs its colour.
+///
+/// The whole pipeline in one call, so that nothing else has to remember the
+/// order. Debayering comes **last**, after the dark and the flat.
+///
+/// A dark and a flat for a one-shot colour camera are themselves mosaics taken
+/// through the same filter grid, so subtracting and dividing pixel by pixel is
+/// exactly right. Debayering first would mix neighbouring filter sites
+/// together, and the calibration frames would no longer correspond to what they
+/// are correcting.
+///
+/// A frame that is already in colour, or that cannot be debayered, is returned
+/// calibrated but unchanged rather than refused: showing the image beats
+/// showing nothing.
+///
+/// # Errors
+///
+/// Returns [`CalibError::WrongSize`] if a calibration frame does not match.
+pub fn calibrate_and_debayer(
+    light: &FitsImage,
+    dark: Option<&MasterFrame>,
+    flat: Option<&MasterFlat>,
+    pattern: Option<crate::debayer::BayerPattern>,
+) -> Result<FitsImage, CalibError> {
+    let calibrated = calibrate(light, dark, flat)?;
+    let Some(pattern) = pattern else {
+        return Ok(calibrated);
+    };
+    match crate::debayer::debayer(&calibrated, pattern) {
+        Ok(colour) => Ok(colour),
+        Err(e) => {
+            log::debug!("not debayering: {e}");
+            Ok(calibrated)
+        }
     }
 }
 
@@ -1306,6 +1344,82 @@ mod tests {
         assert!(history[0].contains("300.0 s"), "{}", history[0]);
 
         assert!(history_for(None, None).is_empty());
+    }
+
+    #[test]
+    fn a_mosaic_is_calibrated_before_it_is_debayered() {
+        // The ordering trap from Phase 7, one level out. A dark for a one-shot
+        // colour camera is itself a mosaic, so it must be subtracted from the
+        // mosaic. Debayering first mixes neighbouring filter sites together and
+        // the dark no longer describes what it is subtracted from.
+        use crate::debayer::{debayer, BayerPattern};
+
+        let (w, h) = (16usize, 16usize);
+        let pattern = BayerPattern::Rggb;
+
+        // A light of even colour, plus a dark offset that lands on the red
+        // sites only, as a stuck red pixel pattern would.
+        let source = [1000.0, 600.0, 300.0];
+        let light_pixels: Vec<f64> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let colour = pattern.colour_at(x, y);
+                source[colour.plane()] + if colour.plane() == 0 { 500.0 } else { 0.0 }
+            })
+            .collect();
+        let dark_pixels: Vec<f64> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                if pattern.colour_at(x, y).plane() == 0 {
+                    500.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        let light = image(w, h, &light_pixels);
+        let dark = build_master_median(&[image(w, h, &dark_pixels)]).unwrap();
+
+        // Correct: subtract on the mosaic, then debayer.
+        let right = calibrate_and_debayer(&light, Some(&dark), None, Some(pattern)).unwrap();
+
+        // Wrong: debayer first, then try to subtract. The dark is still a
+        // mosaic, so it no longer matches, which is itself the point.
+        let debayered_first = debayer(&light, pattern).unwrap();
+        assert!(
+            subtract_dark(&debayered_first, &dark).is_err(),
+            "a mosaic dark cannot be applied to a debayered image"
+        );
+
+        // Done in the right order, the red channel comes back to the source.
+        let plane = w * h;
+        let red = right.data[5 * w + 5];
+        assert!(
+            (red - 1000.0).abs() < 1.0,
+            "red should be corrected to 1000, got {red}"
+        );
+        let green = right.data[plane + 5 * w + 5];
+        assert!((green - 600.0).abs() < 1.0, "green was {green}");
+    }
+
+    #[test]
+    fn calibrating_without_a_pattern_leaves_the_mosaic_alone() {
+        let light = image(8, 8, &vec![100.0; 64]);
+        let out = calibrate_and_debayer(&light, None, None, None).unwrap();
+        assert_eq!(out.channels, 1);
+    }
+
+    #[test]
+    fn a_colour_image_asked_to_debayer_is_returned_unchanged() {
+        // Better than refusing: showing the image beats showing nothing.
+        use crate::debayer::BayerPattern;
+        let spec = SyntheticSpec::new(4, 4, -32).with_channels(3);
+        let colour =
+            Arc::new(read_fits_from_bytes(&synthetic_fits(&spec, &[1.0; 48]).unwrap()).unwrap());
+        let out = calibrate_and_debayer(&colour, None, None, Some(BayerPattern::Rggb)).unwrap();
+        assert_eq!(out.channels, 3);
+        assert_eq!(out.data, colour.data);
     }
 
     #[test]
