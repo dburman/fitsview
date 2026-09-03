@@ -10,6 +10,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use fits_core::calib::{build_master_median, subtract_dark};
 use fits_core::stretch::{build_lut, compute_stretch, StretchParams};
 use fits_core::testutil::{synthetic_fits, SyntheticSpec};
 use fits_core::{finite_min_max, read_fits_from_bytes};
@@ -69,5 +70,30 @@ fn bench_stretch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_read, bench_stats, bench_stretch);
+/// Calibration. The plan requires applying a dark to a 24 megapixel frame to
+/// add under 50 ms, since it happens on every image the user steps to.
+fn bench_calibration(c: &mut Criterion) {
+    let bytes = full_frame_bytes();
+    let image = std::sync::Arc::new(read_fits_from_bytes(&bytes).expect("decode"));
+    let master = build_master_median(std::slice::from_ref(&image)).expect("master");
+
+    let mut group = c.benchmark_group("calibration");
+    group.sample_size(20);
+    group.bench_function("subtract dark 24 MP", |b| {
+        b.iter(|| black_box(subtract_dark(black_box(&image), black_box(&master))));
+    });
+    group.bench_function("build master from 5 frames 24 MP", |b| {
+        let frames: Vec<_> = (0..5).map(|_| image.clone()).collect();
+        b.iter(|| black_box(build_master_median(black_box(&frames))));
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_read,
+    bench_stats,
+    bench_stretch,
+    bench_calibration
+);
 criterion_main!(benches);

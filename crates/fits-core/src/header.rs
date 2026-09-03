@@ -86,6 +86,89 @@ impl FitsHeader {
     }
 }
 
+/// Formats one 80-byte header card.
+///
+/// The value is right-justified into the conventional 20-column field when it
+/// fits, which is what real files look like. Anything that would overflow the
+/// card is truncated rather than corrupting the fixed-width layout.
+#[must_use]
+pub fn format_card(keyword: &str, value: &str) -> Vec<u8> {
+    let text = if value.is_empty() {
+        format!("{keyword:<8}")
+    } else {
+        format!("{keyword:<8}= {value:>20}")
+    };
+    let mut bytes: Vec<u8> = text
+        .bytes()
+        .map(|b| if b.is_ascii() { b } else { b'?' })
+        .collect();
+    bytes.resize(CARD_SIZE, b' ');
+    bytes.truncate(CARD_SIZE);
+    bytes
+}
+
+/// Formats one or more `HISTORY` cards holding `text`.
+///
+/// A card has room for 72 characters after the keyword, so longer text is split
+/// across several cards rather than being cut off.
+#[must_use]
+pub fn format_history(text: &str) -> Vec<u8> {
+    const ROOM: usize = CARD_SIZE - 8;
+    let cleaned: String = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && !c.is_control() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    let chars: Vec<char> = cleaned.chars().collect();
+    for piece in chars.chunks(ROOM) {
+        let line: String = piece.iter().collect();
+        let mut card = format!("HISTORY {line}").into_bytes();
+        card.resize(CARD_SIZE, b' ');
+        card.truncate(CARD_SIZE);
+        out.extend_from_slice(&card);
+    }
+    if out.is_empty() {
+        out.extend_from_slice(&format_card("HISTORY", ""));
+    }
+    out
+}
+
+/// Formats a floating point value the way FITS headers do, always with a
+/// decimal point so it is unambiguously a float.
+#[must_use]
+pub fn format_f64(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
+/// Keywords that describe the file's own structure.
+///
+/// A file written by this crate supplies its own, so these are dropped when
+/// copying a header through: keeping a source file's `BITPIX` or `BZERO` in a
+/// float output would describe the data incorrectly.
+pub const STRUCTURAL_KEYWORDS: &[&str] = &[
+    "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3", "NAXIS4", "BZERO", "BSCALE",
+    "BLANK", "END", "EXTEND", "XTENSION", "PCOUNT", "GCOUNT", "DATAMIN", "DATAMAX",
+];
+
+/// Whether a keyword describes file structure rather than the observation.
+#[must_use]
+pub fn is_structural(keyword: &str) -> bool {
+    STRUCTURAL_KEYWORDS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(keyword))
+}
+
 /// Where a header ended and its data begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedHeader {
@@ -215,6 +298,61 @@ mod tests {
         let padded = block_align(out.len()).unwrap();
         out.resize(padded, b' ');
         out
+    }
+
+    #[test]
+    fn formatted_cards_are_exactly_eighty_bytes() {
+        assert_eq!(format_card("SIMPLE", "T").len(), CARD_SIZE);
+        assert_eq!(format_card("END", "").len(), CARD_SIZE);
+        assert_eq!(format_card("VERYLONG", &"x".repeat(200)).len(), CARD_SIZE);
+    }
+
+    #[test]
+    fn a_formatted_card_parses_back_to_the_same_value() {
+        let mut block = format_card("EXPTIME", "120.0");
+        block.extend_from_slice(&format_card("OBJECT", "'M31     '"));
+        block.extend_from_slice(&format_card("END", ""));
+        block.resize(BLOCK_SIZE, b' ');
+
+        let (h, _) = parse_at(&block, 0).unwrap();
+        assert_eq!(h.get_f64("EXPTIME"), Some(120.0));
+        assert_eq!(h.get("OBJECT"), Some("M31"));
+    }
+
+    #[test]
+    fn history_text_longer_than_a_card_is_split_across_cards() {
+        let long = "c".repeat(200);
+        let cards = format_history(&long);
+        assert_eq!(cards.len() % CARD_SIZE, 0);
+        assert_eq!(cards.len() / CARD_SIZE, 3, "200 chars needs three cards");
+        for card in cards.chunks(CARD_SIZE) {
+            assert!(card.starts_with(b"HISTORY "));
+        }
+    }
+
+    #[test]
+    fn history_is_never_empty_and_never_contains_control_characters() {
+        assert_eq!(format_history("").len(), CARD_SIZE);
+        let cards = format_history("line\nbreak\tand tab");
+        let text = String::from_utf8_lossy(&cards);
+        assert!(!text.contains('\n') && !text.contains('\t'));
+    }
+
+    #[test]
+    fn structural_keywords_are_recognised_case_insensitively() {
+        for k in ["SIMPLE", "bitpix", "NAXIS1", "BzErO", "END"] {
+            assert!(is_structural(k), "{k} should be structural");
+        }
+        for k in ["OBJECT", "EXPTIME", "CCD-TEMP", "FILTER"] {
+            assert!(!is_structural(k), "{k} should not be structural");
+        }
+    }
+
+    #[test]
+    fn floats_are_formatted_with_a_decimal_point() {
+        assert_eq!(format_f64(120.0), "120.0");
+        assert_eq!(format_f64(32768.0), "32768.0");
+        assert_eq!(format_f64(1.5), "1.5");
     }
 
     #[test]

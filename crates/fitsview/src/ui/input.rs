@@ -83,6 +83,7 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             Key::F2 => out.push(Action::BeginRename),
             // View.
             Key::S => out.push(Action::ToggleStretch),
+            Key::D => out.push(Action::ToggleApplyDark),
             Key::F => out.push(Action::FitToWindow),
             Key::Num1 => out.push(Action::ActualSize),
             Key::Questionmark | Key::H => out.push(Action::ToggleHelp),
@@ -240,6 +241,15 @@ mod tests {
     }
 
     #[test]
+    fn d_toggles_dark_calibration() {
+        let f = Frame {
+            keys: key(Key::D),
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::ToggleApplyDark]);
+    }
+
+    #[test]
     fn s_toggles_the_stretch() {
         let f = Frame {
             keys: key(Key::S),
@@ -267,6 +277,8 @@ mod tests {
             Key::Delete,
             Key::Backspace,
             Key::K,
+            Key::D,
+            Key::S,
             Key::F,
             Key::ArrowRight,
             Key::Home,

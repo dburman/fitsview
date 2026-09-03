@@ -12,12 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Pos2, Rect, Vec2};
+use fits_core::calib::{self, MasterFrame};
 use fits_core::stretch::StretchParams;
 use fits_core::FitsImage;
 
 use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
 use crate::folder::{scan_folder, Folder};
-use crate::loader::Loader;
+use crate::jobs::{self, Job};
+use crate::loader::{Cache, Loader};
 use crate::view::ViewState;
 
 /// An image that has been loaded and is being displayed.
@@ -105,6 +107,22 @@ pub enum Action {
     Cancel,
     /// Turn the "confirm every delete" setting on or off.
     ToggleConfirmEveryDelete,
+    /// Offer these files as dark frames to combine.
+    AddDarks(Vec<PathBuf>),
+    /// Combine the collected dark frames into a master.
+    BuildMasterDark,
+    /// Use an existing master dark from disk.
+    LoadMasterDark(PathBuf),
+    /// Write the current master dark to disk.
+    SaveMasterDark(PathBuf),
+    /// Forget the collected darks and the master.
+    ClearDarks,
+    /// Turn dark subtraction on or off.
+    ToggleApplyDark,
+    /// Write calibrated copies of every file in the folder into this folder.
+    StartExport(PathBuf),
+    /// Stop whatever background job is running.
+    CancelJob,
     /// Turn the automatic screen stretch on or off.
     ToggleStretch,
     /// Change the stretch settings.
@@ -140,6 +158,58 @@ pub enum Pending {
         /// Why the current text is unusable, if it is.
         problem: Option<String>,
     },
+}
+
+/// The calibration frames in use, and whether they are applied.
+#[derive(Debug, Default)]
+pub struct Calibration {
+    /// Files offered as darks, waiting to be combined.
+    pub dark_sources: Vec<PathBuf>,
+    /// The combined master dark, once built or loaded.
+    pub dark: Option<Arc<MasterFrame>>,
+    /// Whether the master is subtracted from what is displayed.
+    pub apply_dark: bool,
+    /// Reasons the master may not suit the current image.
+    pub warnings: Vec<String>,
+    /// Why the master cannot be applied at all, if it cannot.
+    pub blocked: Option<String>,
+}
+
+impl Calibration {
+    /// Whether a master is available to apply.
+    #[must_use]
+    pub fn has_dark(&self) -> bool {
+        self.dark.is_some()
+    }
+
+    /// The master to use for display, or `None` when it is off or unusable.
+    #[must_use]
+    pub fn active_dark(&self) -> Option<&MasterFrame> {
+        if self.apply_dark && self.blocked.is_none() {
+            self.dark.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// A one-line description of the master, for the panel.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match &self.dark {
+            None if self.dark_sources.is_empty() => "No darks".to_string(),
+            None => format!("{} darks, not yet combined", self.dark_sources.len()),
+            Some(dark) => {
+                let exposure = dark
+                    .exptime
+                    .map_or_else(String::new, |e| format!(", {e:.0} s"));
+                format!(
+                    "Master of {} frame{}{exposure}",
+                    dark.source_count,
+                    if dark.source_count == 1 { "" } else { "s" }
+                )
+            }
+        }
+    }
 }
 
 /// A short-lived message shown after an action.
@@ -199,6 +269,12 @@ pub struct Model {
     pub confirm_every_delete: bool,
     /// Whether the shortcut overlay is showing.
     pub show_help: bool,
+    /// Calibration frames and whether they are applied.
+    pub calibration: Calibration,
+    /// The background job in progress, if any.
+    pub job: Option<Job>,
+    /// Calibrated images, so stepping back and forth does not recalibrate.
+    calibrated: Cache,
     /// Whether the automatic stretch is applied to every image shown.
     pub stretch_enabled: bool,
     /// How the stretch is chosen.
@@ -238,6 +314,9 @@ impl Model {
             pending: Pending::None,
             confirm_every_delete: false,
             show_help: false,
+            calibration: Calibration::default(),
+            job: None,
+            calibrated: Cache::new(4, 512 * 1024 * 1024),
             stretch_enabled: false,
             stretch_params: StretchParams::default(),
             toast: None,
@@ -297,6 +376,45 @@ impl Model {
             Action::Cancel => self.pending = Pending::None,
             Action::ToggleConfirmEveryDelete => {
                 self.confirm_every_delete = !self.confirm_every_delete;
+            }
+            Action::AddDarks(paths) => {
+                let added = paths.len();
+                self.calibration.dark_sources.extend(paths);
+                self.calibration.dark_sources.sort();
+                self.calibration.dark_sources.dedup();
+                self.toast = Some(Toast::new(format!(
+                    "{added} dark{} added, {} in total",
+                    if added == 1 { "" } else { "s" },
+                    self.calibration.dark_sources.len()
+                )));
+            }
+            Action::BuildMasterDark => self.build_master_dark(),
+            Action::LoadMasterDark(path) => self.load_master_dark(&path),
+            Action::SaveMasterDark(path) => self.save_master_dark(&path),
+            Action::ClearDarks => {
+                self.calibration = Calibration::default();
+                self.calibrated.clear();
+                self.refresh_after_calibration_change();
+                self.toast = Some(Toast::new("Calibration cleared"));
+            }
+            Action::ToggleApplyDark => {
+                if !self.calibration.has_dark() {
+                    return;
+                }
+                self.calibration.apply_dark = !self.calibration.apply_dark;
+                self.refresh_after_calibration_change();
+                self.toast = Some(Toast::new(if self.calibration.apply_dark {
+                    "Dark applied"
+                } else {
+                    "Dark not applied"
+                }));
+            }
+            Action::StartExport(directory) => self.start_export(directory),
+            Action::CancelJob => {
+                if let Some(job) = &self.job {
+                    job.cancel();
+                    self.toast = Some(Toast::new("Stopping…"));
+                }
             }
             Action::ToggleStretch => {
                 self.stretch_enabled = !self.stretch_enabled;
@@ -461,6 +579,133 @@ impl Model {
         self.show_selection();
     }
 
+    /// Starts combining the collected darks on a background thread.
+    fn build_master_dark(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        if self.calibration.dark_sources.is_empty() {
+            self.error = Some("Add some dark frames first".into());
+            return;
+        }
+        self.job = Some(Job::build_master(self.calibration.dark_sources.clone()));
+    }
+
+    /// Loads a master that was saved earlier, or any single frame to use as one.
+    fn load_master_dark(&mut self, path: &Path) {
+        match fits_core::read_fits(path) {
+            Ok(image) => {
+                self.calibration.dark = Some(Arc::new(MasterFrame::from_image(&image)));
+                self.calibration.dark_sources = vec![path.to_path_buf()];
+                self.calibration.apply_dark = true;
+                self.calibrated.clear();
+                self.refresh_after_calibration_change();
+                self.toast = Some(Toast::new("Master dark loaded"));
+            }
+            Err(e) => self.error = Some(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Writes the master dark so it can be reused in another session.
+    fn save_master_dark(&mut self, path: &Path) {
+        let Some(dark) = self.calibration.dark.as_ref() else {
+            return;
+        };
+        let history = vec![format!(
+            "fitsview: master dark combined from {} frames",
+            dark.source_count
+        )];
+        match fits_core::write_fits(path, &dark.to_image(), &history) {
+            Ok(()) => self.toast = Some(Toast::new("Master dark saved")),
+            Err(e) => self.error = Some(format!("Could not save: {e}")),
+        }
+    }
+
+    /// Starts writing calibrated copies of the folder.
+    fn start_export(&mut self, directory: PathBuf) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        if folder.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
+        self.job = Some(Job::export(paths, self.calibration.dark.clone(), directory));
+    }
+
+    /// Collects progress from the background job. Called once per frame.
+    ///
+    /// Returns true if anything changed.
+    fn poll_job(&mut self) -> bool {
+        let Some(job) = self.job.as_mut() else {
+            return false;
+        };
+        let updates = job.poll();
+        let finished = job.is_finished();
+
+        for update in updates {
+            match update {
+                jobs::Update::Finished(jobs::Outcome::Master(master)) => {
+                    self.calibration.dark = Some(Arc::new(*master));
+                    self.calibration.apply_dark = true;
+                    self.calibrated.clear();
+                    self.refresh_after_calibration_change();
+                    self.toast = Some(Toast::new(self.calibration.summary()));
+                }
+                jobs::Update::Finished(jobs::Outcome::Exported { written, directory }) => {
+                    self.toast = Some(Toast::new(format!(
+                        "Wrote {written} file{} to {}",
+                        if written == 1 { "" } else { "s" },
+                        directory.display()
+                    )));
+                }
+                jobs::Update::Cancelled => self.toast = Some(Toast::new("Stopped")),
+                jobs::Update::Failed(message) => self.error = Some(message),
+                jobs::Update::Progress { .. } => {}
+            }
+        }
+
+        if finished {
+            self.job = None;
+        }
+        true
+    }
+
+    /// Re-examines whether the master suits the current image, and redisplays.
+    fn refresh_after_calibration_change(&mut self) {
+        self.calibrated.clear();
+        self.update_calibration_warnings();
+        self.show_selection();
+        self.invalidate_texture();
+    }
+
+    /// Works out whether the master can be applied to what is on screen.
+    fn update_calibration_warnings(&mut self) {
+        self.calibration.blocked = None;
+        self.calibration.warnings.clear();
+
+        let (Some(dark), Some(loaded)) = (self.calibration.dark.as_ref(), self.loaded.as_ref())
+        else {
+            return;
+        };
+
+        if dark.matches(&loaded.image) {
+            self.calibration.warnings = calib::check_compatibility(dark, &loaded.image).warnings;
+        } else {
+            // Dimensions are the one mismatch that cannot be worked around.
+            self.calibration.blocked = Some(format!(
+                "The master is {}, but this image is {}x{}x{}",
+                dark.shape(),
+                loaded.image.width,
+                loaded.image.height,
+                loaded.image.channels
+            ));
+        }
+    }
+
     /// Marks the uploaded texture as stale without reloading the image.
     ///
     /// The generation counter is what the drawing layer compares against, so
@@ -581,9 +826,10 @@ impl Model {
     ///
     /// Returns true if anything changed, so the caller knows to repaint.
     pub fn poll(&mut self) -> bool {
+        let job_changed = self.poll_job();
         let arrivals = self.loader.poll();
         if arrivals.is_empty() {
-            return false;
+            return job_changed;
         }
 
         let selected = self
@@ -592,7 +838,7 @@ impl Model {
             .and_then(|f| f.selected_path())
             .map(Path::to_path_buf);
 
-        let mut changed = false;
+        let mut changed = job_changed;
         for arrival in arrivals {
             let is_selected = selected.as_deref() == Some(arrival.path.as_path());
             match arrival.result {
@@ -618,17 +864,50 @@ impl Model {
         changed
     }
 
-    /// Puts an image on screen.
+    /// Puts an image on screen, calibrated if a master is in use.
+    ///
+    /// The calibrated result is cached, so stepping back to a file already
+    /// visited does not subtract the dark a second time.
     fn display(&mut self, path: PathBuf, image: Arc<FitsImage>, millis: Option<f64>) {
         let load_ms = millis.unwrap_or(0.0);
+        let shown = self.calibrated_version(&path, &image);
+
         self.loaded = Some(Loaded {
             path,
-            image,
+            image: shown,
             load_ms,
         });
         self.error = None;
         self.needs_fit = true;
         self.generation = self.generation.wrapping_add(1);
+        self.update_calibration_warnings();
+    }
+
+    /// The image as it should be displayed: calibrated, or the original.
+    fn calibrated_version(&mut self, path: &Path, image: &Arc<FitsImage>) -> Arc<FitsImage> {
+        let Some(dark) = self.calibration.active_dark() else {
+            return Arc::clone(image);
+        };
+        if !dark.matches(image) {
+            // Reported through `blocked`; showing the raw image beats showing
+            // nothing.
+            return Arc::clone(image);
+        }
+        if let Some(cached) = self.calibrated.get(path) {
+            return cached;
+        }
+        match calib::subtract_dark(image, dark) {
+            Ok(result) => {
+                let result = Arc::new(result);
+                self.calibrated
+                    .insert(path.to_path_buf(), Arc::clone(&result));
+                result
+            }
+            Err(e) => {
+                log::warn!("could not calibrate {}: {e}", path.display());
+                Arc::clone(image)
+            }
+        }
     }
 
     /// Records the viewport and, if an image has just arrived, fits it.
@@ -1468,6 +1747,317 @@ mod tests {
 
         m.handle(Action::ResetStretchParams);
         assert_eq!(m.stretch_params, StretchParams::default());
+    }
+
+    /// Writes `count` dark frames of a uniform level into their own folder.
+    fn darks(count: usize, width: usize, height: usize, level: f64) -> (TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(width, height, 16);
+        let paths = (0..count)
+            .map(|i| {
+                write_synthetic(
+                    dir.path(),
+                    &format!("dark_{i}.fits"),
+                    &spec,
+                    &vec![level; width * height],
+                )
+                .unwrap()
+            })
+            .collect();
+        (dir, paths)
+    }
+
+    /// Pumps until the background job finishes.
+    fn finish_job(model: &mut Model) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            model.poll();
+            if model.job.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("job never finished");
+    }
+
+    #[test]
+    fn building_a_master_dark_enables_calibration() {
+        let dir = folder_of(2, 20, 15);
+        let (_darks_dir, dark_paths) = darks(3, 20, 15, 50.0);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        assert_eq!(m.calibration.dark_sources.len(), 3);
+        assert!(!m.calibration.has_dark(), "not combined yet");
+
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        let dark = m.calibration.dark.as_ref().expect("a master should exist");
+        assert_eq!(dark.source_count, 3);
+        assert!(m.calibration.apply_dark, "building should switch it on");
+        assert!(m.calibration.summary().contains("3 frames"));
+    }
+
+    #[test]
+    fn adding_the_same_dark_twice_does_not_duplicate_it() {
+        let dir = folder_of(1, 10, 10);
+        let (_darks_dir, dark_paths) = darks(2, 10, 10, 50.0);
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::AddDarks(dark_paths.clone()));
+        m.handle(Action::AddDarks(dark_paths));
+        assert_eq!(m.calibration.dark_sources.len(), 2);
+    }
+
+    #[test]
+    fn building_with_no_darks_reports_it_rather_than_starting_a_job() {
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::BuildMasterDark);
+        assert!(m.job.is_none());
+        assert!(m.error.is_some());
+    }
+
+    #[test]
+    fn applying_a_dark_changes_the_displayed_pixels() {
+        // The point of the whole phase: what is on screen is the light minus
+        // the dark, not the raw frame.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(10, 10, 16);
+        write_synthetic(dir.path(), "light.fits", &spec, &vec![500.0; 100]).unwrap();
+
+        let (_darks_dir, dark_paths) = darks(3, 10, 10, 200.0);
+
+        let (mut m, _spy) = model_over(dir.path());
+        assert_eq!(m.loaded.as_ref().unwrap().image.data[0], 500.0);
+
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        assert!(m.calibration.apply_dark);
+        assert_eq!(
+            m.loaded.as_ref().unwrap().image.data[0],
+            300.0,
+            "the displayed image should be light minus dark"
+        );
+
+        m.handle(Action::ToggleApplyDark);
+        assert_eq!(
+            m.loaded.as_ref().unwrap().image.data[0],
+            500.0,
+            "turning it off should restore the raw values"
+        );
+    }
+
+    #[test]
+    fn toggling_calibration_forces_a_redraw() {
+        let dir = folder_of(1, 10, 10);
+        let (_darks_dir, dark_paths) = darks(1, 10, 10, 5.0);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        let before = m.generation;
+        m.handle(Action::ToggleApplyDark);
+        assert_ne!(m.generation, before, "the texture must be rebuilt");
+    }
+
+    #[test]
+    fn a_master_of_the_wrong_size_blocks_calibration_with_a_reason() {
+        let dir = folder_of(1, 20, 15);
+        let (_darks_dir, dark_paths) = darks(1, 8, 8, 10.0);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        let reason = m
+            .calibration
+            .blocked
+            .as_ref()
+            .expect("a size mismatch should be reported");
+        assert!(reason.contains("8x8"), "{reason}");
+        assert!(
+            m.calibration.active_dark().is_none(),
+            "a mismatched master must not be applied"
+        );
+        // The image is still shown, uncalibrated, rather than vanishing.
+        assert!(m.loaded.is_some());
+    }
+
+    #[test]
+    fn calibration_cannot_be_toggled_without_a_master() {
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleApplyDark);
+        assert!(!m.calibration.apply_dark);
+    }
+
+    #[test]
+    fn a_master_survives_being_saved_and_loaded() {
+        let dir = folder_of(1, 12, 8);
+        let (darks_dir, dark_paths) = darks(3, 12, 8, 77.0);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        let saved = darks_dir.path().join("master_dark.fits");
+        m.handle(Action::SaveMasterDark(saved.clone()));
+        assert!(saved.exists(), "the master should be written");
+
+        m.handle(Action::ClearDarks);
+        assert!(!m.calibration.has_dark());
+
+        m.handle(Action::LoadMasterDark(saved));
+        let dark = m.calibration.dark.as_ref().expect("should have loaded");
+        assert_eq!(dark.source_count, 3, "the frame count should survive");
+        assert!((dark.data[0] - 77.0).abs() < 0.01);
+        assert!(m.calibration.apply_dark);
+    }
+
+    #[test]
+    fn clearing_removes_the_master_and_restores_the_raw_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(10, 10, 16);
+        write_synthetic(dir.path(), "light.fits", &spec, &vec![900.0; 100]).unwrap();
+        let (_darks_dir, dark_paths) = darks(1, 10, 10, 100.0);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+        assert_eq!(m.loaded.as_ref().unwrap().image.data[0], 800.0);
+
+        m.handle(Action::ClearDarks);
+        assert!(!m.calibration.has_dark());
+        assert!(m.calibration.dark_sources.is_empty());
+        assert_eq!(m.loaded.as_ref().unwrap().image.data[0], 900.0);
+    }
+
+    #[test]
+    fn calibration_follows_the_selection_through_the_folder() {
+        let dir = folder_of(3, 10, 10);
+        let (_darks_dir, dark_paths) = darks(1, 10, 10, 1.0);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        for _ in 0..2 {
+            m.handle(Action::NextFile);
+            settle(&mut m);
+            assert!(
+                m.loaded.is_some(),
+                "every file should display while calibration is on"
+            );
+        }
+        assert!(m.calibration.blocked.is_none());
+    }
+
+    #[test]
+    fn a_mismatched_exposure_warns_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let light = SyntheticSpec::new(10, 10, 16).with_card("EXPTIME", "300.0");
+        write_synthetic(dir.path(), "light.fits", &light, &vec![500.0; 100]).unwrap();
+
+        let darks_dir = tempfile::tempdir().unwrap();
+        let dark_spec = SyntheticSpec::new(10, 10, 16).with_card("EXPTIME", "30.0");
+        let dark_path =
+            write_synthetic(darks_dir.path(), "d.fits", &dark_spec, &vec![100.0; 100]).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(vec![dark_path]));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        assert!(
+            m.calibration.blocked.is_none(),
+            "an exposure mismatch must not block"
+        );
+        assert!(
+            m.calibration
+                .warnings
+                .iter()
+                .any(|w| w.contains("exposure")),
+            "expected a warning, got {:?}",
+            m.calibration.warnings
+        );
+        assert_eq!(m.loaded.as_ref().unwrap().image.data[0], 400.0);
+    }
+
+    #[test]
+    fn exporting_writes_calibrated_copies_and_leaves_originals_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(8, 8, 16);
+        for i in 0..3 {
+            write_synthetic(dir.path(), &format!("l{i}.fits"), &spec, &vec![400.0; 64]).unwrap();
+        }
+        let (_darks_dir, dark_paths) = darks(1, 8, 8, 100.0);
+        let out = tempfile::tempdir().unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        assert!(m.job.is_some(), "the export should run in the background");
+        finish_job(&mut m);
+
+        for i in 0..3 {
+            let written = out.path().join(format!("l{i}_cal.fits"));
+            assert!(written.exists(), "{} missing", written.display());
+            let image = fits_core::read_fits(&written).unwrap();
+            assert!((image.data[0] - 300.0).abs() < 0.01, "not calibrated");
+
+            let original = fits_core::read_fits(&dir.path().join(format!("l{i}.fits"))).unwrap();
+            assert!((original.data[0] - 400.0).abs() < 0.01, "original changed");
+        }
+    }
+
+    #[test]
+    fn only_one_background_job_runs_at_a_time() {
+        let dir = folder_of(4, 10, 10);
+        let (_darks_dir, dark_paths) = darks(4, 10, 10, 1.0);
+        let out = tempfile::tempdir().unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+
+        // A second request while the first is running is ignored rather than
+        // starting a competing job.
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        assert!(m.job.is_some());
+        finish_job(&mut m);
+    }
+
+    #[test]
+    fn a_job_can_be_cancelled() {
+        let dir = folder_of(20, 40, 40);
+        let out = tempfile::tempdir().unwrap();
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        m.handle(Action::CancelJob);
+        finish_job(&mut m);
+
+        assert!(m.job.is_none());
+        let written = std::fs::read_dir(out.path()).unwrap().count();
+        assert!(written < 20, "wrote {written} despite cancelling");
+    }
+
+    #[test]
+    fn export_does_nothing_without_a_folder() {
+        let out = tempfile::tempdir().unwrap();
+        let mut m = Model::new();
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        assert!(m.job.is_none());
     }
 
     #[test]

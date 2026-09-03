@@ -154,10 +154,27 @@ structure that makes a stretch worth looking at.
 
 ## Phase 6 — Dark calibration
 
-- [ ] Adding darks of the wrong dimensions disables the toggle with a reason.
-- [ ] Applying a dark visibly removes hot pixels.
-- [ ] Export writes `_cal.fits` files and leaves the originals untouched.
-- [ ] Cancelling an export stops it promptly and leaves no partial file.
+Use real darks matching a real light if you have them. Work on a copy.
+
+- [ ] `Add darks…` accepts several files at once and the count is shown.
+- [ ] `Build master` shows a progress bar and finishes without freezing the
+      window. The panel then reports how many frames were combined.
+- [ ] Applying the dark visibly removes hot pixels. Turn the stretch on first;
+      hot pixels are easiest to see against a stretched background.
+- [ ] `D` toggles it, and the image visibly changes each way.
+- [ ] Adding darks of the wrong dimensions disables the toggle and shows the
+      reason, and the light is still displayed uncalibrated rather than vanishing.
+- [ ] A dark of a clearly different exposure shows a warning but still applies.
+- [ ] `Save master…` then `Clear` then `Load master…` restores the same master,
+      and the frame count survives.
+- [ ] Export writes `_cal.fits` files and leaves the originals untouched. Check
+      an original's modification time afterwards.
+- [ ] Exporting into the source folder is safe: originals keep their names and
+      contents.
+- [ ] Cancelling an export stops promptly and leaves no half-written file. Open
+      the last file written and confirm it reads.
+- [ ] The window stays responsive during a long export: panning and stepping
+      through files still work.
 
 ---
 

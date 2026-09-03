@@ -8,6 +8,8 @@
 //!   never touch the real trash.
 //! - [`folder`] is the file list and the selection within it.
 //! - [`sidecar`] remembers keep flags beside the images.
+//! - [`jobs`] runs slow work, such as combining darks or exporting a folder,
+//!   on a background thread with progress and cancellation.
 //! - [`loader`] decodes images on a worker thread and caches the results.
 //! - [`natsort`] orders file names so `light_2` comes before `light_10`.
 //! - [`view`] is the zoom and pan arithmetic.
@@ -25,6 +27,7 @@
 pub mod actions;
 pub mod app;
 pub mod folder;
+pub mod jobs;
 pub mod loader;
 pub mod natsort;
 pub mod sidecar;

@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use std::io::Write;
+
 use crate::block_align;
 use crate::error::FitsError;
 use crate::header::{self, FitsHeader};
@@ -123,6 +125,109 @@ fn find_image_hdu(bytes: &[u8]) -> Result<(FitsHeader, Geometry, usize), FitsErr
 
     let geom = Geometry::from_header(&primary)?;
     Ok((primary, geom, parsed.data_start))
+}
+
+/// Writes an image as a 32-bit floating point FITS file.
+///
+/// Float output is deliberate: a calibrated frame holds values that are no
+/// longer integers, and rounding them back to 16 bits would throw away the
+/// precision calibration exists to provide. It also means no `BZERO` or
+/// `BSCALE` games, so what is written is exactly what was in memory.
+///
+/// Cards describing the observation are copied from `image`; cards describing
+/// the old file's structure are not, since this file has its own. Each line of
+/// `history` becomes a `HISTORY` card, so a calibrated file records how it was
+/// made.
+///
+/// The file is written to a temporary name and renamed into place, so an
+/// interrupted write cannot leave a half-written image where a valid one used
+/// to be.
+///
+/// # Errors
+///
+/// Returns [`FitsError::Io`] if the file cannot be written, and
+/// [`FitsError::DimensionOverflow`] for an image whose size does not fit.
+pub fn write_fits(path: &Path, image: &FitsImage, history: &[String]) -> Result<(), FitsError> {
+    let bytes = encode_fits(image, history)?;
+
+    // Same directory, so the rename is on one filesystem and therefore atomic.
+    let temp = temp_path_for(path);
+    let mut file = std::fs::File::create(&temp).map_err(|e| FitsError::io(&temp, e))?;
+    file.write_all(&bytes)
+        .map_err(|e| FitsError::io(&temp, e))?;
+    file.sync_all().map_err(|e| FitsError::io(&temp, e))?;
+    drop(file);
+
+    std::fs::rename(&temp, path).map_err(|e| {
+        // Leave nothing behind if the rename fails.
+        let _ = std::fs::remove_file(&temp);
+        FitsError::io(path, e)
+    })
+}
+
+/// A hidden sibling of `path`, used while writing.
+fn temp_path_for(path: &Path) -> std::path::PathBuf {
+    let name = path.file_name().map_or_else(
+        || "fitsview".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    path.with_file_name(format!(".{name}.tmp"))
+}
+
+/// Encodes an image as FITS bytes.
+///
+/// Separated from writing so the format can be tested without a filesystem.
+///
+/// # Errors
+///
+/// Returns [`FitsError::DimensionOverflow`] if the image is too large to
+/// describe.
+pub fn encode_fits(image: &FitsImage, history: &[String]) -> Result<Vec<u8>, FitsError> {
+    let mut cards: Vec<u8> = Vec::new();
+    let naxis = if image.channels > 1 { 3 } else { 2 };
+
+    cards.extend_from_slice(&header::format_card("SIMPLE", "T"));
+    cards.extend_from_slice(&header::format_card("BITPIX", "-32"));
+    cards.extend_from_slice(&header::format_card("NAXIS", &naxis.to_string()));
+    cards.extend_from_slice(&header::format_card("NAXIS1", &image.width.to_string()));
+    cards.extend_from_slice(&header::format_card("NAXIS2", &image.height.to_string()));
+    if naxis == 3 {
+        cards.extend_from_slice(&header::format_card("NAXIS3", &image.channels.to_string()));
+    }
+
+    // Carry the observation's own metadata through, but not the old file's
+    // structural description.
+    for (keyword, value) in &image.header.cards {
+        if header::is_structural(keyword) {
+            continue;
+        }
+        cards.extend_from_slice(&header::format_card(keyword, value));
+    }
+
+    for line in history {
+        cards.extend_from_slice(&header::format_history(line));
+    }
+    cards.extend_from_slice(&header::format_card("END", ""));
+
+    let header_len = block_align(cards.len())
+        .ok_or_else(|| FitsError::DimensionOverflow("header too large".into()))?;
+    cards.resize(header_len, b' ');
+
+    let data_len = image
+        .data
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| FitsError::DimensionOverflow(format!("{} samples", image.data.len())))?;
+    let padded = block_align(data_len)
+        .ok_or_else(|| FitsError::DimensionOverflow(format!("{data_len} bytes")))?;
+
+    let mut out = cards;
+    out.reserve(padded);
+    for sample in &image.data {
+        out.extend_from_slice(&sample.to_be_bytes());
+    }
+    out.resize(header_len + padded, 0);
+    Ok(out)
 }
 
 /// Total bytes a FITS file with this geometry occupies, header included.
@@ -315,6 +420,148 @@ mod tests {
             other => panic!("expected an io error, got {other:?}"),
         }
         assert!(err.to_string().contains("definitely-not-here"));
+    }
+
+    #[test]
+    fn writing_then_reading_returns_identical_samples() {
+        // The round trip the plan deferred from Phase 1 to arrive with the
+        // writer. Float output means this is exact, not approximate.
+        for channels in [1, 3] {
+            let (w, h) = (7usize, 5usize);
+            let pixels: Vec<f64> = (0..w * h * channels)
+                .map(|i| i as f64 * 1.25 - 3.0)
+                .collect();
+            let spec = SyntheticSpec::new(w, h, -32).with_channels(channels);
+            let original = read_fits_from_bytes(&synthetic_fits(&spec, &pixels).unwrap()).unwrap();
+
+            let encoded = encode_fits(&original, &[]).unwrap();
+            let back = read_fits_from_bytes(&encoded).unwrap();
+
+            assert_eq!(back.width, original.width, "channels {channels}");
+            assert_eq!(back.height, original.height);
+            assert_eq!(back.channels, original.channels);
+            assert_eq!(back.data, original.data, "samples must survive exactly");
+            assert_eq!((back.min, back.max), (original.min, original.max));
+        }
+    }
+
+    #[test]
+    fn written_files_are_block_aligned() {
+        let spec = SyntheticSpec::new(10, 10, -32);
+        let img = read_fits_from_bytes(&synthetic_fits(&spec, &vec![1.0; 100]).unwrap()).unwrap();
+        let encoded = encode_fits(&img, &[]).unwrap();
+        assert_eq!(encoded.len() % BLOCK_SIZE, 0);
+        assert!(encoded.starts_with(b"SIMPLE"));
+    }
+
+    #[test]
+    fn observation_metadata_is_carried_through_but_structure_is_not() {
+        let spec = SyntheticSpec::new(4, 4, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("OBJECT", "'M31     '")
+            .with_card("EXPTIME", "               120.0");
+        let img = read_fits_from_bytes(&synthetic_fits(&spec, &[1000.0; 16]).unwrap()).unwrap();
+
+        let back = read_fits_from_bytes(&encode_fits(&img, &[]).unwrap()).unwrap();
+        assert_eq!(back.header.get("OBJECT"), Some("M31"));
+        assert_eq!(back.header.get_f64("EXPTIME"), Some(120.0));
+
+        // The source was 16-bit with an offset; the output is float, so the old
+        // structural cards must not follow it.
+        assert_eq!(back.header.get_i64("BITPIX"), Some(-32));
+        assert_eq!(
+            back.header.get("BZERO"),
+            None,
+            "a stale BZERO would misread every pixel"
+        );
+    }
+
+    #[test]
+    fn a_scaled_source_round_trips_to_the_same_physical_values() {
+        // 16-bit unsigned input, float output: the numbers must not shift.
+        let spec = SyntheticSpec::new(4, 4, 16).with_scaling(32768.0, 1.0);
+        let pixels: Vec<f64> = (0..16).map(|i| f64::from(i) * 4000.0).collect();
+        let img = read_fits_from_bytes(&synthetic_fits(&spec, &pixels).unwrap()).unwrap();
+
+        let back = read_fits_from_bytes(&encode_fits(&img, &[]).unwrap()).unwrap();
+        assert_eq!(back.data, as_f32(&pixels));
+    }
+
+    #[test]
+    fn history_lines_are_written_into_the_file() {
+        let spec = SyntheticSpec::new(2, 2, -32);
+        let img = read_fits_from_bytes(&synthetic_fits(&spec, &[1.0; 4]).unwrap()).unwrap();
+        let history = vec![
+            "fitsview: dark subtracted (5 frames)".to_string(),
+            "fitsview: flat divided".to_string(),
+        ];
+        let encoded = encode_fits(&img, &history).unwrap();
+        let text = String::from_utf8_lossy(&encoded[..2880]);
+        assert!(
+            text.contains("HISTORY fitsview: dark subtracted (5 frames)"),
+            "{text}"
+        );
+        assert!(text.contains("HISTORY fitsview: flat divided"));
+    }
+
+    #[test]
+    fn a_header_that_needs_more_than_one_block_is_written_correctly() {
+        let mut spec = SyntheticSpec::new(2, 2, -32);
+        for i in 0..60 {
+            spec = spec.with_card(&format!("KEY{i:<5}"), &format!("{i}"));
+        }
+        let img = read_fits_from_bytes(&synthetic_fits(&spec, &[1.0; 4]).unwrap()).unwrap();
+        let encoded = encode_fits(&img, &[]).unwrap();
+        let back = read_fits_from_bytes(&encoded).unwrap();
+        assert_eq!(back.header.get_i64("KEY59"), Some(59));
+        assert_eq!(back.data, vec![1.0f32; 4]);
+    }
+
+    #[test]
+    fn non_finite_samples_survive_a_write() {
+        // NaN means "no data" and must not be quietly turned into a number.
+        let spec = SyntheticSpec::new(2, 2, -32);
+        let img = read_fits_from_bytes(&synthetic_fits(&spec, &[1.0, f64::NAN, 3.0, 4.0]).unwrap())
+            .unwrap();
+        let back = read_fits_from_bytes(&encode_fits(&img, &[]).unwrap()).unwrap();
+        assert!(back.data[1].is_nan());
+        assert_eq!(back.data[0], 1.0);
+    }
+
+    #[test]
+    fn writing_to_disk_produces_a_readable_file_and_leaves_no_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(6, 4, -32);
+        let pixels: Vec<f64> = (0..24).map(f64::from).collect();
+        let img = read_fits_from_bytes(&synthetic_fits(&spec, &pixels).unwrap()).unwrap();
+
+        let out = dir.path().join("calibrated.fits");
+        write_fits(&out, &img, &["fitsview: test".to_string()]).unwrap();
+
+        let back = read_fits(&out).unwrap();
+        assert_eq!(back.data, as_f32(&pixels));
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    #[test]
+    fn writing_to_an_unwritable_place_reports_the_path() {
+        let err = write_fits(
+            Path::new("/nonexistent/directory/out.fits"),
+            &read_fits_from_bytes(
+                &synthetic_fits(&SyntheticSpec::new(2, 2, -32), &[1.0; 4]).unwrap(),
+            )
+            .unwrap(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitsError::Io { .. }), "got {err:?}");
     }
 
     #[test]

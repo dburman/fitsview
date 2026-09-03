@@ -5,6 +5,7 @@
 //! carries few tests of its own: the behaviour worth testing lives in
 //! [`crate::app`], [`crate::view`], [`crate::texture`] and [`input`].
 
+mod calibration;
 mod dialogs;
 mod filelist;
 pub mod input;
@@ -156,6 +157,9 @@ impl eframe::App for FitsViewApp {
             self.model.handle(action);
         }
         for action in filelist::show(ui, &self.model) {
+            self.model.handle(action);
+        }
+        for action in calibration::show(ui, &self.model) {
             self.model.handle(action);
         }
 

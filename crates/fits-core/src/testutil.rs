@@ -10,8 +10,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::block_align;
 use crate::error::FitsError;
-use crate::{block_align, CARD_SIZE};
 
 /// Describes a synthetic file to build.
 #[derive(Debug, Clone)]
@@ -94,15 +94,7 @@ impl SyntheticSpec {
 /// hex dump.
 #[must_use]
 pub fn card(key: &str, value: &str) -> Vec<u8> {
-    let text = if value.is_empty() {
-        format!("{key:<8}")
-    } else {
-        format!("{key:<8}= {value:>20}")
-    };
-    let mut bytes = text.into_bytes();
-    bytes.resize(CARD_SIZE, b' ');
-    bytes.truncate(CARD_SIZE);
-    bytes
+    crate::header::format_card(key, value)
 }
 
 /// Builds a complete, block-padded header from `(keyword, value)` pairs,
@@ -214,14 +206,9 @@ fn clamp_int(v: f64, lo: f64, hi: f64) -> f64 {
     }
 }
 
-/// Formats a float the way FITS headers do, always with a decimal point so it
-/// is unambiguously a float.
+/// Formats a float the way FITS headers do.
 fn format_f64(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{v:.1}")
-    } else {
-        format!("{v}")
-    }
+    crate::header::format_f64(v)
 }
 
 /// Builds a synthetic file and writes it into `dir`, returning its path.
@@ -327,7 +314,7 @@ pub fn gaussian_background(
 mod tests {
     use super::*;
     use crate::reader::read_fits_from_bytes;
-    use crate::BLOCK_SIZE;
+    use crate::{BLOCK_SIZE, CARD_SIZE};
 
     #[test]
     fn cards_are_exactly_eighty_bytes() {

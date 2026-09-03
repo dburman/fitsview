@@ -13,7 +13,7 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 5 complete. Phase 6 is next.
+**Status:** Phases 0 to 6 complete. Phase 7 is next.
 
 | Phase | State |
 |-------|-------|
@@ -23,7 +23,7 @@ criteria all pass.
 | 3 — Folder browsing | Done |
 | 4 — Delete, rename, flag | Done |
 | 5 — Stretch | Done |
-| 6 — Dark calibration | Not started |
+| 6 — Dark calibration | Done |
 | 7 — Flat calibration | Not started |
 | 8 — Packaging | Not started |
 
@@ -362,7 +362,7 @@ fitsview/
 │   │       ├── image.rs    # FitsImage, Geometry, pixel conversion, statistics
 │   │       ├── reader.rs   # read_fits, is_fits_path (write_fits in Phase 6)
 │   │       ├── stretch.rs  # midtone transfer auto-stretch and lookup tables
-│   │       ├── calib.rs    # Phase 6 & 7
+│   │       ├── calib.rs    # master frames, dark subtraction, flats in Phase 7
 │   │       └── testutil.rs # synthetic FITS generator (feature "test-util")
 │   │   ├── tests/
 │   │   │   └── properties.rs   # proptest: parser must never panic
@@ -381,6 +381,7 @@ fitsview/
 │       │   ├── folder.rs   # folder scanning, file list, selection
 │       │   ├── loader.rs   # worker thread, bounded LRU cache, prefetch
 │       │   ├── natsort.rs  # light_2 sorts before light_10
+│       │   ├── jobs.rs     # background work with progress and cancellation
 │       │   ├── actions.rs  # delete / rename / flag, behind the FileOps trait
 │       │   ├── sidecar.rs  # .fitsview.json: keep flags stored beside images
 │       │   └── ui/
@@ -389,6 +390,7 @@ fitsview/
 │       │       ├── toolbar.rs
 │       │       ├── viewer.rs
 │       │       ├── filelist.rs
+│       │       ├── calibration.rs # the darks and export panel
 │       │       └── dialogs.rs  # confirmation, rename editor, help, toasts
 │       └── tests/
 │           ├── rendering.rs    # end-to-end: file on disk -> texture
@@ -674,7 +676,8 @@ Every test that needs a file uses these. No binary fixtures are committed.
 | `image.rs` | unit + criterion | Every BITPIX, BZERO/BSCALE, u16 fast path equals the generic path, `finite_min_max` with NaN/inf present and with an all-NaN image, `BLANK` becomes NaN, 3-channel layout. |
 | `reader.rs` | unit + proptest | Truncated, NotFits, absurd NAXIS values do not overflow or allocate wildly, primary-empty-then-extension fallback, missing trailing padding tolerated. The `write_fits`→`read_fits` identity test arrives with `write_fits` itself in Phase 6. |
 | `stretch.rs` | unit | The transfer function is monotonic, bounded and self-inverting; the worked example reproduces exactly; skipping the rescale is caught; the median lands on the target for a noisy frame; the table is monotonic and agrees with direct evaluation; constant, all-NaN and single-pixel images fall back safely; every colour channel shares one stretch. |
-| `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, flat normalises to mean 1.0, near-zero gain becomes NaN and is counted, dark is subtracted before the flat divides, all dark and flat combinations. |
+| `calib.rs` | unit | Median rejects an outlier, mean for N≤2, an even count averages the two middle values, dimension mismatch errors, subtraction clamps at 0, undefined pixels propagate correctly, exposure and temperature mismatches warn without blocking, a master survives being saved and reloaded. Phase 7 adds: flat normalises to mean 1.0, near-zero gain becomes NaN and is counted, dark is subtracted before the flat divides. |
+| `jobs.rs` | integration (tempdir) | Building a master reports progress and returns it, failures are reported rather than hanging, export writes every file and never modifies an original even into the same folder, cancellation stops early. |
 | `folder.rs` | integration (tempdir) | Filters extensions, skips hidden, natural sort, sidecar round-trip. |
 | `actions.rs` | unit | Rename rules including separators, reserved names, case-only clashes and files on disk but not listed; delete calls trash and advances the selection; failures leave the list untouched. All through the `FileOps` trait, so no test reaches the real trash. |
 | `sidecar.rs` | unit (tempdir) | Flags round-trip, a damaged file falls back to defaults, unknown fields from a newer version survive a save, an empty sidecar is removed, no temporary file is left behind. |
@@ -1361,11 +1364,60 @@ pub fn write_fits(path: &Path, img: &FitsImage) -> Result<(), FitsError>; // BIT
 5. `Export calibrated…` → choose output folder → writes `<name>_cal.fits` for every file in the folder, using a background thread with a progress bar and cancel button. Never overwrites originals.
 
 ### Acceptance criteria
-- [ ] Unit test: master median of 3 synthetic frames with one outlier pixel rejects the outlier.
-- [ ] Unit test: `light - dark` for known values, clamped at 0.
-- [ ] Round-trip test: `write_fits` then `read_fits` returns identical data.
-- [ ] Applying dark on a 24 MP image adds < 50 ms per image (parallel subtract).
-- [ ] Export runs off the UI thread, is cancellable, and never touches originals.
+- [x] Unit test: master median of 3 synthetic frames with one outlier pixel rejects the outlier.
+- [x] Unit test: `light - dark` for known values, clamped at 0.
+- [x] Round-trip test: `write_fits` then `read_fits` returns identical data. Exact
+      rather than approximate, because the output is 32-bit float.
+- [x] Applying dark on a 24 MP image adds under 50 ms. Measured at 5.3 ms.
+- [x] Export runs off the UI thread, is cancellable, and never touches originals.
+
+### What Phase 6 actually produced
+
+391 tests pass across the workspace, up from 321.
+
+**`write_fits` arrived here, as Phase 1 planned.** Output is always 32-bit float:
+a calibrated frame holds values that are no longer integers, and rounding them
+back to 16 bits would discard the precision calibration exists to provide. It
+also means no scaling keywords, so what is written is exactly what was in
+memory, and the round-trip test is an equality check rather than a tolerance.
+
+Writing goes to a temporary name and is renamed into place, so an interrupted
+write cannot leave a half-written image where a valid one used to be. Cards
+describing the observation are carried through; cards describing the old file's
+structure are not, since a stale `BZERO` would misread every pixel of a float
+file. There is a test for exactly that.
+
+**Measured performance** on a 6000 x 4000 frame:
+
+| Operation | Time |
+|-----------|------|
+| Subtract a dark | 5.3 ms |
+| Combine five frames into a master | 31 ms |
+
+**Decisions worth knowing:**
+
+- The median is used to combine, not the mean, because a cosmic ray strikes one
+  frame and the median discards it rather than averaging a share of it into
+  every calibrated light. With one or two frames there is no majority, so the
+  mean is used instead.
+- An even number of frames averages the two middle values. Taking whichever the
+  partition landed on would make the result depend on scheduling.
+- Subtraction clamps at zero. A pixel below what the dark predicts is noise, not
+  negative light, and negatives would drag the background statistics the stretch
+  depends on.
+- An undefined light pixel stays undefined, and a pixel the dark cannot describe
+  becomes undefined, because there is no honest value for it.
+- Only a dimension mismatch blocks calibration. Exposure and temperature
+  differences warn instead: plenty of usable dark libraries are slightly off,
+  and the user is better placed to judge than the software. A blocked master
+  still shows the raw image rather than nothing.
+- Calibrated images are cached separately from raw ones, so stepping back and
+  forth through a folder does not subtract the dark repeatedly.
+- Export output is always named `<name>_cal.fits`, which differs from every
+  input name, so exporting into the source folder cannot overwrite an original.
+  A test asserts the originals are unchanged after exporting in place.
+- Only one background job runs at a time. A second request while one is running
+  is ignored rather than starting a competing job.
 
 ---
 
