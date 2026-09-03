@@ -174,6 +174,10 @@ pub fn to_color_image(image: &FitsImage, mapping: &Mapping, factor: usize) -> Co
 ///
 /// `out_y` counts from the top of the screen; FITS rows count from the bottom,
 /// so the flip happens in the row index computed here.
+///
+/// Indexes the sample data directly rather than through [`FitsImage::sample`].
+/// The bounds it would check are already established by the loop, and at
+/// 24 megapixels that check runs a hundred million times.
 fn sample_block(
     image: &FitsImage,
     mapping: &Mapping,
@@ -187,30 +191,31 @@ fn sample_block(
     let src_x0 = out_x * factor;
     let src_y0 = flipped_out_y * factor;
 
+    let plane = image.width * image.height;
+    let x_end = (src_x0 + factor).min(image.width);
+    let y_end = (src_y0 + factor).min(image.height);
+
     let mut channel_bytes = [0u8; 3];
     for (c, byte) in channel_bytes.iter_mut().enumerate().take(image.channels) {
+        let base = c * plane;
         let mut total = 0.0f64;
         let mut counted = 0u32;
-        for dy in 0..factor {
-            let y = src_y0 + dy;
-            if y >= image.height {
-                break;
-            }
-            for dx in 0..factor {
-                let x = src_x0 + dx;
-                if x >= image.width {
-                    break;
-                }
-                if let Some(v) = image.sample(x, y, c) {
-                    // Averaging in the sample domain, then mapping, keeps a
-                    // single hot pixel from dominating a whole output block.
-                    if v.is_finite() {
-                        total += f64::from(v);
-                        counted += 1;
-                    }
+
+        for y in src_y0..y_end {
+            let row = base + y * image.width;
+            // The row slice is in range by construction, so the loop below
+            // needs no per-sample bounds check.
+            let samples = &image.data[row + src_x0..row + x_end];
+            for value in samples {
+                // Averaging in the sample domain, then mapping, keeps a single
+                // hot pixel from dominating a whole output block.
+                if value.is_finite() {
+                    total += f64::from(*value);
+                    counted += 1;
                 }
             }
         }
+
         *byte = if counted == 0 {
             // Every contributing sample was NaN, so the block has no data.
             0

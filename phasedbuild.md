@@ -13,9 +13,15 @@ For what the application does and how to build it, see
 
 ## 0. Product Summary
 
-**Status:** All phases complete. Two gaps remain that need a human rather than
-more code: the application has never been tried against real capture files, and
-the manual checklist has never been run on Linux or Windows. See section 10.
+**Status:** Phases 0 to 9 complete, delivering the application as originally
+specified. Phases 10 to 14 were added afterwards: measured improvements to speed
+and the features that turn a viewer into a culling tool. Phase 11 is the most
+important of them, because it fixes a limitation that defeats the purpose of the
+application on a full-frame camera.
+
+Two gaps remain that need a human rather than more code: the application has
+never been tried against real capture files, and the manual checklist has never
+been run on Linux or Windows. See section 10.
 
 | Phase | State |
 |-------|-------|
@@ -29,9 +35,14 @@ the manual checklist has never been run on Linux or Windows. See section 10.
 | 7 — Flat calibration | Done |
 | 8 — Packaging | Done |
 | 9 — Debayering | Done |
+| 10 — Measure the display path | Done |
+| 11 — True full-resolution zoom | Not started |
+| 12 — Faster colour, fewer copies | Not started |
+| 13 — Frame quality measures | Not started |
+| 14 — Readouts | Not started |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 9
-deliver the features below.
+deliver the requirements below, and phases 10 onwards improve on them.
 
 | # | Requirement | Phase |
 |---|-------------|-------|
@@ -1859,6 +1870,329 @@ interpolation. The same trick expresses the row-flip: flipping the rows of
   debayers them better than this does. Writing debayered files would triple
   their size and quietly degrade what anyone stacks with them. The export
   description says so when reconstruction is on.
+
+---
+
+## Phase 10 — Measure the Display Path
+
+**Goal:** Find out what turning samples into a texture actually costs, before
+optimising anything else.
+
+Every benchmark so far lives in `fits-core`. Nothing measures `texture.rs`,
+which is the one piece of work that happens on the way to the screen for every
+image. It calls `FitsImage::sample` once per channel per pixel, through a bounds
+check and an `Option`, and for a 24 MP frame it averages 24 million samples down
+into 6 million texels. **It could easily cost more than decoding the file, and
+nobody knows.**
+
+This phase is deliberately measurement first. The temptation is to rewrite the
+loop on the assumption it is slow; the discipline is to find out, because the
+last two optimisations in this project (`as_chunks`, the stretch lookup table)
+both mattered and both were justified by a number beforehand.
+
+### Steps
+
+1. Add `crates/fitsview/benches/display.rs`, a criterion bench covering:
+   - `to_color_image` at factor 1 on a 4 MP mono frame,
+   - the same at factor 2 on a 24 MP mono frame, which is the common case,
+   - the same for a three-channel frame, since colour walks three planes,
+   - and with a stretch mapping rather than linear, since that adds a table
+     lookup per sample.
+2. Record the numbers in this phase's write-up, next to the existing ones for
+   decoding, stretching and calibration, so the whole per-image cost is visible
+   in one place for the first time.
+3. **Then decide.** If the texture build is small next to the 4.6 ms decode,
+   write that down and stop. If it dominates, the likely causes, in order:
+   - `sample()` per channel per pixel, each with a bounds check and an `Option`,
+     where the loop already knows the index is valid;
+   - the same nested block loop running at factor 1, where it averages a single
+     pixel;
+   - accumulating in `f64` for a value that ends as a `u8`.
+4. Any change must keep every existing texture test passing, especially the
+   vertical flip and the NaN handling, which are the two things a rewritten
+   pixel loop is most likely to break.
+
+### Acceptance criteria
+
+- [x] `cargo bench --package fitsview` reports the texture build for mono and
+      colour, at factor 1 and 2, linear and stretched.
+- [x] The numbers are written into this phase, alongside decode, stretch and
+      calibration, giving one honest per-image total.
+- [x] The optimisation is justified by a before and after number, both recorded.
+- [x] Every texture test still passes, unchanged.
+
+### What Phase 10 actually produced
+
+**The measurements**, on a 6000 x 4000 frame unless stated, from
+`crates/fitsview/benches/display.rs` and the existing `fits-core` benches:
+
+| Step | Mono | One-shot colour |
+|------|------|-----------------|
+| Decode the file | 4.6 ms | 4.6 ms |
+| Debayer | — | 77 ms |
+| Measure the stretch | 11.8 ms | 16.7 ms |
+| Build the lookup table | 0.16 ms | 0.16 ms |
+| Build the texture | 7.0 ms | 15.6 ms |
+
+**The finding worth acting on is not any single step.** Decoding happens on a
+worker thread, but everything after it runs on the interface thread when an
+image is displayed. That totals about **19 ms for a mono frame** and about
+**110 ms for a one-shot colour frame**, against a frame budget of 16.7 ms at
+60 frames per second. Stepping to a new image therefore drops a frame in the
+mono case and stutters visibly in the colour case. Phase 12 addresses the
+largest part of that; moving the work off the interface thread entirely would
+address the rest, and is the obvious next architectural change.
+
+**The texture build was worth optimising, and the reason was not the obvious
+one.** It called `FitsImage::sample` once per channel per output sample, each
+call performing bounds checks and returning an `Option`, when the surrounding
+loop had already established the index was valid. At 24 megapixels that ran a
+hundred million times. Iterating a row slice directly instead:
+
+| Case | Before | After | Change |
+|------|--------|-------|--------|
+| 4 MP mono, factor 1 | 3.46 ms | 3.26 ms | −6% |
+| 24 MP mono, factor 2 | 8.04 ms | 6.78 ms | −16% |
+| 24 MP mono, factor 2, stretched | 8.07 ms | 7.04 ms | −13% |
+| 6 MP colour, factor 1 | 11.18 ms | 9.65 ms | −14% |
+| 24 MP colour, factor 2 | 21.67 ms | 15.57 ms | −28% |
+
+Every texture test passed unchanged, including the vertical flip and the NaN
+handling, which are what made the rewrite safe to attempt.
+
+**A lesson about benchmarking, recorded because it nearly caused a wrong
+decision.** The first comparison reported the mono cases as **50% slower** and
+looked like a clear regression. It was machine load: builds were running
+alongside. Re-running gave confidence intervals spanning zero, and a controlled
+comparison, swapping only the one file and running the two versions back to
+back, showed a consistent improvement. **Benchmark on a quiet machine, compare
+back to back, and treat a wide confidence interval as no result rather than a
+bad one.**
+
+**The stretch costs nothing extra at display time**, which confirms the lookup
+table from Phase 5 was worth building: the linear and stretched texture builds
+are within noise of each other, 6.78 ms against 7.04 ms.
+
+---
+
+## Phase 11 — True Full-Resolution Zoom
+
+**Goal:** Make `1` show one image pixel per screen pixel, which it currently
+does not.
+
+A frame larger than 4096 pixels on a side is downsampled for the texture, so a
+6000 x 4000 image becomes 3000 x 2000. At "100%" the viewer then stretches that
+back across 6000 screen pixels. **What you are looking at is a two-times blur,
+not the image.**
+
+That is a limitation Phase 2 introduced deliberately and recorded, and it is the
+most important thing in this plan still to fix, because it defeats the purpose
+of the application. Culling means judging focus, star shape and tracking. None
+of those can be judged through a blur, so at present the tool cannot do the job
+it exists for on a full-frame camera.
+
+### Concepts
+
+- The downsampled texture stays, and remains right for a fitted view: there is
+  no point uploading 24 million texels to fill a 1400-pixel window.
+- When the zoom passes roughly 1:1, upload **only the part of the image that is
+  visible**, at full resolution. The work is then bounded by the size of the
+  window rather than the size of the image, so a 100-megapixel frame costs the
+  same as a 6-megapixel one.
+- Two textures, then: the overview, rebuilt when the image or the tone mapping
+  changes, and the detail crop, rebuilt when the visible region changes enough
+  to matter.
+- The crop must be padded beyond the visible rectangle, or every small pan
+  rebuilds it. Round the region out to a grid so that panning within a tile
+  reuses the upload.
+
+### Implementation
+
+```rust
+/// The region of the image a detail texture covers, in image pixels.
+pub struct DetailRegion { pub x: usize, pub y: usize, pub width: usize, pub height: usize }
+
+/// The region to upload for a view, rounded out so small pans reuse it,
+/// and clamped to the image. `None` when the overview is good enough.
+pub fn detail_region_for(image: Vec2, view: &ViewState, viewport: Rect) -> Option<DetailRegion>;
+
+/// Builds a texture for part of an image, at full resolution.
+pub fn to_color_image_region(image: &FitsImage, mapping: &Mapping, region: &DetailRegion) -> ColorImage;
+```
+
+`detail_region_for` is pure arithmetic and is where the bugs will be, so it is
+tested directly: at the edges, at extreme zoom, with a viewport larger than the
+image, and with a region that would fall outside it.
+
+The viewer draws the overview as it does now, and draws the detail texture over
+the top of it when one exists, at the rectangle that region maps to on screen.
+
+### Acceptance criteria
+
+- [ ] Unit test: below 1:1 no detail region is asked for, and the overview is
+      used.
+- [ ] Unit test: at and above 1:1 the region covers the visible part of the
+      image and no more, clamped at the edges.
+- [ ] Unit test: panning by a few pixels returns the same region, so the texture
+      is not rebuilt for every frame of a drag.
+- [ ] Unit test: a viewport larger than the image gives a region covering the
+      whole image, not one running off the end.
+- [ ] End-to-end test: a synthetic frame with a one-pixel feature shows that
+      feature at 1:1 on a 6000 x 4000 image, where it is currently averaged
+      away.
+- [ ] The uploaded texture stays bounded by the window size, not the image size,
+      measured on a 24 MP frame.
+
+---
+
+## Phase 12 — Faster Colour, and Fewer Copies
+
+**Goal:** Take the three worst costs out of the per-image path, each justified by
+a measurement.
+
+Measured on a 6000 x 4000 frame: debayering takes **77 ms**, four times the
+decode and calibration together, and is by a distance the slowest step. Two
+smaller wastes sit beside it.
+
+### The three
+
+1. **Debayering is written generically.** Every pixel scans a 3x3 neighbourhood,
+   calls `colour_at` for each neighbour, and accumulates into `f64`. That was
+   the right first version: it is obviously correct and it made the tests easy
+   to write. But a pixel's site type determines exactly which neighbours carry
+   which colour, so the general scan is doing work the pattern already knows the
+   answer to. Specialising the four cases, and separating the interior from the
+   edges so the interior needs no bounds checks, should cut it several times
+   over. **The existing tests must pass untouched**, because they are what makes
+   this safe to do at all.
+
+2. **Calibration copies the image twice.** `subtract_dark` clones the samples,
+   and `divide_flat` clones them again: 192 MB of copying for a 24 MP frame to
+   produce one result. The second copy can be avoided by dividing in place, once
+   the value is already owned.
+
+3. **The calibrated cache is sized for mono.** A debayered 24 MP frame is
+   288 MB, and the cache allows 512 MB, so **fewer than two fit**. Stepping
+   through a colour folder therefore re-debayers almost every frame at 77 ms
+   each. Either the budget rises, or the cache holds the calibrated mosaic and
+   debayering becomes part of the texture build.
+
+### Acceptance criteria
+
+- [ ] Debayering a 24 MP frame is measurably faster, with the before and after
+      recorded here.
+- [ ] Every debayer test passes unchanged, including the four patterns, the
+      colour reconstruction, the NaN propagation and the edge behaviour.
+- [ ] A property test asserts the specialised implementation agrees with the
+      general one, pixel for pixel, on random images for every pattern.
+- [ ] Calibration makes one copy of the samples rather than two, with the
+      benchmark to show it.
+- [ ] Stepping through a folder of colour frames does not re-debayer a frame it
+      has already shown, demonstrated by a test that counts the work.
+
+---
+
+## Phase 13 — Frame Quality Measures
+
+**Goal:** Let bad frames announce themselves, instead of being found by eye.
+
+This is the feature that turns a viewer into a culling tool. Going through two
+hundred frames one at a time is the job the application exists for, and at
+present the only way to judge one is to look at it. What is actually wanted is a
+number per frame, so the ones ruined by cloud, wind or a tracking error sort
+themselves to the top.
+
+### Concepts
+
+- **Background level** is already measured for the stretch: the median. A frame
+  taken through cloud or moonlight has a background well above its neighbours.
+  This costs nothing extra.
+- **Sharpness** is the useful proxy for focus and tracking. The mean squared
+  difference between neighbouring pixels, over the same subsample the stretch
+  uses, is cheap and monotonic in blur. It is not a star measurement, and it is
+  affected by how much signal a frame contains, so it is comparable **within a
+  folder** and meaningless across folders. Say so where it is shown.
+- **Star measurements** are the real answer: count, full width at half maximum,
+  roundness. They need star detection, which is a phase of its own. The cheap
+  measures above find most bad frames, and are worth having first.
+- Measurement happens on the **raw** frame, before calibration and debayering,
+  so numbers are comparable however the display is configured.
+
+### Implementation
+
+```rust
+/// What a frame looks like, for comparing it with its neighbours.
+pub struct Quality {
+    /// Median sample value: the sky background.
+    pub background: f64,
+    /// Spread of the background, from the same statistics the stretch uses.
+    pub noise: f64,
+    /// Mean squared difference between neighbouring samples. Higher is sharper.
+    pub sharpness: f64,
+}
+
+/// Measures a frame, using the same subsample the stretch takes.
+pub fn measure(image: &FitsImage) -> Quality;
+```
+
+Computed once when a frame is loaded, cached with it, and shown in the file
+list as a column and in the metadata panel in full.
+
+### UI
+
+1. A column in the file list, switchable between background and sharpness.
+2. Sorting the list by that column, as well as by name.
+3. Frames more than a chosen distance from the folder's median marked, so they
+   stand out without being deleted for you. **Nothing is ever deleted
+   automatically**; the tool suggests, the user decides.
+4. The numbers in the metadata panel, with a note that they compare within a
+   folder only.
+
+### Acceptance criteria
+
+- [ ] Unit test: a deliberately blurred frame measures less sharp than the same
+      frame unblurred.
+- [ ] Unit test: a frame with a raised background measures a higher background,
+      and its sharpness is not much changed by the offset.
+- [ ] Unit test: measurement is unaffected by NaN pixels and does not panic on a
+      constant or single-pixel frame.
+- [ ] Unit test: sorting by a measure orders a synthetic folder as expected, and
+      sorting by name still works.
+- [ ] Measuring a 24 MP frame adds no more than a few milliseconds, since it
+      reuses the stretch's subsample. Recorded here.
+- [ ] Marking an outlier never changes a file: a test asserts nothing is deleted
+      or flagged without a user action.
+
+---
+
+## Phase 14 — Readouts
+
+**Goal:** Answer the two questions a viewer gets asked constantly.
+
+Small, and worth having once the larger work is done.
+
+1. **The pixel under the pointer.** Its coordinates in image space and its value
+   in each channel, in the status bar. Constantly wanted when judging whether
+   stars are saturated, and cheap: the view arithmetic to convert a screen
+   position to an image position already exists and is already tested.
+2. **A histogram**, which Phase 8 listed as optional and skipped. 256 bins over
+   the same subsample the stretch measures, drawn under the viewer, with the
+   stretch's black point and midtone marked on it so the effect of the stretch
+   settings is visible rather than guessed at.
+3. **Blink comparison**, optional: hold a key to flip to the previously selected
+   frame and back, which is how two frames are actually compared. Needs both to
+   be in the cache, which they are.
+
+### Acceptance criteria
+
+- [ ] Unit test: a screen position maps to the right image pixel at several zoom
+      levels and pan offsets, including outside the image, where nothing is
+      reported rather than a wrong pixel.
+- [ ] Unit test: the value shown is the raw sample, not the displayed one, so it
+      means what the file holds.
+- [ ] Unit test: histogram bins sum to the number of finite samples measured, and
+      an all-NaN frame produces an empty histogram rather than a panic.
+- [ ] The readout costs nothing measurable per frame.
 
 ---
 

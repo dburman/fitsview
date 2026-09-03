@@ -68,6 +68,14 @@ fn bench_stretch(c: &mut Criterion) {
     group.bench_function("build lookup table", |b| {
         b.iter(|| black_box(build_lut(black_box(&stretch[0]))));
     });
+
+    // A debayered frame is three planes, and the stretch measures all of them
+    // together, so a one-shot colour user pays this rather than the figure
+    // above. Worth knowing before optimising the wrong thing.
+    let colour = debayer(&image, BayerPattern::Rggb).expect("debayer");
+    group.bench_function("compute 24 MP colour", |b| {
+        b.iter(|| black_box(compute_stretch(black_box(&colour), &params)));
+    });
     group.finish();
 }
 

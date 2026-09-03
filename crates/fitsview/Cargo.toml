@@ -22,5 +22,10 @@ thiserror = "2.0.20"
 trash = "5.2.7"
 
 [dev-dependencies]
+criterion = "0.8.2"
 fits-core = { workspace = true, features = ["test-util"] }
 tempfile = "3.27.0"
+
+[[bench]]
+name = "display"
+harness = false
