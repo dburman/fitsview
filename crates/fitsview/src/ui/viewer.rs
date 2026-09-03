@@ -51,7 +51,8 @@ pub fn show(ui: &mut Ui, model: &mut Model, texture: Option<&TextureHandle>) -> 
                 }
             }
 
-            actions.extend(actions_for(&collect_input(ui, &response, viewport)));
+            let modal = model.pending != crate::app::Pending::None;
+            actions.extend(actions_for(&collect_input(ui, &response, viewport, modal)));
         });
 
     actions
@@ -59,7 +60,7 @@ pub fn show(ui: &mut Ui, model: &mut Model, texture: Option<&TextureHandle>) -> 
 
 /// Gathers this frame's input into the plain structure [`actions_for`]
 /// understands. Keeping the two apart is what makes the mapping testable.
-fn collect_input(ui: &Ui, response: &egui::Response, viewport: Rect) -> Frame {
+fn collect_input(ui: &Ui, response: &egui::Response, viewport: Rect, modal: bool) -> Frame {
     let ctx = ui.ctx();
 
     let dropped = ctx.input(|i| {
@@ -76,10 +77,11 @@ fn collect_input(ui: &Ui, response: &egui::Response, viewport: Rect) -> Frame {
             .filter_map(|e| match e {
                 egui::Event::Key {
                     key,
+                    modifiers,
                     pressed: true,
                     repeat: false,
                     ..
-                } => Some(*key),
+                } => Some((*key, *modifiers)),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -108,5 +110,6 @@ fn collect_input(ui: &Ui, response: &egui::Response, viewport: Rect) -> Frame {
         pointer,
         drag_delta,
         dropped,
+        modal,
     }
 }

@@ -13,7 +13,7 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 3 complete. Phase 4 is next.
+**Status:** Phases 0 to 4 complete. Phase 5 is next.
 
 | Phase | State |
 |-------|-------|
@@ -21,7 +21,7 @@ criteria all pass.
 | 1 — FITS reader | Done |
 | 2 — Minimal viewer | Done |
 | 3 — Folder browsing | Done |
-| 4 — Delete, rename, flag | Not started |
+| 4 — Delete, rename, flag | Done |
 | 5 — Stretch | Not started |
 | 6 — Dark calibration | Not started |
 | 7 — Flat calibration | Not started |
@@ -326,14 +326,15 @@ fitsview/
 │       │   ├── folder.rs   # folder scanning, file list, selection
 │       │   ├── loader.rs   # worker thread, bounded LRU cache, prefetch
 │       │   ├── natsort.rs  # light_2 sorts before light_10
-│       │   ├── actions.rs  # Phase 4: delete / rename / flag logic
+│       │   ├── actions.rs  # delete / rename / flag, behind the FileOps trait
+│       │   ├── sidecar.rs  # .fitsview.json: keep flags stored beside images
 │       │   └── ui/
 │       │       ├── mod.rs      # FitsViewApp, texture cache
 │       │       ├── input.rs    # raw input -> Action, tested directly
 │       │       ├── toolbar.rs
 │       │       ├── viewer.rs
 │       │       ├── filelist.rs
-│       │       └── dialogs.rs  # Phase 4
+│       │       └── dialogs.rs  # confirmation, rename editor, help, toasts
 │       └── tests/
 │           ├── rendering.rs    # end-to-end: file on disk -> texture
 │           └── navigation.rs   # measured: no interface stall, bounded memory
@@ -620,7 +621,8 @@ Every test that needs a file uses these. No binary fixtures are committed.
 | `stretch.rs` | unit | Median maps to `target_bg` within tolerance, LUT is monotonic non-decreasing, constant image does not divide by zero, all-NaN image does not panic, RGB per-channel. |
 | `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, flat normalises to mean 1.0, near-zero gain becomes NaN and is counted, dark is subtracted before the flat divides, all dark and flat combinations. |
 | `folder.rs` | integration (tempdir) | Filters extensions, skips hidden, natural sort, sidecar round-trip. |
-| `actions.rs` | integration (tempdir) | Rename rules, flag toggle persists, delete calls trash (mock via trait `FileOps` so tests don't touch the real trash). |
+| `actions.rs` | unit | Rename rules including separators, reserved names, case-only clashes and files on disk but not listed; delete calls trash and advances the selection; failures leave the list untouched. All through the `FileOps` trait, so no test reaches the real trash. |
+| `sidecar.rs` | unit (tempdir) | Flags round-trip, a damaged file falls back to defaults, unknown fields from a newer version survive a save, an empty sidecar is removed, no temporary file is left behind. |
 | `loader.rs` | unit | LRU eviction by count and bytes, recently used entries survive, an oversized image is still kept, stale results dropped after a folder change, the queue is replaced rather than appended to, failures reported and not cached. |
 | `natsort.rs` | unit | Numeric ordering, leading zeros, case insensitivity, overlong digit runs, and that the comparator is a valid total order. |
 | `texture.rs` | unit | Vertical flip applied exactly once, downsample factor selection, NaN maps to black. |
@@ -1048,11 +1050,76 @@ model, not the renderer.
 | `?` | Help |
 
 ### Acceptance criteria
-- [ ] Deleting an unflagged file moves it to trash and advances selection with no dialog.
-- [ ] Deleting a flagged file always shows the confirmation; `Enter` does not confirm.
-- [ ] Flags survive app restart (sidecar file).
-- [ ] Rename rejects duplicates and bad names; extension is preserved.
-- [ ] `actions.rs` unit tests pass on Linux, macOS, Windows in CI.
+- [x] Deleting an unflagged file moves it to trash and advances selection with no dialog.
+- [x] Deleting a flagged file always shows the confirmation. `Enter` does not
+      confirm: the dialog handles only Escape, and the key mapping sends
+      `ConfirmDelete` solely for `Shift+Delete`.
+- [x] Flags survive app restart, verified by reopening the folder in a fresh model.
+- [x] Rename rejects duplicates and bad names; the extension is preserved.
+- [x] `actions.rs` unit tests pass locally. **CI has still never run**, so
+      "on Linux, macOS, Windows" remains unverified.
+
+### What Phase 4 actually produced
+
+284 tests pass across the workspace, up from 215.
+
+**The important finding of this phase was a two-minute freeze.** Every automated
+test uses a recording stand-in for the filesystem, exactly as this plan asks, so
+nothing exercised the real trash. A deliberately separate check did, and it
+failed after **120 seconds** with an Apple Event timeout. The `trash` crate
+defaults on macOS to driving Finder through AppleScript, which needs automation
+permission and blocks until it times out when it does not have it. Wired to a
+delete button, that is a frozen window.
+
+The fix is to use `NSFileManager` on macOS through the crate's
+`DeleteMethod::NsFileManager`: a direct API call, no extra permission, no Finder
+dependency. The same check now passes in 0.2 seconds. Windows and Freedesktop
+systems keep the crate's default, which already uses a real trash API.
+
+The lesson generalises, and is worth remembering for Phases 6 and 7: **a test
+double proves the logic, never the integration.** Where a trait exists so tests
+can avoid a side effect, something still has to exercise the real thing.
+
+**How the real filesystem is tested.** `actions::real_filesystem_tests` holds
+three checks. Rename and its failure path run normally, since they stay inside a
+temporary folder. The trash check is marked `#[ignore]`, because it genuinely
+puts a file in the trash of whoever runs it, and is run deliberately:
+
+```bash
+cargo test -p fitsview --all-features -- --ignored real_delete
+```
+
+Run it on each platform when touching deletion. This is the one `#[ignore]` in
+the repository; it adds coverage rather than skipping any, but it is called out
+here because ignoring tests otherwise needs asking first.
+
+**Decisions worth knowing:**
+
+- Deleting always moves to the trash. `move_to_trash` is the only deletion call
+  in the crate, and nothing calls `remove_file` on a user's image.
+- A dialog swallows every shortcut except Escape. Otherwise typing `d` or `k`
+  into a file name would delete or flag files while the editor had focus.
+- `Enter` cannot confirm a delete. The only keyboard route past the
+  confirmation is `Shift+Delete`, so a burst of held keystrokes cannot destroy a
+  file that was marked to keep.
+- A failed delete or rename leaves the list exactly as it was, so what is on
+  screen always matches what is on disk.
+- The rename editor stays open when a name is unusable, with the reason shown,
+  rather than discarding what was typed.
+- Renaming re-sorts the list and follows the file, since the new name may belong
+  elsewhere in the order.
+- A rename is refused when the target exists on disk but is not listed. A
+  non-FITS file is not in the list, and renaming over it would still destroy it.
+- Case-only clashes are refused, because most desktop filesystems are
+  case-insensitive and the rename would clobber the file.
+- The sidecar keeps fields it does not recognise, so settings written by a later
+  version, such as the calibration paths Phases 6 and 7 will add, are not
+  silently dropped by an older build.
+- The sidecar is deleted rather than left empty when the last flag is cleared,
+  so the application does not litter a user's folders.
+- Undo is offered only where it works. macOS has no programmatic restore from
+  the trash, so the hint is hidden there rather than promising something that
+  fails.
 
 ---
 

@@ -5,6 +5,7 @@
 //! carries few tests of its own: the behaviour worth testing lives in
 //! [`crate::app`], [`crate::view`], [`crate::texture`] and [`input`].
 
+mod dialogs;
 mod filelist;
 pub mod input;
 mod toolbar;
@@ -105,6 +106,16 @@ impl eframe::App for FitsViewApp {
 
         for action in viewer::show(ui, &mut self.model, texture.as_ref()) {
             self.model.handle(action);
+        }
+        for action in dialogs::show(ui, &self.model) {
+            self.model.handle(action);
+        }
+
+        // Toasts disappear on their own, so keep painting while one is up.
+        self.model.expire_toast();
+        if self.model.toast.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 }

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use egui::{Pos2, Rect, Vec2};
 use fits_core::FitsImage;
 
+use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
 use crate::folder::{scan_folder, Folder};
 use crate::loader::Loader;
 use crate::view::ViewState;
@@ -87,8 +88,80 @@ pub enum Action {
         /// Multiplier applied to the current zoom.
         factor: f32,
     },
+    /// Turn the selected file's keep flag on or off.
+    ToggleFlag,
+    /// Ask to delete the selected file. Opens a confirmation if one is needed.
+    RequestDelete,
+    /// Delete without asking. Only reached from the confirmation dialog.
+    ConfirmDelete,
+    /// Begin renaming the selected file.
+    BeginRename,
+    /// The rename editor's text changed, so revalidate it.
+    RenameTextChanged(String),
+    /// Finish renaming, using the name currently typed.
+    CommitRename(String),
+    /// Abandon a confirmation or a rename.
+    Cancel,
+    /// Turn the "confirm every delete" setting on or off.
+    ToggleConfirmEveryDelete,
+    /// Show or hide the keyboard shortcut overlay.
+    ToggleHelp,
     /// Dismiss the current error message.
     ClearError,
+}
+
+/// A modal question or edit that is waiting on the user.
+///
+/// Only one can be active at a time, which is why this is an enum rather than
+/// a set of booleans that could contradict each other.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Pending {
+    /// Nothing is waiting.
+    #[default]
+    None,
+    /// Waiting for the user to confirm deleting this file.
+    DeleteConfirm {
+        /// Name of the file in question.
+        name: String,
+        /// Whether it carries a keep flag, which changes the wording.
+        flagged: bool,
+    },
+    /// Renaming, with the text typed so far.
+    Rename {
+        /// Current contents of the edit box.
+        text: String,
+        /// Why the current text is unusable, if it is.
+        problem: Option<String>,
+    },
+}
+
+/// A short-lived message shown after an action.
+#[derive(Debug, Clone)]
+pub struct Toast {
+    /// What to show.
+    pub text: String,
+    /// When it stops being shown.
+    pub until: std::time::Instant,
+}
+
+impl Toast {
+    /// How long a message stays on screen.
+    pub const LIFETIME: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// A message shown from now.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            until: std::time::Instant::now() + Self::LIFETIME,
+        }
+    }
+
+    /// Whether it should still be shown.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        std::time::Instant::now() < self.until
+    }
 }
 
 /// The application's state.
@@ -113,8 +186,19 @@ pub struct Model {
     pub viewport: Rect,
     /// True while the selected file is still being decoded.
     pub loading: bool,
+    /// A confirmation or rename waiting on the user.
+    pub pending: Pending,
+    /// When on, even unflagged files ask before being deleted.
+    pub confirm_every_delete: bool,
+    /// Whether the shortcut overlay is showing.
+    pub show_help: bool,
+    /// The most recent transient message.
+    pub toast: Option<Toast>,
     /// Decodes images off the UI thread and caches the results.
     loader: Loader,
+    /// How files are deleted and renamed. Swapped in tests so that nothing
+    /// reaches the real trash.
+    ops: Box<dyn FileOps + Send>,
 }
 
 impl Default for Model {
@@ -140,8 +224,21 @@ impl Model {
             generation: 0,
             viewport: Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0)),
             loading: false,
+            pending: Pending::None,
+            confirm_every_delete: false,
+            show_help: false,
+            toast: None,
             loader: Loader::default(),
+            ops: Box::new(RealFileOps),
         }
+    }
+
+    /// A model that performs file operations through `ops`.
+    ///
+    /// Tests use this so that deleting never reaches the real trash.
+    #[must_use]
+    pub fn with_file_ops(ops: Box<dyn FileOps + Send>) -> Self {
+        Self { ops, ..Self::new() }
     }
 
     /// Applies an action.
@@ -178,7 +275,160 @@ impl Model {
                     self.view.zoom_about(anchor, factor);
                 }
             }
+            Action::ToggleFlag => self.toggle_flag(),
+            Action::RequestDelete => self.request_delete(),
+            Action::ConfirmDelete => self.delete_now(),
+            Action::BeginRename => self.begin_rename(),
+            Action::RenameTextChanged(text) => self.check_rename(&text),
+            Action::CommitRename(text) => self.commit_rename(&text),
+            Action::Cancel => self.pending = Pending::None,
+            Action::ToggleConfirmEveryDelete => {
+                self.confirm_every_delete = !self.confirm_every_delete;
+            }
+            Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ClearError => self.error = None,
+        }
+    }
+
+    /// Turns the selected file's keep flag on or off and records it.
+    fn toggle_flag(&mut self) {
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        let Some(Outcome::Flagged { name, flagged }) = actions::toggle_flag(folder) else {
+            return;
+        };
+        if let Err(e) = actions::save_flags(folder) {
+            // The flag is set in memory either way; say so rather than
+            // pretending it will survive a restart.
+            self.error = Some(format!("Could not save flags: {e}"));
+        }
+        self.toast = Some(Toast::new(if flagged {
+            format!("Keeping {name}")
+        } else {
+            format!("No longer keeping {name}")
+        }));
+    }
+
+    /// Deletes, or asks first when the file is flagged or the user has asked to
+    /// be asked every time.
+    fn request_delete(&mut self) {
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        let Some(entry) = folder.selected_entry() else {
+            return;
+        };
+        if actions::needs_delete_confirmation(folder, self.confirm_every_delete) {
+            self.pending = Pending::DeleteConfirm {
+                name: entry.name.clone(),
+                flagged: entry.flagged,
+            };
+        } else {
+            self.delete_now();
+        }
+    }
+
+    /// Performs the delete. The confirmation, if any, has already happened.
+    fn delete_now(&mut self) {
+        self.pending = Pending::None;
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        match actions::delete_selected(folder, self.ops.as_ref()) {
+            Ok(Outcome::Deleted { name }) => {
+                let hint = if actions::undo_supported() {
+                    " — restore it from the trash"
+                } else {
+                    ""
+                };
+                self.toast = Some(Toast::new(format!("Deleted {name}{hint}")));
+                self.error = None;
+                self.after_list_changed();
+            }
+            Ok(_) => {}
+            Err(e) => self.error = Some(format!("Could not delete: {e}")),
+        }
+    }
+
+    /// Opens the rename editor with the current name in it.
+    fn begin_rename(&mut self) {
+        let Some(name) = self
+            .folder
+            .as_ref()
+            .and_then(Folder::selected_entry)
+            .map(|e| e.name.clone())
+        else {
+            return;
+        };
+        self.pending = Pending::Rename {
+            text: name,
+            problem: None,
+        };
+    }
+
+    /// Checks the typed name and reports what is wrong with it, if anything.
+    ///
+    /// Called as the user types so the problem appears before they commit.
+    pub fn check_rename(&mut self, text: &str) {
+        let problem = self.folder.as_ref().and_then(|f| {
+            actions::validate_new_name(f, self.ops.as_ref(), text)
+                .err()
+                .map(|e| e.to_string())
+        });
+        self.pending = Pending::Rename {
+            text: text.to_string(),
+            problem,
+        };
+    }
+
+    /// Applies a rename, keeping the editor open if the name is unusable.
+    fn commit_rename(&mut self, text: &str) {
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        match actions::rename_selected(folder, self.ops.as_ref(), text) {
+            Ok(Outcome::Renamed { from, to }) => {
+                self.pending = Pending::None;
+                if let Err(e) = actions::save_flags(folder) {
+                    self.error = Some(format!("Could not save flags: {e}"));
+                }
+                self.toast = Some(Toast::new(format!("Renamed {from} to {to}")));
+                self.after_list_changed();
+            }
+            Ok(_) => self.pending = Pending::None,
+            Err(ActionError::Rename(e)) => {
+                // Keep the editor open so the user can correct the name.
+                self.pending = Pending::Rename {
+                    text: text.to_string(),
+                    problem: Some(e.to_string()),
+                };
+            }
+            Err(e) => {
+                self.pending = Pending::None;
+                self.error = Some(format!("Could not rename: {e}"));
+            }
+        }
+    }
+
+    /// Brings the display back in step after the file list changes.
+    fn after_list_changed(&mut self) {
+        if self
+            .folder
+            .as_ref()
+            .is_some_and(|f| f.selected_path().is_none())
+        {
+            self.loaded = None;
+            self.loading = false;
+            return;
+        }
+        self.show_selection();
+    }
+
+    /// Drops the toast once its time is up. Called each frame.
+    pub fn expire_toast(&mut self) {
+        if self.toast.as_ref().is_some_and(|t| !t.is_live()) {
+            self.toast = None;
         }
     }
 
@@ -837,6 +1087,310 @@ mod tests {
         m.handle(Action::Open(path));
         settle(&mut m);
         assert!(m.status_text().contains("RGB"), "{}", m.status_text());
+    }
+
+    /// A model whose file operations are recorded rather than performed, so
+    /// that tests never reach the real trash.
+    #[derive(Debug, Default)]
+    struct SpyOps {
+        trashed: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl crate::actions::FileOps for std::sync::Arc<SpyOps> {
+        fn trash(&self, path: &Path) -> Result<(), String> {
+            self.trashed.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }
+        fn rename(&self, from: &Path, to: &Path) -> Result<(), String> {
+            std::fs::rename(from, to).map_err(|e| e.to_string())
+        }
+        fn exists(&self, path: &Path) -> bool {
+            path.exists()
+        }
+    }
+
+    /// A model over `dir` that records deletes instead of performing them.
+    fn model_over(dir: &Path) -> (Model, std::sync::Arc<SpyOps>) {
+        let spy = std::sync::Arc::new(SpyOps::default());
+        let mut m = Model::with_file_ops(Box::new(std::sync::Arc::clone(&spy)));
+        m.handle(Action::Open(dir.to_path_buf()));
+        settle(&mut m);
+        (m, spy)
+    }
+
+    #[test]
+    fn flagging_marks_the_file_and_survives_reopening_the_folder() {
+        let dir = folder_of(3, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        m.handle(Action::ToggleFlag);
+
+        assert!(m.folder.as_ref().unwrap().files[1].flagged);
+        assert!(m.toast.is_some(), "the user should be told");
+
+        // Reopen, as though the application had been restarted.
+        let (m2, _spy2) = model_over(dir.path());
+        assert!(
+            m2.folder.as_ref().unwrap().files[1].flagged,
+            "the flag must survive a restart"
+        );
+        assert!(!m2.folder.as_ref().unwrap().files[0].flagged);
+    }
+
+    #[test]
+    fn unflagging_is_persisted_too() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleFlag);
+        m.handle(Action::ToggleFlag);
+
+        let (m2, _spy2) = model_over(dir.path());
+        assert!(!m2.folder.as_ref().unwrap().files[0].flagged);
+    }
+
+    #[test]
+    fn deleting_an_unflagged_file_happens_at_once_with_no_dialog() {
+        let dir = folder_of(3, 10, 10);
+        let (mut m, spy) = model_over(dir.path());
+
+        m.handle(Action::RequestDelete);
+        assert_eq!(m.pending, Pending::None, "no dialog for an unflagged file");
+        assert_eq!(spy.trashed.lock().unwrap().len(), 1);
+        assert_eq!(m.position_label(), "1 / 2", "selection should advance");
+        settle(&mut m);
+        assert!(m.loaded.is_some(), "the next image should be shown");
+    }
+
+    #[test]
+    fn deleting_a_flagged_file_always_asks_first() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, spy) = model_over(dir.path());
+        m.handle(Action::ToggleFlag);
+
+        m.handle(Action::RequestDelete);
+        match &m.pending {
+            Pending::DeleteConfirm { name, flagged } => {
+                assert_eq!(name, "light_1.fits");
+                assert!(flagged);
+            }
+            other => panic!("expected a confirmation, got {other:?}"),
+        }
+        assert!(
+            spy.trashed.lock().unwrap().is_empty(),
+            "nothing may be deleted before the user confirms"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_confirmation_keeps_the_file() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, spy) = model_over(dir.path());
+        m.handle(Action::ToggleFlag);
+        m.handle(Action::RequestDelete);
+
+        m.handle(Action::Cancel);
+        assert_eq!(m.pending, Pending::None);
+        assert!(spy.trashed.lock().unwrap().is_empty());
+        assert_eq!(m.position_label(), "1 / 2", "the file is still there");
+    }
+
+    #[test]
+    fn confirming_deletes_the_flagged_file() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, spy) = model_over(dir.path());
+        m.handle(Action::ToggleFlag);
+        m.handle(Action::RequestDelete);
+
+        m.handle(Action::ConfirmDelete);
+        assert_eq!(m.pending, Pending::None);
+        assert_eq!(spy.trashed.lock().unwrap().len(), 1);
+        assert_eq!(m.position_label(), "1 / 1");
+    }
+
+    #[test]
+    fn confirm_every_delete_asks_even_for_unflagged_files() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, spy) = model_over(dir.path());
+        m.handle(Action::ToggleConfirmEveryDelete);
+        assert!(m.confirm_every_delete);
+
+        m.handle(Action::RequestDelete);
+        assert!(matches!(m.pending, Pending::DeleteConfirm { .. }));
+        assert!(spy.trashed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_the_last_remaining_file_clears_the_view() {
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::RequestDelete);
+        assert_eq!(m.position_label(), "0 / 0");
+        assert!(m.loaded.is_none(), "nothing left to show");
+        assert!(!m.loading);
+    }
+
+    #[test]
+    fn a_delete_that_fails_is_reported_and_changes_nothing() {
+        #[derive(Debug)]
+        struct AlwaysFails;
+        impl crate::actions::FileOps for AlwaysFails {
+            fn trash(&self, _: &Path) -> Result<(), String> {
+                Err("permission denied".into())
+            }
+            fn rename(&self, _: &Path, _: &Path) -> Result<(), String> {
+                Err("permission denied".into())
+            }
+            fn exists(&self, _: &Path) -> bool {
+                false
+            }
+        }
+
+        let dir = folder_of(2, 10, 10);
+        let mut m = Model::with_file_ops(Box::new(AlwaysFails));
+        m.handle(Action::Open(dir.path().to_path_buf()));
+        settle(&mut m);
+
+        m.handle(Action::RequestDelete);
+        assert!(m.error.is_some(), "the failure must be surfaced");
+        assert_eq!(m.position_label(), "1 / 2", "the file is still listed");
+    }
+
+    #[test]
+    fn renaming_moves_the_file_on_disk_and_keeps_it_selected() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::BeginRename);
+        match &m.pending {
+            Pending::Rename { text, problem } => {
+                assert_eq!(text, "light_1.fits", "editor starts with the current name");
+                assert!(problem.is_none());
+            }
+            other => panic!("expected the rename editor, got {other:?}"),
+        }
+
+        m.handle(Action::CommitRename("m31_first.fits".into()));
+        assert_eq!(m.pending, Pending::None);
+        assert!(dir.path().join("m31_first.fits").exists());
+        assert!(!dir.path().join("light_1.fits").exists());
+        assert_eq!(
+            m.folder.as_ref().unwrap().selected_entry().unwrap().name,
+            "m31_first.fits"
+        );
+    }
+
+    #[test]
+    fn a_rename_that_clashes_keeps_the_editor_open_with_a_reason() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::BeginRename);
+        m.handle(Action::CommitRename("light_2.fits".into()));
+
+        match &m.pending {
+            Pending::Rename { problem, .. } => {
+                let problem = problem.as_ref().expect("should explain the clash");
+                assert!(problem.contains("already exists"), "{problem}");
+            }
+            other => panic!("the editor should stay open, got {other:?}"),
+        }
+        assert!(dir.path().join("light_1.fits").exists(), "nothing moved");
+    }
+
+    #[test]
+    fn typing_an_invalid_name_reports_it_before_committing() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::BeginRename);
+
+        m.handle(Action::RenameTextChanged("sub/dir.fits".into()));
+        match &m.pending {
+            Pending::Rename { problem, .. } => {
+                assert!(problem.is_some(), "should complain about the separator");
+            }
+            other => panic!("expected the editor, got {other:?}"),
+        }
+
+        m.handle(Action::RenameTextChanged("fine.fits".into()));
+        match &m.pending {
+            Pending::Rename { problem, .. } => assert!(problem.is_none()),
+            other => panic!("expected the editor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelling_a_rename_leaves_the_file_alone() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::BeginRename);
+        m.handle(Action::Cancel);
+
+        assert_eq!(m.pending, Pending::None);
+        assert!(dir.path().join("light_1.fits").exists());
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_its_flag_across_a_restart() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleFlag);
+        m.handle(Action::BeginRename);
+        m.handle(Action::CommitRename("keeper.fits".into()));
+
+        let (m2, _spy2) = model_over(dir.path());
+        let entry = m2
+            .folder
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .find(|e| e.name == "keeper.fits")
+            .expect("renamed file should be listed");
+        assert!(entry.flagged, "the flag must follow the new name");
+    }
+
+    #[test]
+    fn the_help_overlay_toggles() {
+        let mut m = Model::new();
+        assert!(!m.show_help);
+        m.handle(Action::ToggleHelp);
+        assert!(m.show_help);
+        m.handle(Action::ToggleHelp);
+        assert!(!m.show_help);
+    }
+
+    #[test]
+    fn file_actions_do_nothing_without_a_folder() {
+        let mut m = Model::new();
+        for a in [
+            Action::ToggleFlag,
+            Action::RequestDelete,
+            Action::ConfirmDelete,
+            Action::BeginRename,
+            Action::CommitRename("x.fits".into()),
+        ] {
+            m.handle(a);
+        }
+        assert!(m.folder.is_none());
+        assert_eq!(m.pending, Pending::None);
+    }
+
+    #[test]
+    fn a_toast_expires_on_its_own() {
+        let mut m = Model::new();
+        m.toast = Some(Toast {
+            text: "gone".into(),
+            until: std::time::Instant::now() - Duration::from_secs(1),
+        });
+        m.expire_toast();
+        assert!(m.toast.is_none());
+
+        m.toast = Some(Toast::new("still here"));
+        m.expire_toast();
+        assert!(m.toast.is_some());
     }
 
     #[test]

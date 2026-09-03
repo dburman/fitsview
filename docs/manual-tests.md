@@ -97,14 +97,36 @@ hardware, which those tests cannot judge.
 
 ## Phase 4 — Delete, rename, flag
 
+Work on a copy of a folder, not on frames you care about.
+
+Run the real-trash check on this platform first, since no ordinary test
+touches it:
+
+```
+cargo test -p fitsview --all-features -- --ignored real_delete
+```
+
 - [ ] Deleting an unflagged file shows no dialog and advances the selection.
-- [ ] The deleted file is in the OS trash or recycle bin, not gone.
+- [ ] **The deleted file is in the trash or recycle bin, not gone.** Open the
+      trash and confirm it is really there.
+- [ ] Deleting is immediate. If it hangs for even a second, the trash back end
+      is wrong for this platform; see the Phase 4 notes in `README.md`.
+- [ ] `K` flags the file, the star appears in the list and the toolbar button
+      changes.
 - [ ] Deleting a flagged file always shows the confirmation dialog.
 - [ ] `Enter` does **not** confirm that dialog; `Esc` cancels it.
-- [ ] `F2` renames inline, with the extension preserved.
-- [ ] Renaming to an existing name is rejected with a visible message.
-- [ ] Flags survive quitting and reopening the app.
-- [ ] `?` shows the help overlay and every listed shortcut works.
+- [ ] `Shift+Delete` deletes a flagged file without the dialog.
+- [ ] "Confirm every delete" makes unflagged files ask too.
+- [ ] `F2` opens the rename editor with the current name, extension preserved
+      when you leave it off.
+- [ ] Renaming to an existing name is rejected with a visible message, and the
+      editor stays open with what you typed.
+- [ ] While the rename editor is open, pressing `d`, `k` or an arrow key types
+      into the box and does not delete, flag or navigate.
+- [ ] Flags survive quitting and reopening the application.
+- [ ] Clearing the last flag removes `.fitsview.json` from the folder.
+- [ ] `?` shows the help overlay, and every shortcut listed in it works.
+- [ ] Deleting the last file in a folder leaves an empty window, not a crash.
 
 ---
 

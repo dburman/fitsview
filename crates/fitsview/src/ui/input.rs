@@ -3,7 +3,7 @@
 //! Kept apart from drawing so the mapping from a key or a gesture to a
 //! behaviour can be tested directly, without an event loop.
 
-use egui::{Key, Pos2, Vec2};
+use egui::{Key, Modifiers, Pos2, Vec2};
 
 use crate::app::Action;
 
@@ -17,8 +17,8 @@ pub const ZOOM_PER_SCROLL_UNIT: f32 = 0.0015;
 /// in a test.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Frame {
-    /// Keys pressed this frame.
-    pub keys: Vec<Key>,
+    /// Keys pressed this frame, each with the modifiers held at the time.
+    pub keys: Vec<(Key, Modifiers)>,
     /// Accumulated wheel movement.
     pub scroll_delta: f32,
     /// Where the pointer is, if it is over the image area.
@@ -27,23 +27,39 @@ pub struct Frame {
     pub drag_delta: Vec2,
     /// Files dropped on the window this frame.
     pub dropped: Vec<std::path::PathBuf>,
+    /// True while a dialog or the rename editor owns the keyboard.
+    ///
+    /// Navigation and destructive shortcuts are suppressed then, so that typing
+    /// a new file name cannot delete files or jump through the folder.
+    pub modal: bool,
 }
 
 /// Converts a frame of input into the actions it implies.
 ///
 /// The order matters: a dropped file is handled before view changes, so that
 /// dropping and scrolling in the same frame does not zoom the outgoing image.
+///
+/// While a dialog or the rename editor is open, only Escape is honoured. Every
+/// other shortcut is suppressed, because the keystrokes belong to the editor
+/// and because `d` in a file name must never mean delete.
 #[must_use]
 pub fn actions_for(frame: &Frame) -> Vec<Action> {
     let mut out = Vec::new();
 
+    if frame.modal {
+        if frame.keys.iter().any(|(k, _)| *k == Key::Escape) {
+            out.push(Action::Cancel);
+        }
+        return out;
+    }
+
     // Only the last dropped file is opened. Opening several at once would need
-    // the folder model, which arrives in Phase 3.
+    // multi-selection, which this application does not have.
     if let Some(path) = frame.dropped.last() {
         out.push(Action::Open(path.clone()));
     }
 
-    for key in &frame.keys {
+    for (key, modifiers) in &frame.keys {
         match key {
             // Navigation. Space steps forward because culling is a
             // one-hand-on-the-keyboard job.
@@ -52,9 +68,23 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             Key::Home => out.push(Action::FirstFile),
             Key::End => out.push(Action::LastFile),
             Key::F5 => out.push(Action::Rescan),
+            // File management. Backspace is included because that is what
+            // deletes a file on macOS.
+            Key::Delete | Key::Backspace => {
+                // Shift is the deliberate second gesture that gets past the
+                // confirmation for a file marked to keep.
+                if modifiers.shift {
+                    out.push(Action::ConfirmDelete);
+                } else {
+                    out.push(Action::RequestDelete);
+                }
+            }
+            Key::K => out.push(Action::ToggleFlag),
+            Key::F2 => out.push(Action::BeginRename),
             // View.
             Key::F => out.push(Action::FitToWindow),
             Key::Num1 => out.push(Action::ActualSize),
+            Key::Questionmark | Key::H => out.push(Action::ToggleHelp),
             Key::Escape => out.push(Action::ClearError),
             _ => {}
         }
@@ -87,6 +117,16 @@ mod tests {
         Frame::default()
     }
 
+    /// One key press with no modifiers.
+    fn key(k: Key) -> Vec<(Key, Modifiers)> {
+        vec![(k, Modifiers::NONE)]
+    }
+
+    /// Several key presses with no modifiers.
+    fn keys(list: &[Key]) -> Vec<(Key, Modifiers)> {
+        list.iter().map(|k| (*k, Modifiers::NONE)).collect()
+    }
+
     #[test]
     fn an_empty_frame_produces_no_actions() {
         assert!(actions_for(&frame()).is_empty());
@@ -95,13 +135,13 @@ mod tests {
     #[test]
     fn f_fits_and_one_shows_actual_size() {
         let f = Frame {
-            keys: vec![Key::F],
+            keys: key(Key::F),
             ..frame()
         };
         assert_eq!(actions_for(&f), vec![Action::FitToWindow]);
 
         let f = Frame {
-            keys: vec![Key::Num1],
+            keys: key(Key::Num1),
             ..frame()
         };
         assert_eq!(actions_for(&f), vec![Action::ActualSize]);
@@ -110,7 +150,7 @@ mod tests {
     #[test]
     fn escape_clears_the_error() {
         let f = Frame {
-            keys: vec![Key::Escape],
+            keys: key(Key::Escape),
             ..frame()
         };
         assert_eq!(actions_for(&f), vec![Action::ClearError]);
@@ -119,7 +159,7 @@ mod tests {
     #[test]
     fn unmapped_keys_do_nothing() {
         let f = Frame {
-            keys: vec![Key::Q, Key::Z, Key::W],
+            keys: keys(&[Key::Q, Key::Z, Key::W]),
             ..frame()
         };
         assert!(actions_for(&f).is_empty());
@@ -137,12 +177,12 @@ mod tests {
             (Key::End, Action::LastFile),
             (Key::F5, Action::Rescan),
         ];
-        for (key, expected) in cases {
+        for (k, expected) in cases {
             let f = Frame {
-                keys: vec![key],
+                keys: key(k),
                 ..frame()
             };
-            assert_eq!(actions_for(&f), vec![expected], "key {key:?}");
+            assert_eq!(actions_for(&f), vec![expected], "key {k:?}");
         }
     }
 
@@ -151,10 +191,110 @@ mod tests {
         // The event collector filters out auto-repeat, so several presses in a
         // frame means the user really pressed it several times.
         let f = Frame {
-            keys: vec![Key::ArrowRight, Key::ArrowRight, Key::ArrowRight],
+            keys: keys(&[Key::ArrowRight, Key::ArrowRight, Key::ArrowRight]),
             ..frame()
         };
         assert_eq!(actions_for(&f).len(), 3);
+    }
+
+    #[test]
+    fn file_management_keys_map_to_their_actions() {
+        for (k, expected) in [
+            (Key::K, Action::ToggleFlag),
+            (Key::Delete, Action::RequestDelete),
+            (Key::Backspace, Action::RequestDelete),
+            (Key::F2, Action::BeginRename),
+        ] {
+            let f = Frame {
+                keys: key(k),
+                ..frame()
+            };
+            assert_eq!(actions_for(&f), vec![expected], "key {k:?}");
+        }
+    }
+
+    #[test]
+    fn shift_delete_skips_the_confirmation() {
+        // The deliberate second gesture for a file marked to keep.
+        for k in [Key::Delete, Key::Backspace] {
+            let f = Frame {
+                keys: vec![(k, Modifiers::SHIFT)],
+                ..frame()
+            };
+            assert_eq!(actions_for(&f), vec![Action::ConfirmDelete], "key {k:?}");
+        }
+    }
+
+    #[test]
+    fn plain_delete_asks_rather_than_deleting_outright() {
+        let f = Frame {
+            keys: key(Key::Delete),
+            ..frame()
+        };
+        assert_eq!(
+            actions_for(&f),
+            vec![Action::RequestDelete],
+            "an unmodified Delete must go through the confirmation path"
+        );
+    }
+
+    #[test]
+    fn either_help_key_toggles_the_overlay() {
+        for k in [Key::Questionmark, Key::H] {
+            let f = Frame {
+                keys: key(k),
+                ..frame()
+            };
+            assert_eq!(actions_for(&f), vec![Action::ToggleHelp], "key {k:?}");
+        }
+    }
+
+    #[test]
+    fn a_modal_swallows_every_shortcut_except_escape() {
+        // Typing a file name must never delete files or jump through the
+        // folder, which is what would happen if these leaked through.
+        let dangerous = keys(&[
+            Key::Delete,
+            Key::Backspace,
+            Key::K,
+            Key::F,
+            Key::ArrowRight,
+            Key::Home,
+            Key::F5,
+            Key::F2,
+        ]);
+        let f = Frame {
+            keys: dangerous,
+            scroll_delta: 40.0,
+            pointer: Some(Pos2::ZERO),
+            drag_delta: Vec2::new(3.0, 3.0),
+            dropped: vec![PathBuf::from("/tmp/a.fits")],
+            modal: true,
+        };
+        assert!(
+            actions_for(&f).is_empty(),
+            "no shortcut may act while a dialog is open: {:?}",
+            actions_for(&f)
+        );
+    }
+
+    #[test]
+    fn escape_still_cancels_while_a_modal_is_open() {
+        let f = Frame {
+            keys: key(Key::Escape),
+            modal: true,
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::Cancel]);
+    }
+
+    #[test]
+    fn escape_outside_a_modal_dismisses_the_error_instead() {
+        let f = Frame {
+            keys: key(Key::Escape),
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::ClearError]);
     }
 
     #[test]
@@ -252,7 +392,8 @@ mod tests {
             scroll_delta: 50.0,
             pointer: Some(Pos2::new(1.0, 1.0)),
             drag_delta: Vec2::new(5.0, 5.0),
-            keys: vec![Key::F],
+            keys: key(Key::F),
+            modal: false,
         };
         let actions = actions_for(&f);
         assert!(

@@ -4,7 +4,10 @@
 //! opening a window:
 //!
 //! - [`app`] holds the state and every rule that changes it.
+//! - [`actions`] deletes, renames and flags files, behind a trait so tests
+//!   never touch the real trash.
 //! - [`folder`] is the file list and the selection within it.
+//! - [`sidecar`] remembers keep flags beside the images.
 //! - [`loader`] decodes images on a worker thread and caches the results.
 //! - [`natsort`] orders file names so `light_2` comes before `light_10`.
 //! - [`view`] is the zoom and pan arithmetic.
@@ -19,10 +22,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod actions;
 pub mod app;
 pub mod folder;
 pub mod loader;
 pub mod natsort;
+pub mod sidecar;
 pub mod texture;
 pub mod ui;
 pub mod view;

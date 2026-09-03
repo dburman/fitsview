@@ -60,6 +60,43 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
             ui.separator();
 
+            let has_selection = model
+                .folder
+                .as_ref()
+                .is_some_and(|f| f.selected_entry().is_some());
+            let flagged = model
+                .folder
+                .as_ref()
+                .and_then(crate::folder::Folder::selected_entry)
+                .is_some_and(|e| e.flagged);
+
+            if ui
+                .add_enabled(
+                    has_selection,
+                    Button::new(if flagged { "★ Keep" } else { "☆ Keep" }),
+                )
+                .on_hover_text("Mark this file to keep (K). Flagged files ask before deleting.")
+                .clicked()
+            {
+                actions.push(Action::ToggleFlag);
+            }
+            if ui
+                .add_enabled(has_selection, Button::new("Rename"))
+                .on_hover_text("Rename this file (F2)")
+                .clicked()
+            {
+                actions.push(Action::BeginRename);
+            }
+            if ui
+                .add_enabled(has_selection, Button::new("🗑 Delete"))
+                .on_hover_text("Move this file to the trash (Delete)")
+                .clicked()
+            {
+                actions.push(Action::RequestDelete);
+            }
+
+            ui.separator();
+
             let has_image = model.loaded.is_some();
             if ui
                 .add_enabled(has_image, Button::new("Fit"))
@@ -75,6 +112,24 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
             {
                 actions.push(Action::ActualSize);
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("?")
+                    .on_hover_text("Keyboard shortcuts (? or H)")
+                    .clicked()
+                {
+                    actions.push(Action::ToggleHelp);
+                }
+                let mut confirm = model.confirm_every_delete;
+                if ui
+                    .checkbox(&mut confirm, "Confirm every delete")
+                    .on_hover_text("Ask before deleting any file, not only flagged ones")
+                    .changed()
+                {
+                    actions.push(Action::ToggleConfirmEveryDelete);
+                }
+            });
         });
     });
 

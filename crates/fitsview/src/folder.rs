@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use fits_core::is_fits_path;
 
-use crate::natsort::natural_cmp;
+use crate::natsort;
+use crate::sidecar;
 
 /// One file in the browsed folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +79,14 @@ pub fn scan_folder(dir: &Path) -> std::io::Result<Folder> {
         });
     }
 
-    files.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+    files.sort_by(|a, b| natsort::natural_cmp(&a.name, &b.name));
+
+    // Keep flags live beside the images, so they survive a restart and travel
+    // with the folder if it is copied elsewhere.
+    let flags = sidecar::load(dir);
+    for entry in &mut files {
+        entry.flagged = flags.is_flagged(&entry.name);
+    }
 
     let selected = if files.is_empty() { None } else { Some(0) };
     Ok(Folder {
@@ -89,6 +97,14 @@ pub fn scan_folder(dir: &Path) -> std::io::Result<Folder> {
 }
 
 impl Folder {
+    /// Re-sorts the file list into natural name order.
+    ///
+    /// Needed after a rename, since the new name may belong elsewhere.
+    pub fn sort(&mut self) {
+        self.files
+            .sort_by(|a, b| natsort::natural_cmp(&a.name, &b.name));
+    }
+
     /// Number of files.
     #[must_use]
     pub fn len(&self) -> usize {
