@@ -238,7 +238,7 @@ Real flats matter here: synthetic ones cannot show dust shadows.
 - [ ] A crash shows a dialog rather than the window vanishing, and writes to the
       crash log named in that dialog. To provoke one deliberately, build with a
       temporary `panic!` early in `main`.
-- [ ] Pushing a `v0.1.0` tag produces a draft release with three binaries
+- [ ] Pushing a version tag produces a draft release with three binaries
       attached. Check each downloads and runs.
 
 ---
