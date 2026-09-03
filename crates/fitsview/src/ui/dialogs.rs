@@ -16,6 +16,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Delete / Backspace", "Delete to trash"),
     ("Shift+Delete", "Delete a flagged file without asking"),
     ("F2", "Rename"),
+    ("S", "Toggle the automatic stretch"),
     ("F / 1", "Fit to window / actual size"),
     ("Scroll", "Zoom about the pointer"),
     ("Drag", "Pan"),

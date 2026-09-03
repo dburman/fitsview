@@ -82,6 +82,7 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             Key::K => out.push(Action::ToggleFlag),
             Key::F2 => out.push(Action::BeginRename),
             // View.
+            Key::S => out.push(Action::ToggleStretch),
             Key::F => out.push(Action::FitToWindow),
             Key::Num1 => out.push(Action::ActualSize),
             Key::Questionmark | Key::H => out.push(Action::ToggleHelp),
@@ -236,6 +237,15 @@ mod tests {
             vec![Action::RequestDelete],
             "an unmodified Delete must go through the confirmation path"
         );
+    }
+
+    #[test]
+    fn s_toggles_the_stretch() {
+        let f = Frame {
+            keys: key(Key::S),
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::ToggleStretch]);
     }
 
     #[test]

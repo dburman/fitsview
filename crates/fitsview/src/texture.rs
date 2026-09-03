@@ -13,7 +13,10 @@
 //! 3. **Mapping samples to bytes.** Non-finite samples become black rather
 //!    than poisoning the arithmetic.
 
+use std::sync::Arc;
+
 use egui::{Color32, ColorImage};
+use fits_core::stretch::{self, Lut, StretchParams};
 use fits_core::FitsImage;
 use rayon::prelude::*;
 
@@ -25,32 +28,69 @@ pub const MAX_TEXTURE_EDGE: usize = 4096;
 
 /// Maps sample values onto the 0..=255 display range.
 ///
-/// Phase 2 uses a plain linear ramp between the image extremes. Phase 5 adds
-/// the astro stretch, which replaces this with a lookup table.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Two modes. Linear spreads the image's finite range evenly, which is honest
+/// but shows almost nothing on a raw astronomical frame. Stretched puts the sky
+/// background at a chosen brightness through a per-channel lookup table, which
+/// is what makes the faint signal visible.
+#[derive(Debug, Clone)]
 pub struct Mapping {
-    /// Sample value that maps to black.
-    pub low: f32,
-    /// Sample value that maps to white.
-    pub high: f32,
+    /// Sample value that maps to the bottom of the range.
+    low: f32,
+    /// Sample value that maps to the top of the range.
+    high: f32,
+    /// One lookup table per channel when stretching, empty when linear.
+    ///
+    /// Shared rather than copied, because a table is 64 KB and the mapping is
+    /// cloned for every texture rebuild.
+    luts: Arc<Vec<Box<Lut>>>,
 }
 
 impl Mapping {
     /// A linear ramp across an image's finite range.
     #[must_use]
     pub fn linear(image: &FitsImage) -> Self {
+        Self::range(image.min, image.max)
+    }
+
+    /// A linear ramp between two explicit values.
+    #[must_use]
+    pub fn range(low: f32, high: f32) -> Self {
         Self {
-            low: image.min,
-            high: image.max,
+            low,
+            high,
+            luts: Arc::new(Vec::new()),
         }
     }
 
-    /// Maps one sample to a display byte.
+    /// An automatic stretch computed from the image.
+    ///
+    /// The tables are built once here rather than per pixel, which is what
+    /// keeps a stretched redraw as cheap as a linear one.
+    #[must_use]
+    pub fn stretched(image: &FitsImage, params: &StretchParams) -> Self {
+        let luts = stretch::compute_stretch(image, params)
+            .iter()
+            .map(stretch::build_lut)
+            .collect();
+        Self {
+            low: image.min,
+            high: image.max,
+            luts: Arc::new(luts),
+        }
+    }
+
+    /// Whether this mapping applies a stretch.
+    #[must_use]
+    pub fn is_stretched(&self) -> bool {
+        !self.luts.is_empty()
+    }
+
+    /// Maps one sample of the given channel to a display byte.
     ///
     /// Non-finite samples map to black. A `NaN` reaching this unhandled would
     /// otherwise produce an arbitrary byte and speckle the image.
     #[must_use]
-    pub fn to_u8(&self, sample: f32) -> u8 {
+    pub fn to_u8(&self, sample: f32, channel: usize) -> u8 {
         if !sample.is_finite() {
             return 0;
         }
@@ -58,11 +98,16 @@ impl Mapping {
         if span <= 0.0 {
             return 0;
         }
-        let t = ((sample - self.low) / span).clamp(0.0, 1.0);
+        let normalised = ((sample - self.low) / span).clamp(0.0, 1.0);
+
+        if let Some(lut) = self.luts.get(channel).or_else(|| self.luts.first()) {
+            return lut[stretch::lut_index(normalised)];
+        }
+
         // 255.0 rather than 256.0 so that `high` maps exactly to 255.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         {
-            (t * 255.0).round() as u8
+            (normalised * 255.0).round() as u8
         }
     }
 }
@@ -171,7 +216,7 @@ fn sample_block(
             0
         } else {
             #[allow(clippy::cast_possible_truncation)]
-            mapping.to_u8((total / f64::from(counted)) as f32)
+            mapping.to_u8((total / f64::from(counted)) as f32, c)
         };
     }
 
@@ -200,44 +245,32 @@ mod tests {
     fn linear_mapping_spans_the_image_range() {
         let img = image(2, 1, &[10.0, 20.0]);
         let m = Mapping::linear(&img);
-        assert_eq!(m.to_u8(10.0), 0);
-        assert_eq!(m.to_u8(20.0), 255);
-        assert_eq!(m.to_u8(15.0), 128);
+        assert_eq!(m.to_u8(10.0, 0), 0);
+        assert_eq!(m.to_u8(20.0, 0), 255);
+        assert_eq!(m.to_u8(15.0, 0), 128);
     }
 
     #[test]
     fn mapping_clamps_out_of_range_samples() {
-        let m = Mapping {
-            low: 0.0,
-            high: 100.0,
-        };
-        assert_eq!(m.to_u8(-50.0), 0);
-        assert_eq!(m.to_u8(1000.0), 255);
+        let m = Mapping::range(0.0, 100.0);
+        assert_eq!(m.to_u8(-50.0, 0), 0);
+        assert_eq!(m.to_u8(1000.0, 0), 255);
     }
 
     #[test]
     fn non_finite_samples_map_to_black() {
-        let m = Mapping {
-            low: 0.0,
-            high: 100.0,
-        };
-        assert_eq!(m.to_u8(f32::NAN), 0);
-        assert_eq!(m.to_u8(f32::INFINITY), 0);
-        assert_eq!(m.to_u8(f32::NEG_INFINITY), 0);
+        let m = Mapping::range(0.0, 100.0);
+        assert_eq!(m.to_u8(f32::NAN, 0), 0);
+        assert_eq!(m.to_u8(f32::INFINITY, 0), 0);
+        assert_eq!(m.to_u8(f32::NEG_INFINITY, 0), 0);
     }
 
     #[test]
     fn a_zero_width_range_does_not_divide_by_zero() {
-        let m = Mapping {
-            low: 5.0,
-            high: 5.0,
-        };
-        assert_eq!(m.to_u8(5.0), 0);
-        let m = Mapping {
-            low: 10.0,
-            high: 0.0,
-        };
-        assert_eq!(m.to_u8(5.0), 0);
+        let m = Mapping::range(5.0, 5.0);
+        assert_eq!(m.to_u8(5.0, 0), 0);
+        let m = Mapping::range(10.0, 0.0);
+        assert_eq!(m.to_u8(5.0, 0), 0);
     }
 
     #[test]
@@ -262,10 +295,7 @@ mod tests {
     fn horizontal_order_is_not_flipped() {
         // Only the vertical axis differs between FITS and screen order.
         let img = image(3, 1, &[0.0, 128.0, 255.0]);
-        let m = Mapping {
-            low: 0.0,
-            high: 255.0,
-        };
+        let m = Mapping::range(0.0, 255.0);
         let ci = to_color_image(&img, &m, 1);
         assert_eq!(ci.pixels[0], Color32::from_gray(0));
         assert_eq!(ci.pixels[2], Color32::from_gray(255));
@@ -276,15 +306,12 @@ mod tests {
         let height = 5;
         let pixels: Vec<f64> = (0..height).map(|y| y as f64 * 60.0).collect();
         let img = image(1, height, &pixels);
-        let m = Mapping {
-            low: 0.0,
-            high: 240.0,
-        };
+        let m = Mapping::range(0.0, 240.0);
         let ci = to_color_image(&img, &m, 1);
         // FITS row 4 (brightest) must be at texture row 0.
         for (out_y, px) in ci.pixels.iter().enumerate() {
             let fits_row = height - 1 - out_y;
-            let expected = m.to_u8(fits_row as f32 * 60.0);
+            let expected = m.to_u8(fits_row as f32 * 60.0, 0);
             assert_eq!(*px, Color32::from_gray(expected), "output row {out_y}");
         }
     }
@@ -318,13 +345,10 @@ mod tests {
     fn downsampling_averages_a_block() {
         // A 2x2 image of 0, 100, 200, 300 averages to 150.
         let img = image(2, 2, &[0.0, 100.0, 200.0, 300.0]);
-        let m = Mapping {
-            low: 0.0,
-            high: 300.0,
-        };
+        let m = Mapping::range(0.0, 300.0);
         let ci = to_color_image(&img, &m, 2);
         assert_eq!(ci.size, [1, 1]);
-        assert_eq!(ci.pixels[0], Color32::from_gray(m.to_u8(150.0)));
+        assert_eq!(ci.pixels[0], Color32::from_gray(m.to_u8(150.0, 0)));
     }
 
     #[test]
@@ -333,10 +357,7 @@ mod tests {
         // partial. Reading past the edge would panic or produce garbage.
         let pixels: Vec<f64> = (0..9).map(|i| i as f64).collect();
         let img = image(3, 3, &pixels);
-        let m = Mapping {
-            low: 0.0,
-            high: 8.0,
-        };
+        let m = Mapping::range(0.0, 8.0);
         let ci = to_color_image(&img, &m, 2);
         assert_eq!(ci.size, [2, 2]);
         assert!(ci.pixels.iter().all(|p| p.a() == 255));
@@ -345,13 +366,10 @@ mod tests {
     #[test]
     fn a_block_of_only_nan_becomes_black_rather_than_arbitrary() {
         let img = image(2, 1, &[f64::NAN, 50.0]);
-        let m = Mapping {
-            low: 0.0,
-            high: 100.0,
-        };
+        let m = Mapping::range(0.0, 100.0);
         let ci = to_color_image(&img, &m, 1);
         assert_eq!(ci.pixels[0], Color32::from_gray(0));
-        assert_eq!(ci.pixels[1], Color32::from_gray(m.to_u8(50.0)));
+        assert_eq!(ci.pixels[1], Color32::from_gray(m.to_u8(50.0, 0)));
     }
 
     #[test]
@@ -359,10 +377,7 @@ mod tests {
         // Averaging NaN as if it were zero would darken the block. Only the
         // finite samples should count.
         let img = image(2, 2, &[100.0, 100.0, f64::NAN, 100.0]);
-        let m = Mapping {
-            low: 0.0,
-            high: 100.0,
-        };
+        let m = Mapping::range(0.0, 100.0);
         let ci = to_color_image(&img, &m, 2);
         assert_eq!(ci.pixels[0], Color32::from_gray(255));
     }
@@ -372,10 +387,7 @@ mod tests {
         let spec = SyntheticSpec::new(1, 1, -32).with_channels(3);
         let bytes = synthetic_fits(&spec, &[0.0, 128.0, 255.0]).unwrap();
         let img = read_fits_from_bytes(&bytes).unwrap();
-        let m = Mapping {
-            low: 0.0,
-            high: 255.0,
-        };
+        let m = Mapping::range(0.0, 255.0);
         let ci = to_color_image(&img, &m, 1);
         assert_eq!(ci.pixels[0], Color32::from_rgb(0, 128, 255));
     }

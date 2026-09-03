@@ -88,7 +88,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "fitsview",
         options,
-        Box::new(move |_cc| Ok(Box::new(FitsViewApp::new(initial)))),
+        Box::new(move |cc| Ok(Box::new(FitsViewApp::with_storage(initial, cc.storage)))),
     )
 }
 

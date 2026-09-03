@@ -132,11 +132,23 @@ cargo test -p fitsview --all-features -- --ignored real_delete
 
 ## Phase 5 — Stretch
 
-- [ ] The stretch toggle visibly brightens a linear image.
+Use a real light frame if you have one, since synthetic samples lack the faint
+structure that makes a stretch worth looking at.
+
+- [ ] `S`, and the Stretch checkbox, visibly brighten a raw frame. A linear view
+      of a real light should look nearly black beforehand.
 - [ ] Toggling off returns to the previous appearance.
-- [ ] The setting persists across a restart.
+- [ ] Toggling is immediate on a 24 MP frame, with no visible pause.
+- [ ] A colour frame keeps its colour when stretched. If it turns grey, each
+      plane is being measured separately; see the Phase 5 notes in `README.md`.
+- [ ] The ⚙ menu adjusts the background level and black point, and the image
+      responds as you drag.
+- [ ] Reset returns both settings to their defaults.
+- [ ] The stretch setting, and the settings behind ⚙, survive quitting and
+      reopening the application.
 - [ ] Stretched images look comparable to the same file in another astronomy
-      viewer.
+      viewer. This is the only check that the algorithm matches convention
+      rather than merely being self-consistent.
 
 ---
 

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Pos2, Rect, Vec2};
+use fits_core::stretch::StretchParams;
 use fits_core::FitsImage;
 
 use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
@@ -104,6 +105,12 @@ pub enum Action {
     Cancel,
     /// Turn the "confirm every delete" setting on or off.
     ToggleConfirmEveryDelete,
+    /// Turn the automatic screen stretch on or off.
+    ToggleStretch,
+    /// Change the stretch settings.
+    SetStretchParams(StretchParams),
+    /// Return the stretch settings to their defaults.
+    ResetStretchParams,
     /// Show or hide the keyboard shortcut overlay.
     ToggleHelp,
     /// Dismiss the current error message.
@@ -192,6 +199,10 @@ pub struct Model {
     pub confirm_every_delete: bool,
     /// Whether the shortcut overlay is showing.
     pub show_help: bool,
+    /// Whether the automatic stretch is applied to every image shown.
+    pub stretch_enabled: bool,
+    /// How the stretch is chosen.
+    pub stretch_params: StretchParams,
     /// The most recent transient message.
     pub toast: Option<Toast>,
     /// Decodes images off the UI thread and caches the results.
@@ -227,6 +238,8 @@ impl Model {
             pending: Pending::None,
             confirm_every_delete: false,
             show_help: false,
+            stretch_enabled: false,
+            stretch_params: StretchParams::default(),
             toast: None,
             loader: Loader::default(),
             ops: Box::new(RealFileOps),
@@ -284,6 +297,29 @@ impl Model {
             Action::Cancel => self.pending = Pending::None,
             Action::ToggleConfirmEveryDelete => {
                 self.confirm_every_delete = !self.confirm_every_delete;
+            }
+            Action::ToggleStretch => {
+                self.stretch_enabled = !self.stretch_enabled;
+                self.invalidate_texture();
+                self.toast = Some(Toast::new(if self.stretch_enabled {
+                    "Stretch on"
+                } else {
+                    "Stretch off"
+                }));
+            }
+            Action::SetStretchParams(params) => {
+                if params != self.stretch_params {
+                    self.stretch_params = params;
+                    if self.stretch_enabled {
+                        self.invalidate_texture();
+                    }
+                }
+            }
+            Action::ResetStretchParams => {
+                self.stretch_params = StretchParams::default();
+                if self.stretch_enabled {
+                    self.invalidate_texture();
+                }
             }
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ClearError => self.error = None,
@@ -423,6 +459,14 @@ impl Model {
             return;
         }
         self.show_selection();
+    }
+
+    /// Marks the uploaded texture as stale without reloading the image.
+    ///
+    /// The generation counter is what the drawing layer compares against, so
+    /// bumping it is enough to force a rebuild with the current tone mapping.
+    fn invalidate_texture(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Drops the toast once its time is up. Called each frame.
@@ -1350,6 +1394,80 @@ mod tests {
             .find(|e| e.name == "keeper.fits")
             .expect("renamed file should be listed");
         assert!(entry.flagged, "the flag must follow the new name");
+    }
+
+    #[test]
+    fn the_stretch_toggles_and_forces_a_redraw() {
+        // The texture is cached against the generation counter, so toggling a
+        // display setting has to bump it or the change would not appear.
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        let before = m.generation;
+
+        m.handle(Action::ToggleStretch);
+        assert!(m.stretch_enabled);
+        assert_ne!(m.generation, before, "the texture must be rebuilt");
+        assert!(m.toast.is_some(), "the user should be told");
+
+        m.handle(Action::ToggleStretch);
+        assert!(!m.stretch_enabled);
+    }
+
+    #[test]
+    fn the_stretch_can_be_toggled_with_no_image_open() {
+        // It is a display setting, not an operation on a file.
+        let mut m = Model::new();
+        m.handle(Action::ToggleStretch);
+        assert!(m.stretch_enabled);
+    }
+
+    #[test]
+    fn changing_the_stretch_settings_redraws_only_when_the_stretch_is_on() {
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        let before = m.generation;
+        m.handle(Action::SetStretchParams(StretchParams {
+            target_bg: 0.4,
+            ..StretchParams::default()
+        }));
+        assert_eq!(
+            m.generation, before,
+            "no need to redraw while the stretch is off"
+        );
+        assert!((m.stretch_params.target_bg - 0.4).abs() < f32::EPSILON);
+
+        m.handle(Action::ToggleStretch);
+        let before = m.generation;
+        m.handle(Action::SetStretchParams(StretchParams {
+            target_bg: 0.2,
+            ..StretchParams::default()
+        }));
+        assert_ne!(m.generation, before, "a live change must be shown");
+    }
+
+    #[test]
+    fn setting_the_same_stretch_parameters_does_not_redraw() {
+        let dir = folder_of(1, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleStretch);
+
+        let before = m.generation;
+        m.handle(Action::SetStretchParams(m.stretch_params));
+        assert_eq!(m.generation, before, "an unchanged setting is not a change");
+    }
+
+    #[test]
+    fn resetting_the_stretch_settings_restores_the_defaults() {
+        let mut m = Model::new();
+        m.handle(Action::SetStretchParams(StretchParams {
+            target_bg: 0.45,
+            shadows_clip: -1.0,
+        }));
+        assert_ne!(m.stretch_params, StretchParams::default());
+
+        m.handle(Action::ResetStretchParams);
+        assert_eq!(m.stretch_params, StretchParams::default());
     }
 
     #[test]

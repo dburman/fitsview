@@ -10,6 +10,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use fits_core::stretch::{build_lut, compute_stretch, StretchParams};
 use fits_core::testutil::{synthetic_fits, SyntheticSpec};
 use fits_core::{finite_min_max, read_fits_from_bytes};
 
@@ -47,5 +48,26 @@ fn bench_stats(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_read, bench_stats);
+/// Computing the stretch and building its table, once per image. The plan
+/// requires a stretched redraw to stay under 100 ms on a 24 megapixel frame,
+/// and this is the part that is not already measured by `bench_read`.
+fn bench_stretch(c: &mut Criterion) {
+    let bytes = full_frame_bytes();
+    let image = read_fits_from_bytes(&bytes).expect("decode");
+    let params = StretchParams::default();
+
+    let mut group = c.benchmark_group("stretch");
+    group.sample_size(20);
+    group.bench_function("compute 24 MP", |b| {
+        b.iter(|| black_box(compute_stretch(black_box(&image), &params)));
+    });
+
+    let stretch = compute_stretch(&image, &params);
+    group.bench_function("build lookup table", |b| {
+        b.iter(|| black_box(build_lut(black_box(&stretch[0]))));
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_read, bench_stats, bench_stretch);
 criterion_main!(benches);

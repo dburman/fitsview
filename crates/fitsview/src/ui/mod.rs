@@ -12,9 +12,16 @@ mod toolbar;
 mod viewer;
 
 use egui::{TextureHandle, TextureOptions, Ui};
+use fits_core::stretch::StretchParams;
 
 use crate::app::{Action, Model};
 use crate::texture::{self, Mapping};
+
+/// Storage keys for settings that outlive a session.
+const KEY_STRETCH_ENABLED: &str = "stretch_enabled";
+const KEY_STRETCH_SHADOWS: &str = "stretch_shadows_clip";
+const KEY_STRETCH_TARGET: &str = "stretch_target_bg";
+const KEY_CONFIRM_EVERY_DELETE: &str = "confirm_every_delete";
 
 /// The `eframe` application: a model, a cached texture, and the glue between
 /// them.
@@ -37,6 +44,33 @@ impl FitsViewApp {
             model,
             texture: None,
         }
+    }
+
+    /// Creates the application, restoring settings saved by a previous session.
+    ///
+    /// A missing or unreadable setting falls back to its default rather than
+    /// failing to start.
+    #[must_use]
+    pub fn with_storage(
+        initial: Option<std::path::PathBuf>,
+        storage: Option<&dyn eframe::Storage>,
+    ) -> Self {
+        let mut app = Self::new(initial);
+        let Some(storage) = storage else {
+            return app;
+        };
+
+        let defaults = StretchParams::default();
+        app.model.stretch_enabled =
+            eframe::get_value(storage, KEY_STRETCH_ENABLED).unwrap_or(false);
+        app.model.stretch_params = StretchParams {
+            shadows_clip: eframe::get_value(storage, KEY_STRETCH_SHADOWS)
+                .unwrap_or(defaults.shadows_clip),
+            target_bg: eframe::get_value(storage, KEY_STRETCH_TARGET).unwrap_or(defaults.target_bg),
+        };
+        app.model.confirm_every_delete =
+            eframe::get_value(storage, KEY_CONFIRM_EVERY_DELETE).unwrap_or(false);
+        app
     }
 
     /// The current model. Useful to tests and to startup checks.
@@ -72,7 +106,12 @@ impl FitsViewApp {
                 image.height
             );
         }
-        let colour = texture::to_color_image(image, &Mapping::linear(image), factor);
+        let mapping = if self.model.stretch_enabled {
+            Mapping::stretched(image, &self.model.stretch_params)
+        } else {
+            Mapping::linear(image)
+        };
+        let colour = texture::to_color_image(image, &mapping, factor);
         let handle = ui
             .ctx()
             .load_texture("fits-image", colour, TextureOptions::LINEAR);
@@ -81,6 +120,25 @@ impl FitsViewApp {
 }
 
 impl eframe::App for FitsViewApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, KEY_STRETCH_ENABLED, &self.model.stretch_enabled);
+        eframe::set_value(
+            storage,
+            KEY_STRETCH_SHADOWS,
+            &self.model.stretch_params.shadows_clip,
+        );
+        eframe::set_value(
+            storage,
+            KEY_STRETCH_TARGET,
+            &self.model.stretch_params.target_bg,
+        );
+        eframe::set_value(
+            storage,
+            KEY_CONFIRM_EVERY_DELETE,
+            &self.model.confirm_every_delete,
+        );
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         // Collect anything the worker finished since the last frame. Painting
         // continues either way; this never blocks.
@@ -117,5 +175,93 @@ impl eframe::App for FitsViewApp {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A storage back end held in memory, standing in for the file eframe
+    /// writes. Lets the save and restore round-trip be tested without a window
+    /// or a clean shutdown.
+    #[derive(Default)]
+    struct MemoryStorage {
+        values: HashMap<String, String>,
+    }
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.values.insert(key.to_string(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.values.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn settings_survive_a_save_and_restore() {
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::ToggleStretch);
+        app.model.handle(Action::SetStretchParams(StretchParams {
+            shadows_clip: -1.5,
+            target_bg: 0.4,
+        }));
+        app.model.handle(Action::ToggleConfirmEveryDelete);
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(
+            restored.model.stretch_enabled,
+            "the stretch should come back"
+        );
+        assert!(
+            (restored.model.stretch_params.shadows_clip - (-1.5)).abs() < f32::EPSILON,
+            "got {}",
+            restored.model.stretch_params.shadows_clip
+        );
+        assert!(
+            (restored.model.stretch_params.target_bg - 0.4).abs() < f32::EPSILON,
+            "got {}",
+            restored.model.stretch_params.target_bg
+        );
+        assert!(restored.model.confirm_every_delete);
+    }
+
+    #[test]
+    fn a_first_run_with_no_saved_settings_uses_the_defaults() {
+        let storage = MemoryStorage::default();
+        let app = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(!app.model.stretch_enabled);
+        assert_eq!(app.model.stretch_params, StretchParams::default());
+        assert!(!app.model.confirm_every_delete);
+    }
+
+    #[test]
+    fn damaged_settings_fall_back_to_the_defaults_rather_than_failing_to_start() {
+        let mut storage = MemoryStorage::default();
+        eframe::Storage::set_string(
+            &mut storage,
+            KEY_STRETCH_ENABLED,
+            "not a boolean".to_string(),
+        );
+        eframe::Storage::set_string(&mut storage, KEY_STRETCH_TARGET, "{{{".to_string());
+
+        let app = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(!app.model.stretch_enabled);
+        assert_eq!(app.model.stretch_params, StretchParams::default());
+    }
+
+    #[test]
+    fn starting_without_any_storage_is_fine() {
+        let app = FitsViewApp::with_storage(None, None);
+        assert_eq!(app.model.stretch_params, StretchParams::default());
     }
 }

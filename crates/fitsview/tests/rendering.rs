@@ -176,3 +176,101 @@ fn a_colour_image_renders_its_three_planes_into_rgb() {
     assert_eq!(p.g(), 0, "green plane should be black");
     assert_eq!(p.b(), 0, "blue plane should be black");
 }
+
+#[test]
+fn the_stretch_lifts_a_dark_sky_background_into_view() {
+    // The reason the feature exists. A raw frame is a faint background just
+    // above black with a few bright stars, which linearly shows as nothing.
+    use fits_core::stretch::StretchParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (w, h) = (300usize, 300usize);
+    let mut pixels = gaussian_background(w, h, 1000.0, 30.0, 21);
+    // A handful of stars, which set the top of the range.
+    for i in 0..20 {
+        pixels[(i * 4177) % (w * h)] = 60_000.0;
+    }
+    let spec = SyntheticSpec::new(w, h, 16).with_scaling(32768.0, 1.0);
+    let path = write_synthetic(dir.path(), "sky.fits", &spec, &pixels).unwrap();
+    let image = read_fits(&path).unwrap();
+
+    let factor = texture::downsample_factor(image.width, image.height, texture::MAX_TEXTURE_EDGE);
+    let linear = texture::to_color_image(&image, &Mapping::linear(&image), factor);
+    let stretched = texture::to_color_image(
+        &image,
+        &Mapping::stretched(&image, &StretchParams::default()),
+        factor,
+    );
+
+    let mean = |img: &egui::ColorImage| {
+        img.pixels.iter().map(|p| f64::from(p.r())).sum::<f64>() / img.pixels.len() as f64
+    };
+    let linear_mean = mean(&linear);
+    let stretched_mean = mean(&stretched);
+
+    assert!(
+        linear_mean < 10.0,
+        "a linear view of a raw frame should be nearly black, got {linear_mean}"
+    );
+    assert!(
+        stretched_mean > 50.0,
+        "the stretch should make the background visible, got {stretched_mean}"
+    );
+}
+
+#[test]
+fn the_stretch_leaves_nan_pixels_black() {
+    use fits_core::stretch::StretchParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (w, h) = (64usize, 64usize);
+    let mut pixels = gaussian_background(w, h, 900.0, 25.0, 4);
+    pixels[0] = f64::NAN;
+    let spec = SyntheticSpec::new(w, h, -32);
+    let path = write_synthetic(dir.path(), "nan.fits", &spec, &pixels).unwrap();
+    let image = read_fits(&path).unwrap();
+
+    let rendered = texture::to_color_image(
+        &image,
+        &Mapping::stretched(&image, &StretchParams::default()),
+        1,
+    );
+    // FITS row 0 is the bottom of the picture, so sample 0 lands bottom-left.
+    let bottom_left = rendered.pixels[(rendered.size[1] - 1) * rendered.size[0]];
+    assert_eq!(bottom_left, Color32::from_gray(0), "NaN should stay black");
+}
+
+#[test]
+fn a_stretched_colour_image_keeps_its_colour() {
+    // Each plane is stretched with its own table, but all share one
+    // normalisation, so a red-dominant frame must not come out grey.
+    use fits_core::stretch::StretchParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (w, h) = (32usize, 32usize);
+    let mut pixels = vec![0.0f64; w * h * 3];
+    let red = gaussian_background(w, h, 4000.0, 50.0, 31);
+    let green = gaussian_background(w, h, 1500.0, 50.0, 32);
+    let blue = gaussian_background(w, h, 800.0, 50.0, 33);
+    pixels[..w * h].copy_from_slice(&red);
+    pixels[w * h..2 * w * h].copy_from_slice(&green);
+    pixels[2 * w * h..].copy_from_slice(&blue);
+
+    let spec = SyntheticSpec::new(w, h, 16).with_channels(3);
+    let path = write_synthetic(dir.path(), "colour.fits", &spec, &pixels).unwrap();
+    let image = read_fits(&path).unwrap();
+
+    let rendered = texture::to_color_image(
+        &image,
+        &Mapping::stretched(&image, &StretchParams::default()),
+        1,
+    );
+    let mean = |f: fn(&Color32) -> u8| {
+        rendered.pixels.iter().map(|p| f64::from(f(p))).sum::<f64>() / rendered.pixels.len() as f64
+    };
+    let (r, g, b) = (mean(|p| p.r()), mean(|p| p.g()), mean(|p| p.b()));
+    assert!(
+        r > g && g > b,
+        "channel order should survive the stretch: r={r:.1} g={g:.1} b={b:.1}"
+    );
+}

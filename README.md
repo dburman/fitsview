@@ -13,7 +13,7 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 4 complete. Phase 5 is next.
+**Status:** Phases 0 to 5 complete. Phase 6 is next.
 
 | Phase | State |
 |-------|-------|
@@ -22,7 +22,7 @@ criteria all pass.
 | 2 — Minimal viewer | Done |
 | 3 — Folder browsing | Done |
 | 4 — Delete, rename, flag | Done |
-| 5 — Stretch | Not started |
+| 5 — Stretch | Done |
 | 6 — Dark calibration | Not started |
 | 7 — Flat calibration | Not started |
 | 8 — Packaging | Not started |
@@ -361,7 +361,7 @@ fitsview/
 │   │       ├── header.rs   # FITS header parsing
 │   │       ├── image.rs    # FitsImage, Geometry, pixel conversion, statistics
 │   │       ├── reader.rs   # read_fits, is_fits_path (write_fits in Phase 6)
-│   │       ├── stretch.rs  # Phase 5
+│   │       ├── stretch.rs  # midtone transfer auto-stretch and lookup tables
 │   │       ├── calib.rs    # Phase 6 & 7
 │   │       └── testutil.rs # synthetic FITS generator (feature "test-util")
 │   │   ├── tests/
@@ -673,7 +673,7 @@ Every test that needs a file uses these. No binary fixtures are committed.
 | `header.rs` | unit + proptest | Card parsing, quoted strings with `/` inside, `END` detection, multi-block headers, missing `NAXIS` → `BadHeader`, arbitrary bytes never panic. |
 | `image.rs` | unit + criterion | Every BITPIX, BZERO/BSCALE, u16 fast path equals the generic path, `finite_min_max` with NaN/inf present and with an all-NaN image, `BLANK` becomes NaN, 3-channel layout. |
 | `reader.rs` | unit + proptest | Truncated, NotFits, absurd NAXIS values do not overflow or allocate wildly, primary-empty-then-extension fallback, missing trailing padding tolerated. The `write_fits`→`read_fits` identity test arrives with `write_fits` itself in Phase 6. |
-| `stretch.rs` | unit | Median maps to `target_bg` within tolerance, LUT is monotonic non-decreasing, constant image does not divide by zero, all-NaN image does not panic, RGB per-channel. |
+| `stretch.rs` | unit | The transfer function is monotonic, bounded and self-inverting; the worked example reproduces exactly; skipping the rescale is caught; the median lands on the target for a noisy frame; the table is monotonic and agrees with direct evaluation; constant, all-NaN and single-pixel images fall back safely; every colour channel shares one stretch. |
 | `calib.rs` | unit | Median rejects outlier, mean for N≤2, dimension mismatch error, subtract clamps at 0, flat normalises to mean 1.0, near-zero gain becomes NaN and is counted, dark is subtracted before the flat divides, all dark and flat combinations. |
 | `folder.rs` | integration (tempdir) | Filters extensions, skips hidden, natural sort, sidecar round-trip. |
 | `actions.rs` | unit | Rename rules including separators, reserved names, case-only clashes and files on disk but not listed; delete calls trash and advances the selection; failures leave the list untouched. All through the `FileOps` trait, so no test reaches the real trash. |
@@ -1217,7 +1217,10 @@ fn mtf(m: f32, x: f32) -> f32 {
 call `mtf` itself to *solve* for the midtone that puts the background where we
 want it, instead of inverting the function by hand.
 
-Steps to compute, per channel:
+Steps to compute. For a colour image these run **once over all three planes
+together**, and the result is applied to each of them. Measuring each plane
+separately would put every channel's background at the same brightness, which
+divides out the camera's colour response and renders a red nebula grey.
 
 1. Normalise pixel values to `[0,1]` using the image `min`/`max`. Skip non-finite values entirely.
 2. Compute the **median** `med` and the **MAD** (median absolute deviation) of the normalised samples.
@@ -1270,12 +1273,59 @@ parameters, so toggling back and forth does not recompute it.
 4. Stretch parameters are computed **per image** (auto), not shared.
 
 ### Acceptance criteria
-- [ ] Unit test: synthetic Gaussian background, median maps to `target_bg * 255` ±3.
-- [ ] Unit test: the worked example table above reproduces to 6 decimal places.
-- [ ] Unit test: LUT is monotonic non-decreasing across all 65536 entries.
-- [ ] Unit test: constant image, all-NaN image, and single-pixel image do not panic.
-- [ ] Toggling stretch on a 24 MP image re-renders in under 100 ms once the LUT is cached.
-- [ ] Setting persists across restart.
+- [x] Unit test: synthetic Gaussian background, median maps to `target_bg * 255` ±3.
+- [x] Unit test: the worked example table above reproduces to 6 decimal places.
+- [x] Unit test: LUT is monotonic non-decreasing across all 65536 entries.
+- [x] Unit test: constant image, all-NaN image, and single-pixel image do not panic.
+- [x] Toggling stretch on a 24 MP image re-renders well inside 100 ms. Measured:
+      11.6 ms to compute the stretch and 0.16 ms to build the table.
+- [x] Setting persists across restart, tested through a save and restore
+      round-trip against an in-memory storage back end.
+
+### What Phase 5 actually produced
+
+321 tests pass across the workspace, up from 284.
+
+**A bug that contradicted reasoning already written in this document.** The first
+implementation computed a separate stretch for each colour plane, which is what
+the original wording of this phase suggested. An end-to-end test rendered a
+strongly red frame and found it came out nearly grey: red 68, green 62, blue 63.
+Measuring each plane separately puts every channel's background at the same
+brightness, which is precisely the mistake the flat-calibration phase warns
+against for the same reason. Fixed by measuring once across all planes and
+applying that one stretch to each, which astronomy tools call the linked
+variant. The phase text above now says so.
+
+**Measured performance**, from `benches/read.rs` on an Apple silicon laptop, for
+a 6000 x 4000 frame:
+
+| Operation | Time |
+|-----------|------|
+| Full decode: header, conversion, min and max | 4.4 ms |
+| `finite_min_max` over 24 M samples | 1.0 ms |
+| Compute the stretch | 11.6 ms |
+| Build the 65536-entry table | 0.16 ms |
+
+The decode figure improved from the 7.3 ms recorded in Phase 1, because the
+`as_chunks` rewrite made during the continuous integration fix removed the
+per-sample indexing.
+
+**Decisions worth knowing:**
+
+- The stretch changes the display only. Pixel data is untouched, so calibration
+  and statistics keep working on real values.
+- All channels share one measurement and one lookup table set, for the colour
+  reason above.
+- A constant frame, an all-undefined frame, and any case where the background
+  cannot be measured fall back to a straight ramp rather than a curve that would
+  render black.
+- The table is indexed by the sample quantised to 16 bits, so a stretched redraw
+  costs one multiply, one cast and one array index per pixel.
+- Toggling the stretch bumps the texture generation counter rather than
+  reloading the image, so the change appears without touching the disk.
+- Changing a setting while the stretch is off does not force a redraw.
+- Settings persist through `eframe`'s storage. Damaged or missing values fall
+  back to defaults rather than preventing startup, which is tested.
 
 ---
 

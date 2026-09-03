@@ -14,6 +14,7 @@ pub mod error;
 pub mod header;
 pub mod image;
 pub mod reader;
+pub mod stretch;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil;
@@ -22,6 +23,7 @@ pub use error::FitsError;
 pub use header::FitsHeader;
 pub use image::{convert_pixels, finite_min_max, FitsImage, Geometry};
 pub use reader::{is_fits_path, read_fits, read_fits_from_bytes};
+pub use stretch::{build_lut, compute_stretch, Stretch, StretchParams};
 
 /// FITS files are a sequence of 2880-byte blocks. Headers are padded to a whole
 /// number of blocks, and so is the data section.

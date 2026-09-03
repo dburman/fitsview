@@ -1,6 +1,7 @@
 //! The top bar of file actions and the bottom status line.
 
-use egui::{Button, Panel, Ui};
+use egui::{Button, DragValue, Panel, RichText, Ui};
+use fits_core::stretch::StretchParams;
 
 use crate::app::{Action, Model};
 
@@ -113,6 +114,23 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 actions.push(Action::ActualSize);
             }
 
+            ui.separator();
+
+            // The stretch is a display setting, so it stays available even
+            // before an image has finished loading.
+            let mut stretch = model.stretch_enabled;
+            if ui
+                .checkbox(&mut stretch, "Stretch")
+                .on_hover_text(
+                    "Automatic screen stretch, so the faint signal is visible (S).\n\
+                     Affects the display only; the pixel data is untouched.",
+                )
+                .changed()
+            {
+                actions.push(Action::ToggleStretch);
+            }
+            actions.extend(stretch_settings(ui, model));
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("?")
@@ -146,6 +164,55 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
         });
     });
 
+    actions
+}
+
+/// The stretch settings, tucked behind a menu so they do not clutter the bar.
+fn stretch_settings(ui: &mut Ui, model: &Model) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let defaults = StretchParams::default();
+    let mut params = model.stretch_params;
+
+    ui.menu_button("⚙", |ui| {
+        ui.set_min_width(260.0);
+        ui.label(RichText::new("Stretch settings").strong());
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Background")
+                .on_hover_text("Where the sky background ends up, from black at 0 to white at 1");
+            ui.add(
+                DragValue::new(&mut params.target_bg)
+                    .speed(0.005)
+                    .range(0.05..=0.5),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Black point").on_hover_text(
+                "How far below the background, in noise deviations, the black point sits. \
+                 More negative keeps more of the faint signal.",
+            );
+            ui.add(
+                DragValue::new(&mut params.shadows_clip)
+                    .speed(0.05)
+                    .range(-5.0..=0.0),
+            );
+        });
+
+        ui.add_space(6.0);
+        if ui
+            .add_enabled(params != defaults, Button::new("Reset"))
+            .clicked()
+        {
+            actions.push(Action::ResetStretchParams);
+            ui.close();
+        }
+    });
+
+    if params != model.stretch_params {
+        actions.push(Action::SetStretchParams(params));
+    }
     actions
 }
 
