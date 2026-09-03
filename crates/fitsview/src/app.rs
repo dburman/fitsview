@@ -14,14 +14,17 @@ use std::sync::Arc;
 use egui::{Pos2, Rect, Vec2};
 use fits_core::calib::{self, MasterFlat, MasterFrame};
 use fits_core::debayer::{self, BayerPattern};
+use fits_core::stars::DetectionParams;
 use fits_core::stretch::StretchParams;
 use fits_core::FitsImage;
+use fits_core::StarField;
 
 use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
 use crate::folder::{scan_folder, Folder, SortKey};
 use crate::jobs::{self, Job};
 use crate::loader::{Cache, Loader};
 use crate::sidecar;
+use crate::stardetect::StarDetector;
 use crate::view::ViewState;
 
 /// An image that has been loaded and is being displayed.
@@ -157,12 +160,18 @@ pub enum Action {
     StartExport(PathBuf),
     /// Stop whatever background job is running.
     CancelJob,
+    /// Turn star detection on or off.
+    ToggleStars,
     /// Turn the automatic screen stretch on or off.
     ToggleStretch,
     /// Change the stretch settings.
     SetStretchParams(StretchParams),
     /// Return the stretch settings to their defaults.
     ResetStretchParams,
+    /// Change the star detection settings and look again.
+    SetStarParams(DetectionParams),
+    /// Return the star detection settings to their defaults.
+    ResetStarParams,
     /// Collapse the file list to the left edge, or bring it back.
     ToggleFileList,
     /// Set whether the file list is showing, when the panel itself decides.
@@ -487,6 +496,14 @@ pub struct Model {
     /// scrolls to follow it. Clicking a row must not scroll it under the
     /// pointer, which is why this is not simply always on.
     pub scroll_to_selection: bool,
+    /// Whether stars are detected and drawn on the image.
+    pub stars_enabled: bool,
+    /// How hard to look for them.
+    pub star_params: DetectionParams,
+    /// What was found in the frame on screen, once detection has finished.
+    pub stars: Option<StarField>,
+    /// Runs detection off the interface thread.
+    detector: StarDetector,
     /// Whether the histogram strip beneath the image is showing.
     pub show_histogram: bool,
     /// Whether the metadata section of the right-hand panel is expanded.
@@ -550,6 +567,10 @@ impl Model {
             pointer: None,
             show_filelist: true,
             scroll_to_selection: false,
+            stars_enabled: false,
+            star_params: DetectionParams::default(),
+            stars: None,
+            detector: StarDetector::new(),
             show_histogram: false,
             show_header: true,
             header_filter: String::new(),
@@ -752,6 +773,32 @@ impl Model {
                     job.cancel();
                     self.toast = Some(Toast::new("Stopping…"));
                 }
+            }
+            Action::SetStarParams(params) => {
+                if params != self.star_params {
+                    self.star_params = params;
+                    self.restart_detection();
+                }
+            }
+            Action::ResetStarParams => {
+                let defaults = DetectionParams::default();
+                if defaults != self.star_params {
+                    self.star_params = defaults;
+                    self.restart_detection();
+                }
+            }
+            Action::ToggleStars => {
+                self.stars_enabled = !self.stars_enabled;
+                self.stars = None;
+                self.detector.clear();
+                if self.stars_enabled {
+                    self.request_stars();
+                }
+                self.toast = Some(Toast::new(if self.stars_enabled {
+                    "Finding stars…"
+                } else {
+                    "Stars off"
+                }));
             }
             Action::ToggleStretch => {
                 self.stretch_enabled = !self.stretch_enabled;
@@ -1079,6 +1126,48 @@ impl Model {
         self.job = Some(Job::measure(paths));
     }
 
+    /// Asks for the current frame's stars, if they are wanted and not already
+    /// known.
+    ///
+    /// Detection runs on the **calibrated** frame but before colour
+    /// reconstruction: a mosaic would otherwise show every star four times,
+    /// once per filter site, so it has its own entry point.
+    /// Throws away what was found and looks again under new settings.
+    fn restart_detection(&mut self) {
+        if self.stars_enabled {
+            self.stars = None;
+            self.detector.clear();
+            self.request_stars();
+        }
+    }
+
+    fn request_stars(&mut self) {
+        if !self.stars_enabled {
+            return;
+        }
+        let Some(loaded) = self.loaded.as_ref() else {
+            return;
+        };
+        if self.detector.has_result_for(self.generation, &loaded.path) {
+            return;
+        }
+
+        // The mosaic, when there is one, rather than the reconstruction.
+        let (image, pattern) = if loaded.raw.channels == 1 {
+            (Arc::clone(&loaded.raw), self.bayer.active())
+        } else {
+            (Arc::clone(&loaded.image), None)
+        };
+
+        self.detector.request(
+            self.generation,
+            loaded.path.clone(),
+            image,
+            pattern,
+            self.star_params,
+        );
+    }
+
     /// Collects progress from the background job. Called once per frame.
     ///
     /// Returns true if anything changed.
@@ -1378,7 +1467,12 @@ impl Model {
     ///
     /// Returns true if anything changed, so the caller knows to repaint.
     pub fn poll(&mut self) -> bool {
-        let job_changed = self.poll_job();
+        let mut job_changed = self.poll_job();
+        if let Some(field) = self.detector.poll() {
+            log::debug!("found {} stars", field.count());
+            self.stars = Some(field);
+            job_changed = true;
+        }
         let arrivals = self.loader.poll();
         if arrivals.is_empty() {
             return job_changed;
@@ -1462,6 +1556,10 @@ impl Model {
         self.needs_fit = true;
         self.generation = self.generation.wrapping_add(1);
         self.update_calibration_warnings();
+
+        // A new frame means the old stars describe nothing.
+        self.stars = None;
+        self.request_stars();
     }
 
     /// The image as it should be displayed: calibrated, or the original.
@@ -3716,6 +3814,149 @@ mod tests {
                 "channel {channel} differs from what is on screen"
             );
         }
+    }
+
+    /// Writes a small sky with three stars on it.
+    fn starry_folder() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (120usize, 120usize);
+        let mut pixels = fits_core::testutil::gaussian_background(w, h, 1000.0, 10.0, 3);
+        for (cx, cy) in [(30usize, 40usize), (70, 60), (90, 90)] {
+            for dy in 0..7 {
+                for dx in 0..7 {
+                    let (x, y) = (cx + dx - 3, cy + dy - 3);
+                    let r = ((dx as f64 - 3.0).powi(2) + (dy as f64 - 3.0).powi(2)) / 4.0;
+                    pixels[y * w + x] += 9000.0 * (-r).exp();
+                }
+            }
+        }
+        write_synthetic(
+            dir.path(),
+            "sky.fits",
+            &SyntheticSpec::new(w, h, -32),
+            &pixels,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Pumps until the stars turn up.
+    fn wait_for_stars(model: &mut Model) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            model.poll();
+            if model.stars.is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("stars never arrived");
+    }
+
+    #[test]
+    fn stars_are_found_when_asked_for_and_not_before() {
+        let dir = starry_folder();
+        let (mut m, _spy) = model_over(dir.path());
+        assert!(!m.stars_enabled, "detection is off unless asked for");
+        assert!(m.stars.is_none());
+
+        m.handle(Action::ToggleStars);
+        assert!(m.stars_enabled);
+        wait_for_stars(&mut m);
+
+        let field = m.stars.as_ref().unwrap();
+        assert_eq!(field.count(), 3);
+        assert!(field.fwhm.is_some(), "three stars give a median width");
+    }
+
+    #[test]
+    fn turning_detection_off_forgets_what_was_found() {
+        let dir = starry_folder();
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleStars);
+        wait_for_stars(&mut m);
+
+        m.handle(Action::ToggleStars);
+        assert!(!m.stars_enabled);
+        assert!(m.stars.is_none(), "stale stars must not be drawn");
+    }
+
+    #[test]
+    fn stepping_to_another_frame_discards_the_previous_stars() {
+        // Drawing one frame's stars over another would be worse than drawing
+        // none.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (100usize, 100usize);
+        for name in ["a.fits", "b.fits"] {
+            let mut pixels = fits_core::testutil::gaussian_background(w, h, 1000.0, 10.0, 5);
+            for dy in 0..7 {
+                for dx in 0..7 {
+                    let r = ((dx as f64 - 3.0).powi(2) + (dy as f64 - 3.0).powi(2)) / 4.0;
+                    pixels[(50 + dy - 3) * w + 50 + dx - 3] += 9000.0 * (-r).exp();
+                }
+            }
+            write_synthetic(dir.path(), name, &SyntheticSpec::new(w, h, -32), &pixels).unwrap();
+        }
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleStars);
+        wait_for_stars(&mut m);
+        assert!(m.stars.is_some());
+
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        // The moment the frame changes, the old answer is gone.
+        assert!(
+            m.stars.is_none() || m.stars.as_ref().unwrap().count() > 0,
+            "stars must belong to the frame on screen"
+        );
+        wait_for_stars(&mut m);
+        assert_eq!(m.stars.as_ref().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn detection_does_nothing_without_an_image() {
+        let mut m = Model::new();
+        m.handle(Action::ToggleStars);
+        assert!(m.stars_enabled, "the setting still takes effect");
+        assert!(m.stars.is_none());
+        assert!(!m.poll(), "and nothing is waiting to arrive");
+    }
+
+    #[test]
+    fn changing_the_settings_looks_again() {
+        let dir = starry_folder();
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleStars);
+        wait_for_stars(&mut m);
+
+        // Demanding stars larger than any of these finds nothing, which is
+        // proof the setting reached the detector rather than being stored and
+        // ignored.
+        m.handle(Action::SetStarParams(DetectionParams {
+            minimum_area: 5_000,
+            ..DetectionParams::default()
+        }));
+        assert!(m.stars.is_none(), "the old answer is dropped at once");
+        wait_for_stars(&mut m);
+        assert_eq!(m.stars.as_ref().unwrap().count(), 0);
+
+        m.handle(Action::ResetStarParams);
+        wait_for_stars(&mut m);
+        assert_eq!(m.stars.as_ref().unwrap().count(), 3);
+    }
+
+    #[test]
+    fn settings_do_nothing_while_detection_is_off() {
+        let dir = starry_folder();
+        let (mut m, _spy) = model_over(dir.path());
+        settle(&mut m);
+        m.handle(Action::SetStarParams(DetectionParams {
+            threshold: 8.0,
+            ..DetectionParams::default()
+        }));
+        assert_eq!(m.star_params.threshold, 8.0, "the setting is remembered");
+        assert!(!m.detector.is_busy(), "but nothing is looked for");
     }
 
     #[test]

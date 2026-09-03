@@ -37,6 +37,7 @@ pub mod loader;
 pub mod natsort;
 pub mod shortcuts;
 pub mod sidecar;
+pub mod stardetect;
 pub mod texture;
 pub mod ui;
 pub mod view;

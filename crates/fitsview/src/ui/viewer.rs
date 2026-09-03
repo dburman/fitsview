@@ -1,8 +1,8 @@
 //! The central image area: draws the texture and collects gestures.
 
 use egui::{
-    pos2, Align2, CentralPanel, Color32, FontId, Frame as PanelFrame, Rect, Sense, TextureHandle,
-    Ui, Vec2,
+    pos2, Align2, CentralPanel, Color32, FontId, Frame as PanelFrame, Rect, Sense, Stroke,
+    TextureHandle, Ui, Vec2,
 };
 
 use crate::app::{Action, Model};
@@ -49,6 +49,8 @@ pub fn show(
                             Color32::WHITE,
                         );
                     }
+
+                    draw_stars(ui, model, loaded.image.height);
                 }
                 _ => {
                     let message = if model.loading {
@@ -78,6 +80,42 @@ pub fn show(
         });
 
     actions
+}
+
+/// Marks each detected star, sized to its measured width.
+///
+/// Drawing them is what makes a bad detection obvious rather than hidden inside
+/// a number: a circle around a hot pixel or a galaxy is visible at a glance.
+fn draw_stars(ui: &Ui, model: &Model, image_height: usize) {
+    let Some(field) = model.stars.as_ref() else {
+        return;
+    };
+    if !model.stars_enabled {
+        return;
+    }
+
+    let painter = ui.painter();
+    let ordinary = Color32::from_rgb(120, 220, 140);
+    let saturated = Color32::from_rgb(240, 170, 90);
+
+    for star in &field.stars {
+        // Detection works in the file's row order; the picture is flipped.
+        #[allow(clippy::cast_precision_loss)]
+        let display_y = image_height as f64 - 1.0 - star.y;
+        #[allow(clippy::cast_possible_truncation)]
+        let centre = model
+            .view
+            .image_to_screen(Vec2::new(star.x as f32, display_y as f32));
+
+        // A circle a little wider than the star, so it frames rather than hides.
+        #[allow(clippy::cast_possible_truncation)]
+        let radius = ((star.fwhm as f32) * model.view.zoom).clamp(3.0, 40.0);
+        painter.circle_stroke(
+            centre,
+            radius,
+            Stroke::new(1.0, if star.saturated { saturated } else { ordinary }),
+        );
+    }
 }
 
 /// Gathers this frame's input into the plain structure [`actions_for`]

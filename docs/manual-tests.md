@@ -311,3 +311,28 @@ Needs a real session, ideally one with a few frames spoiled by cloud or wind.
       histogram, and dragging the stretch settings moves them.
 - [ ] The histogram updates when you step to another frame.
 - [ ] It is still showing, or still hidden, after quitting and reopening.
+
+## Phase 15 — Star detection
+
+- [ ] The **Stars** box in the toolbar is unticked when the application first
+      starts, and no circles are drawn.
+- [ ] Ticking it, or pressing `Shift+S`, draws a circle on each star within a
+      moment. Zoom in and check the circles sit on the stars rather than beside
+      them, and that their sizes follow how big the stars look.
+- [ ] Plain `S` still toggles the stretch rather than the stars.
+- [ ] The toolbar and the metadata panel agree on the count, and the width and
+      roundness are plausible: a few pixels wide, roundness near 1 on a frame
+      that tracked.
+- [ ] A deliberately defocused or trailed frame reports a larger width, or a
+      lower roundness, than a good one from the same night. This is the whole
+      point of the feature; if it does not hold, the numbers are not usable.
+- [ ] Holding the arrow key down through a folder with stars on is still
+      smooth, and no frame ever shows the previous frame's circles.
+- [ ] On a one-shot colour frame, each star is circled once rather than as a
+      cluster of four, with reconstruction both on and off.
+- [ ] The gear beside the box is greyed out until detection is on. Opening it
+      and lowering the threshold finds more stars; **Reset** returns to the
+      original count.
+- [ ] Untick the box: the circles go, and the figures leave the metadata panel.
+- [ ] Tick it, quit, and reopen: it is still ticked, and detection starts on
+      the frame that reopens.

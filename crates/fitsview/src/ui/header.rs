@@ -58,6 +58,52 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
         ui.separator();
     }
 
+    // The star measurements, when they have been asked for and found.
+    if model.stars_enabled {
+        Grid::new("stars-grid")
+            .num_columns(2)
+            .spacing([12.0, 2.0])
+            .show(ui, |ui| {
+                let field = model.stars.as_ref();
+                ui.label(RichText::new("Stars").strong());
+                ui.label(match field {
+                    None => "finding…".to_string(),
+                    Some(f) => f.count().to_string(),
+                });
+                ui.end_row();
+
+                ui.label(RichText::new("Width").strong());
+                ui.label(match field.and_then(|f| f.fwhm) {
+                    Some(fwhm) => format!("{fwhm:.2} px"),
+                    None => "—".to_string(),
+                });
+                ui.end_row();
+
+                ui.label(RichText::new("Roundness").strong());
+                ui.label(match field.and_then(|f| f.roundness) {
+                    Some(r) => format!("{r:.2}"),
+                    None => "—".to_string(),
+                });
+                ui.end_row();
+
+                if let Some(saturated) = field.map(|f| f.saturated).filter(|s| *s > 0) {
+                    ui.label(RichText::new("Saturated").strong());
+                    ui.label(saturated.to_string());
+                    ui.end_row();
+                }
+            });
+        ui.label(
+            RichText::new(
+                "Width is the full width at half maximum, in pixels; smaller is \
+                 sharper. Roundness falls when stars are trailed. Saturated \
+                 stars are counted but not measured.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.separator();
+    }
+
     let mut filter = model.header_filter.clone();
     if ui
         .add(

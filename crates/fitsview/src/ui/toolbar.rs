@@ -1,6 +1,7 @@
 //! The top bar of file actions and the bottom status line.
 
 use egui::{Button, DragValue, Panel, RichText, Ui};
+use fits_core::stars::DetectionParams;
 use fits_core::stretch::StretchParams;
 
 use crate::app::{Action, Model};
@@ -146,6 +147,32 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
             }
             actions.extend(stretch_settings(ui, model));
 
+            // Beside the stretch, because both are decisions about what the
+            // display shows rather than about the file.
+            let mut stars = model.stars_enabled;
+            if ui
+                .checkbox(&mut stars, "Stars")
+                .on_hover_text(
+                    "Find the stars and measure them: how many, how wide, how round (Shift+S).\n\
+                     Runs in the background and draws a circle on each.\n\
+                     Costs about 60 ms a frame, so it is off unless asked for.",
+                )
+                .changed()
+            {
+                actions.push(Action::ToggleStars);
+            }
+            actions.extend(star_settings(ui, model));
+            if model.stars_enabled {
+                let summary = match &model.stars {
+                    None => "finding…".to_string(),
+                    Some(field) => match field.fwhm {
+                        Some(fwhm) => format!("{} stars, {fwhm:.1} px", field.count()),
+                        None => format!("{} stars", field.count()),
+                    },
+                };
+                ui.label(RichText::new(summary).weak().small());
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("?")
@@ -239,6 +266,74 @@ fn stretch_settings(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
     if params != model.stretch_params {
         actions.push(Action::SetStretchParams(params));
+    }
+    actions
+}
+
+/// The gear menu beside the Stars toggle. A rich field and a sparse one want
+/// different thresholds, but the defaults should mean this is rarely opened.
+fn star_settings(ui: &mut Ui, model: &Model) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let defaults = DetectionParams::default();
+    let mut params = model.star_params;
+
+    ui.add_enabled_ui(model.stars_enabled, |ui| {
+        ui.menu_button("⚙", |ui| {
+            ui.set_min_width(280.0);
+            ui.label(RichText::new("Star detection").strong());
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Threshold").on_hover_text(
+                    "How far above the sky background, in noise deviations, a pixel \
+                     must be to belong to a star. Lower finds fainter stars and more \
+                     noise.",
+                );
+                ui.add(
+                    DragValue::new(&mut params.threshold)
+                        .speed(0.1)
+                        .range(2.0..=20.0),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Smallest").on_hover_text(
+                    "Fewest pixels a star may cover. Raising it discards hot pixels \
+                     and cosmic rays; lowering it keeps the faintest stars.",
+                );
+                ui.add(
+                    DragValue::new(&mut params.minimum_area)
+                        .speed(0.2)
+                        .range(1..=64),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Most stars").on_hover_text(
+                    "The brightest this many are kept, so a dense field stays quick.",
+                );
+                ui.add(
+                    DragValue::new(&mut params.limit)
+                        .speed(20.0)
+                        .range(100..=50_000),
+                );
+            });
+
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(params != defaults, Button::new("Reset"))
+                .clicked()
+            {
+                actions.push(Action::ResetStarParams);
+                ui.close();
+            }
+        })
+        .response
+        .on_hover_text("Star detection settings");
+    });
+
+    if params != model.star_params {
+        actions.push(Action::SetStarParams(params));
     }
     actions
 }

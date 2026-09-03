@@ -13,10 +13,9 @@ For what the application does and how to build it, see
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 14 complete. Phases 0 to 9 delivered the application as
-originally specified; 10 to 14 improved its speed and added what turns a viewer
-into a culling tool. Phase 15, star detection, is planned and not started: it
-replaces Phase 13's sharpness proxy with the measurement astrophotographers
+**Status:** Phases 0 to 15 complete. Phases 0 to 9 delivered the application as
+originally specified; 10 to 15 improved its speed and added what turns a viewer
+into a culling tool, ending with the star measurements astrophotographers
 actually judge frames by.
 
 Two gaps remain that need a human rather than more code: the application has
@@ -40,7 +39,7 @@ been run on Linux or Windows. See section 10.
 | 12 — Faster colour, fewer copies | Done |
 | 13 — Frame quality measures | Done |
 | 14 — Readouts | Done |
-| 15 — Star detection | Not started |
+| 15 — Star detection | Done |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 9
 deliver the requirements below, and phases 10 onwards improve on them.
@@ -2472,9 +2471,11 @@ pub struct DetectionParams {
     /// Smallest region worth calling a star, in pixels. Default 4, which
     /// rejects single hot pixels and cosmic ray hits.
     pub minimum_area: usize,
-    /// Largest region worth calling a star. Default 400, which rejects
-    /// nebulosity and satellite trails.
+    /// Largest region worth calling a star, which rejects nebulosity.
     pub maximum_area: usize,
+    /// Longest a region's bounding box may be against its width, which is
+    /// what rejects satellite trails.
+    pub maximum_elongation: f64,
     /// Most stars to measure, so a rich field cannot cost unbounded time.
     pub limit: usize,
 }
@@ -2496,34 +2497,88 @@ seed. The threshold pass is the expensive part and parallelises over rows.
    width, so what was detected is visible and a bad detection is obvious rather
    than hidden inside a number.
 4. Count, median width and median roundness join the metadata panel beside the
-   Phase 13 figures, and become sort keys in the file list alongside background
-   and sharpness.
+   Phase 13 figures.
 5. The detection settings are worth exposing, behind the same gear menu pattern
    the stretch uses, because a rich field and a sparse one want different
    thresholds. Defaults must be sensible enough that the menu is rarely opened.
 
 ### Acceptance criteria
 
-- [ ] Unit test: a synthetic field of a known number of Gaussian stars is
+- [x] Unit test: a synthetic field of a known number of Gaussian stars is
       detected, with the right count.
-- [ ] Unit test: centroids are recovered to better than half a pixel.
-- [ ] Unit test: the measured width recovers the synthetic width, within 15%,
+- [x] Unit test: centroids are recovered to better than half a pixel.
+- [x] Unit test: the measured width recovers the synthetic width, within 15%,
       across at least three different widths.
-- [ ] Unit test: a blurred frame measures a larger width than the same frame
+- [x] Unit test: a blurred frame measures a larger width than the same frame
       unblurred, which is the claim the whole feature rests on.
-- [ ] Unit test: single hot pixels and cosmic ray hits are not counted as stars.
-- [ ] Unit test: a trailed star measures a lower roundness than a round one of
+- [x] Unit test: single hot pixels and cosmic ray hits are not counted as stars.
+- [x] Unit test: a trailed star measures a lower roundness than a round one of
       the same flux.
-- [ ] Unit test: saturated stars are counted and excluded from the width figure.
-- [ ] Unit test: stars touching the frame edge are ignored rather than measured
+- [x] Unit test: saturated stars are counted and excluded from the width figure.
+- [x] Unit test: stars touching the frame edge are ignored rather than measured
       wrongly.
-- [ ] Unit test: a frame of pure noise finds no stars, and an all-undefined
+- [x] Unit test: a frame of pure noise finds no stars, and an all-undefined
       frame does not panic.
-- [ ] Unit test: the star limit is respected on a dense field, so time stays
+- [x] Unit test: the star limit is respected on a dense field, so time stays
       bounded.
-- [ ] Detection on a 24 MP frame is measured and recorded here, and runs on the
+- [x] Detection on a 24 MP frame is measured and recorded here, and runs on the
       worker thread; the navigation tests still pass, which is what proves it.
-- [ ] The toggle is off by default and its state persists.
+- [x] The toggle is off by default and its state persists.
+
+
+### What Phase 15 actually produced
+
+**`fits-core/src/stars.rs`.** The background and noise come from the existing
+Phase 13 estimate, pixels above `background + threshold × noise` are collected,
+and connected regions are found with a sparse union-find over just those pixels
+rather than over the whole frame. On an empty sky that is a handful of pixels;
+the threshold pass itself is the cost, and it parallelises over rows.
+
+Each surviving region is measured from a **window around it**, not from the
+thresholded pixels alone. Measuring the moments of only the pixels above the
+threshold clips the wings of every star and understates the width by roughly the
+same amount every time, which would still rank frames correctly but would report
+a number no one could compare against a stacker's. The window includes the
+wings, so the widths agree with the synthetic truth to within a few per cent.
+
+`detect_mosaic` handles one-shot colour by walking only the green sites, which
+is a half-resolution image, and doubling the coordinates and widths afterwards.
+That finds each star once instead of four times and costs a quarter of the work.
+
+**`fitsview/src/stardetect.rs`.** A one-shot background detector, in the same
+shape as the loader: a request carries the generation it belongs to, the answer
+is dropped if the frame has moved on, and the interface never waits. Detection
+is off unless asked for, and the Phase 3 navigation timing tests still pass,
+which is what proves it never ran on the UI thread.
+
+**Measured:** **64 ms** for 3,000 stars on a 24 MP frame (`stars/detect on
+24 MP`). That is twelve times the cost of decoding the frame, which is why the
+toggle exists rather than the measurement simply always being taken.
+
+#### Two things that went wrong
+
+**The area cap rejected the stars it was meant to keep.** `maximum_area` was set
+to 400 pixels to reject satellite trails, and a σ=4 star covers about 570 above
+the threshold — so on a night of poor seeing, exactly when the measurement
+matters most, every star was thrown away and the frame reported as empty. The
+cap is now 2,000, and trails are rejected by the **bounding box being long and
+thin** instead. That filter had to be measured on a real trail before it was
+trusted: because the moment window truncates a long trail, a trail's *measured*
+roundness looks respectable, so roundness alone would not have caught it.
+
+**A test asserted a duration.** `requesting_does_not_block_the_caller` asserted
+that a request returned within 5 ms and failed at 5.3 ms, because spawning a
+thread in a debug build is not free. It was rewritten to assert the structure —
+that the detector reports itself busy and the result arrives later — which is
+the thing actually worth guaranteeing. Timing assertions belong in benchmarks.
+
+#### Not done, deliberately
+
+Star width is not a sort key in the file list. Every other sort key is measured
+as the folder loads, at about 1 ms a frame; adding detection there would put
+64 ms on every file in the folder for an ordering the sharpness key already
+approximates. Sorting by width would need the measurement cached to disk beside
+the keep flags, which is a phase of its own.
 
 ---
 
@@ -2566,6 +2621,8 @@ worth trusting is its exit status.
       alone, and the shortcut list is generated from one place.
 - [x] Images display right way up, and files containing NaN pixels render
       correctly.
+- [x] Frames can be judged without leaving the application: sky background,
+      noise, sharpness, and the star count, width and roundness.
 - [ ] **Manual test with real files from at least two capture programs.** Not
       done: every test to date uses synthetic files. This is the one gap that
       cannot be closed without real data, and it is the most likely place for a

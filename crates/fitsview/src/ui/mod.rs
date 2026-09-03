@@ -41,6 +41,7 @@ const KEY_LAST_FOLDER: &str = "last_folder";
 const KEY_SHOW_FILELIST: &str = "show_filelist";
 const KEY_SHOW_HEADER: &str = "show_header";
 const KEY_SHOW_HISTOGRAM: &str = "show_histogram";
+const KEY_STARS: &str = "stars_enabled";
 
 /// The `eframe` application: a model, a cached texture, and the glue between
 /// them.
@@ -306,6 +307,7 @@ impl eframe::App for FitsViewApp {
         eframe::set_value(storage, KEY_SHOW_FILELIST, &self.model.show_filelist);
         eframe::set_value(storage, KEY_SHOW_HEADER, &self.model.show_header);
         eframe::set_value(storage, KEY_SHOW_HISTOGRAM, &self.model.show_histogram);
+        eframe::set_value(storage, KEY_STARS, &self.model.stars_enabled);
         if let Some(folder) = self.model.folder.as_ref() {
             eframe::set_value(storage, KEY_LAST_FOLDER, &folder.dir.display().to_string());
         }

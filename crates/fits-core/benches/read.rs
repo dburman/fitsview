@@ -138,6 +138,47 @@ fn bench_quality(c: &mut Criterion) {
     group.finish();
 }
 
+/// Star detection, which runs on the worker thread when it is asked for.
+fn bench_stars(c: &mut Criterion) {
+    use fits_core::stars::{self, DetectionParams};
+    use fits_core::testutil::gaussian_background;
+
+    // A realistic frame: sky, noise, and a few thousand stars.
+    let (w, h) = (6000usize, 4000usize);
+    let mut pixels = gaussian_background(w, h, 1000.0, 20.0, 77);
+    let mut rng = fits_core::testutil::Prng::new(78);
+    for _ in 0..3000 {
+        let cx = rng.next_f64() * (w - 20) as f64 + 10.0;
+        let cy = rng.next_f64() * (h - 20) as f64 + 10.0;
+        for dy in -5i64..=5 {
+            for dx in -5i64..=5 {
+                let x = cx as i64 + dx;
+                let y = cy as i64 + dy;
+                if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                    continue;
+                }
+                let r = (dx * dx + dy * dy) as f64;
+                pixels[y as usize * w + x as usize] += 9000.0 * (-r / 8.0).exp();
+            }
+        }
+    }
+    let spec = SyntheticSpec::new(w, h, -32);
+    let image =
+        read_fits_from_bytes(&synthetic_fits(&spec, &pixels).expect("build")).expect("decode");
+
+    let mut group = c.benchmark_group("stars");
+    group.sample_size(10);
+    group.bench_function("detect on 24 MP", |b| {
+        b.iter(|| {
+            black_box(stars::detect(
+                black_box(&image),
+                &DetectionParams::default(),
+            ))
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read,
@@ -145,6 +186,7 @@ criterion_group!(
     bench_stretch,
     bench_calibration,
     bench_debayer,
-    bench_quality
+    bench_quality,
+    bench_stars
 );
 criterion_main!(benches);

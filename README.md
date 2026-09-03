@@ -25,6 +25,9 @@ when you want the image to fill the screen.
 always moves the file to the system trash, never destroys it, and a frame marked
 to keep always asks first. Rename with `F2`. Keep marks are stored beside the
 images, so they survive restarting and travel with the folder if you copy it.
+The list can be ordered by sky background or by sharpness instead of by name,
+both measured as the folder loads, which brings the frames worth throwing out to
+one end.
 
 **Seeing the image.** A raw frame is almost black; `S` applies the standard
 midtone stretch that puts the sky background at a sensible brightness and brings
@@ -43,13 +46,21 @@ of filters and displays as grey. `B` reconstructs the colour, automatically when
 the file records which filter pattern it used. Exports stay as mosaics, because
 that is what a stacker wants.
 
+**Judging a frame.** `Shift+S` finds the stars and measures them: how many, how
+wide (the full width at half maximum, in pixels) and how round. That is what
+tells you whether a frame is in focus and whether the mount tracked, and it is
+the measurement to cull on. Each star is circled on the image, so a bad
+detection is obvious rather than hidden inside a number. It takes about 60 ms on
+a 24-megapixel frame, runs in the background, and is off until asked for.
+
 **Knowing what you are looking at.** The metadata panel shows the FITS header,
 with the keywords that identify a frame pinned to the top and a filter for
-finding the rest.
+finding the rest, along with the sky background, the noise, and the star
+figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 498 automated tests that run on all three operating systems.
+by 610 automated tests that run on all three operating systems.
 
 ---
 
@@ -243,10 +254,10 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in ten phases, each with its own acceptance criteria and a
-write-up of what it produced and what went wrong along the way. That plan, along
-with the architecture, the reasoning behind each library choice, a primer on the
-FITS format, and the per-module test plan, is in
+`fitsview` was built in sixteen phases, each with its own acceptance criteria
+and a write-up of what it produced and what went wrong along the way. That plan,
+along with the architecture, the reasoning behind each library choice, a primer
+on the FITS format, and the per-module test plan, is in
 **[phasedbuild.md](phasedbuild.md)**.
 
 It is worth reading before changing anything: several of the bugs found during

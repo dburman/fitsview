@@ -86,6 +86,7 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             Key::K => out.push(Action::ToggleFlag),
             Key::F2 => out.push(Action::BeginRename),
             // View.
+            Key::S if modifiers.shift => out.push(Action::ToggleStars),
             Key::S => out.push(Action::ToggleStretch),
             Key::D => out.push(Action::ToggleApplyDark),
             Key::B => out.push(Action::ToggleDebayer),
@@ -266,6 +267,21 @@ mod tests {
             ..frame()
         };
         assert_eq!(actions_for(&shifted), vec![Action::ToggleApplyFlat]);
+    }
+
+    #[test]
+    fn shift_s_toggles_the_stars_while_plain_s_still_stretches() {
+        let plain = Frame {
+            keys: key(Key::S),
+            ..frame()
+        };
+        assert_eq!(actions_for(&plain), vec![Action::ToggleStretch]);
+
+        let shifted = Frame {
+            keys: vec![(Key::S, Modifiers::SHIFT)],
+            ..frame()
+        };
+        assert_eq!(actions_for(&shifted), vec![Action::ToggleStars]);
     }
 
     #[test]
