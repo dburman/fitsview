@@ -15,6 +15,16 @@ mod toolbar;
 mod viewer;
 
 use egui::{TextureHandle, TextureOptions, Ui};
+
+/// What the histogram strip needs, computed once per image.
+pub struct HistogramView {
+    /// The model generation it was built from.
+    generation: u64,
+    /// The distribution of the samples.
+    pub histogram: fits_core::Histogram,
+    /// The stretch in force, for marking the black point and midtone.
+    pub stretch: Option<fits_core::Stretch>,
+}
 use fits_core::stretch::StretchParams;
 
 use crate::app::{Action, Model};
@@ -37,9 +47,13 @@ pub struct FitsViewApp {
     /// The uploaded overview texture, tagged with the model generation it was
     /// built from, so it is rebuilt only when the displayed image changes.
     texture: Option<(u64, TextureHandle)>,
-    /// The distribution of the displayed image's samples, rebuilt when the
-    /// image changes rather than every frame.
-    histogram: Option<(u64, fits_core::Histogram)>,
+    /// The distribution of the displayed image's samples, and where the
+    /// stretch puts its black point and midtone.
+    ///
+    /// Both are rebuilt only when the image changes. Measuring the stretch
+    /// costs 12 ms on a full frame, so doing it while drawing would spend most
+    /// of a frame's budget on a decoration, every frame.
+    histogram: Option<HistogramView>,
     /// A full-resolution texture for the visible part of the image, used once
     /// the zoom passes the point where the overview is being magnified.
     ///
@@ -172,14 +186,25 @@ impl FitsViewApp {
         if self
             .histogram
             .as_ref()
-            .is_some_and(|(generation, _)| *generation == self.model.generation)
+            .is_some_and(|view| view.generation == self.model.generation)
         {
             return;
         }
-        self.histogram = Some((
-            self.model.generation,
-            fits_core::histogram::compute(&loaded.image),
-        ));
+
+        // Only worth measuring when it will actually be drawn.
+        let stretch = if self.model.stretch_enabled {
+            fits_core::compute_stretch(&loaded.image, &self.model.stretch_params)
+                .first()
+                .copied()
+        } else {
+            None
+        };
+
+        self.histogram = Some(HistogramView {
+            generation: self.model.generation,
+            histogram: fits_core::histogram::compute(&loaded.image),
+            stretch,
+        });
     }
 
     /// Uploads the visible part of the image at full resolution, when the
@@ -296,10 +321,11 @@ impl eframe::App for FitsViewApp {
         }
 
         self.sync_histogram();
-        let histogram = self.histogram.as_ref().map(|(_, h)| h.clone());
+        let histogram = self.histogram.take();
         for action in histogram::show(ui, &self.model, histogram.as_ref()) {
             self.model.handle(action);
         }
+        self.histogram = histogram;
 
         self.sync_texture(ui);
         self.sync_detail(ui);
@@ -383,6 +409,54 @@ mod tests {
             restored.model.stretch_params.target_bg
         );
         assert!(restored.model.confirm_every_delete);
+    }
+
+    #[test]
+    fn the_histogram_is_not_rebuilt_while_the_image_is_unchanged() {
+        // Measuring the stretch for the marks costs 12 ms on a full frame.
+        // Doing it while drawing would spend most of a frame's budget on a
+        // decoration, sixty times a second.
+        use fits_core::testutil::{write_synthetic, SyntheticSpec};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_synthetic(
+            dir.path(),
+            "light.fits",
+            &SyntheticSpec::new(32, 32, 16),
+            &(0..1024).map(f64::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::Open(dir.path().to_path_buf()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.model.loaded.is_none() && std::time::Instant::now() < deadline {
+            app.model.poll();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        app.model.handle(Action::ToggleHistogram);
+        app.model.handle(Action::ToggleStretch);
+
+        app.sync_histogram();
+        assert!(app.histogram.is_some(), "it should have been built once");
+
+        // Mark the cached copy. A rebuild would discard the mark.
+        app.histogram.as_mut().unwrap().histogram.counted = 12_345;
+        app.sync_histogram();
+        assert_eq!(
+            app.histogram.as_ref().unwrap().histogram.counted,
+            12_345,
+            "an unchanged image must not be measured again"
+        );
+
+        // A new image is a different matter.
+        app.model.generation += 1;
+        app.sync_histogram();
+        assert_ne!(
+            app.histogram.as_ref().unwrap().histogram.counted,
+            12_345,
+            "a changed image should be measured afresh"
+        );
     }
 
     #[test]

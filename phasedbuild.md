@@ -2314,7 +2314,8 @@ Small, and worth having once the larger work is done.
       samples are counted nowhere, and an all-undefined frame is empty rather
       than a panic.
 - [x] The readout costs nothing measurable: it reads one pixel. The histogram is
-      recomputed only when the image changes, not per frame.
+      recomputed only when the image changes, not per frame. **This was not true
+      when first written**; see below.
 - [ ] **Blink comparison: not built.** It was the optional third item. The two
       frames are already cached, so it remains cheap to add, but the pixel
       readout and the histogram answer questions asked far more often.
@@ -2332,6 +2333,28 @@ astronomical frame puts almost every sample into a handful of buckets, so a
 linear plot is one spike and nothing else. A logarithm would fix that and lie:
 it makes a bucket holding one sample look occupied. The square root keeps the
 stars visible while an empty bucket stays empty.
+
+**A twelve millisecond cost on every frame, found by asking rather than by a
+test.** The histogram marks where the stretch puts its black point and midtone,
+and the first version worked that out **while drawing**. Measuring a stretch
+costs 12 ms on a full frame and 17 ms on colour, so with the histogram open and
+the stretch on, most of a frame's budget went on a decoration, sixty times a
+second, and a colour frame exceeded the budget outright.
+
+Both are now computed once per image and cached with the histogram, keyed on the
+same generation counter the textures use. A test marks the cached copy and calls
+the sync again, asserting the mark survives, which a rebuild would destroy.
+
+| Work | Before | After |
+|------|--------|-------|
+| Stretch marks | 12.4 ms **every frame** | once per image |
+| Counting the samples | once per image | 2.2 ms, once per image |
+| Phase 13's outlier range, over 200 files | 1.2 µs per frame | unchanged |
+
+Phase 13 turned out to cost nothing worth measuring: the file list works out
+what counts as unusual on every frame, and that takes **1.2 microseconds** over
+two hundred files, which is under a ten-thousandth of a frame. Its real cost,
+measuring a frame, is 10 ms and is paid on the loader's worker thread.
 
 **A whole feature that compiled, passed every test, and did nothing.** The
 histogram module was written, the model state added, the key mapped, the panel

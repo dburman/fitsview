@@ -34,6 +34,60 @@ fn colour(width: usize, height: usize) -> FitsImage {
     read_fits_from_bytes(&synthetic_fits(&spec, &pixels).expect("build")).expect("decode")
 }
 
+/// Work the interface does on every frame, rather than once per image.
+///
+/// Anything here is paid sixty times a second, so a millisecond is expensive
+/// in a way that a millisecond per image is not.
+fn bench_per_frame(c: &mut Criterion) {
+    use fitsview::folder::{FileEntry, Folder, SortKey};
+    use std::path::PathBuf;
+
+    let mut group = c.benchmark_group("per frame");
+    group.sample_size(50);
+
+    // Phase 13: the file list works out what counts as unusual, every frame.
+    let folder = Folder {
+        dir: PathBuf::from("/session"),
+        files: (0..200)
+            .map(|i| FileEntry {
+                path: PathBuf::from(format!("/session/light_{i}.fits")),
+                name: format!("light_{i}.fits"),
+                size: 1024,
+                flagged: false,
+                quality: Some(fits_core::Quality {
+                    background: 1000.0 + f64::from(i % 17),
+                    noise: 20.0,
+                    sharpness: 1.0 + f64::from(i % 7) / 10.0,
+                }),
+            })
+            .collect(),
+        selected: Some(0),
+    };
+    group.bench_function("usual range over 200 files", |b| {
+        b.iter(|| black_box(folder.usual_range(black_box(SortKey::Background))));
+    });
+
+    // Phase 14 used to measure the stretch here, every frame, for the
+    // histogram's marks. It is now computed once per image, so the only
+    // per-frame cost is drawing 256 bars. Kept as a record of what was avoided.
+    let full = mono(6000, 4000);
+    group.bench_function("what the histogram marks used to cost per frame", |b| {
+        b.iter(|| {
+            black_box(fits_core::compute_stretch(
+                black_box(&full),
+                &StretchParams::default(),
+            ))
+        });
+    });
+
+    // What it costs now: counting the samples, also once per image.
+    group.bench_function("histogram, once per image", |b| {
+        b.iter(|| black_box(fits_core::histogram::compute(black_box(&full))));
+    });
+
+    group.finish();
+}
+
 fn bench_texture(c: &mut Criterion) {
     let mut group = c.benchmark_group("texture");
     group.sample_size(20);
@@ -97,5 +151,5 @@ fn bench_texture(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_texture);
+criterion_group!(benches, bench_texture, bench_per_frame);
 criterion_main!(benches);

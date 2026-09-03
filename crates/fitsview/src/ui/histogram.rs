@@ -5,16 +5,17 @@
 //! rather than guessed at.
 
 use egui::{Color32, Panel, Rect, RichText, Sense, Stroke, Ui, Vec2};
-use fits_core::histogram::{Histogram, BINS};
+use fits_core::histogram::BINS;
 
 use crate::app::{Action, Model};
+use crate::ui::HistogramView;
 
 /// Height of the strip. Enough to read a shape, small enough not to compete
 /// with the image.
 const HEIGHT: f32 = 72.0;
 
 /// Draws the histogram, when it is showing.
-pub fn show(ui: &mut Ui, model: &Model, histogram: Option<&Histogram>) -> Vec<Action> {
+pub fn show(ui: &mut Ui, model: &Model, view: Option<&HistogramView>) -> Vec<Action> {
     let mut actions = Vec::new();
     if !model.show_histogram {
         return actions;
@@ -39,8 +40,8 @@ pub fn show(ui: &mut Ui, model: &Model, histogram: Option<&Histogram>) -> Vec<Ac
 
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), HEIGHT), Sense::hover());
-        match histogram {
-            Some(h) if !h.is_empty() => draw(ui, rect, h, model),
+        match view {
+            Some(view) if !view.histogram.is_empty() => draw(ui, rect, view),
             _ => {
                 ui.painter().text(
                     rect.center(),
@@ -57,7 +58,8 @@ pub fn show(ui: &mut Ui, model: &Model, histogram: Option<&Histogram>) -> Vec<Ac
 }
 
 /// Paints the bars, and the stretch points over them.
-fn draw(ui: &Ui, rect: Rect, histogram: &Histogram, model: &Model) {
+fn draw(ui: &Ui, rect: Rect, view: &HistogramView) {
+    let histogram = &view.histogram;
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, Color32::from_gray(24));
 
@@ -83,11 +85,8 @@ fn draw(ui: &Ui, rect: Rect, histogram: &Histogram, model: &Model) {
     }
 
     // Where the stretch is putting things, so its settings are visible rather
-    // than a matter of trial and error.
-    if !model.stretch_enabled {
-        return;
-    }
-    let Some(stretch) = current_stretch(model) else {
+    // than a matter of trial and error. Measured once per image, not here.
+    let Some(stretch) = view.stretch else {
         return;
     };
     let mark = |position: f32, colour: Color32, label: &str| {
@@ -110,12 +109,4 @@ fn draw(ui: &Ui, rect: Rect, histogram: &Histogram, model: &Model) {
     // that becomes mid grey lies.
     let midtone_input = stretch.shadows + stretch.midtones * (stretch.highlights - stretch.shadows);
     mark(midtone_input, Color32::from_rgb(230, 200, 120), "mid");
-}
-
-/// The stretch currently in force for the displayed image.
-fn current_stretch(model: &Model) -> Option<fits_core::Stretch> {
-    let loaded = model.loaded.as_ref()?;
-    fits_core::compute_stretch(&loaded.image, &model.stretch_params)
-        .first()
-        .copied()
 }
