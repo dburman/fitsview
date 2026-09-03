@@ -7,8 +7,8 @@
 
 /// Every shortcut, as `(keys, what it does)`.
 pub const SHORTCUTS: &[(&str, &str)] = &[
-    ("→  Space  PgDn", "Next file"),
-    ("←  PgUp", "Previous file"),
+    ("→  ↓  Space  PgDn", "Next file"),
+    ("←  ↑  PgUp", "Previous file"),
     ("Home / End", "First / last file"),
     ("K", "Toggle keep flag"),
     ("Delete / Backspace", "Delete to trash"),
@@ -18,6 +18,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("D", "Toggle dark calibration"),
     ("Shift+F", "Toggle flat calibration"),
     ("I", "Show the FITS header"),
+    ("L", "Hide or show the file list"),
     ("F / 1", "Fit to window / actual size"),
     ("Scroll", "Zoom about the pointer"),
     ("Drag", "Pan"),

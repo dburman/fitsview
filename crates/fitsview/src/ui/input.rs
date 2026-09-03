@@ -62,9 +62,13 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
     for (key, modifiers) in &frame.keys {
         match key {
             // Navigation. Space steps forward because culling is a
-            // one-hand-on-the-keyboard job.
-            Key::ArrowRight | Key::Space | Key::PageDown => out.push(Action::NextFile),
-            Key::ArrowLeft | Key::PageUp => out.push(Action::PreviousFile),
+            // one-hand-on-the-keyboard job. Down and up move through the file
+            // list the way its own order reads, which is what anyone who has
+            // just clicked a row expects next.
+            Key::ArrowRight | Key::ArrowDown | Key::Space | Key::PageDown => {
+                out.push(Action::NextFile);
+            }
+            Key::ArrowLeft | Key::ArrowUp | Key::PageUp => out.push(Action::PreviousFile),
             Key::Home => out.push(Action::FirstFile),
             Key::End => out.push(Action::LastFile),
             Key::F5 => out.push(Action::Rescan),
@@ -85,6 +89,7 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             Key::S => out.push(Action::ToggleStretch),
             Key::D => out.push(Action::ToggleApplyDark),
             Key::I => out.push(Action::ToggleHeader),
+            Key::L => out.push(Action::ToggleFileList),
             // Plain F fits the image to the window, so the flat takes Shift+F
             // rather than stealing a key people use constantly.
             Key::F if modifiers.shift => out.push(Action::ToggleApplyFlat),
@@ -175,9 +180,11 @@ mod tests {
     fn every_navigation_key_maps_to_its_action() {
         let cases = [
             (Key::ArrowRight, Action::NextFile),
+            (Key::ArrowDown, Action::NextFile),
             (Key::Space, Action::NextFile),
             (Key::PageDown, Action::NextFile),
             (Key::ArrowLeft, Action::PreviousFile),
+            (Key::ArrowUp, Action::PreviousFile),
             (Key::PageUp, Action::PreviousFile),
             (Key::Home, Action::FirstFile),
             (Key::End, Action::LastFile),
@@ -260,6 +267,31 @@ mod tests {
     }
 
     #[test]
+    fn the_vertical_arrows_move_through_the_file_list() {
+        // Down moves down the list, which is the next file, and up the reverse.
+        let down = Frame {
+            keys: key(Key::ArrowDown),
+            ..frame()
+        };
+        assert_eq!(actions_for(&down), vec![Action::NextFile]);
+
+        let up = Frame {
+            keys: key(Key::ArrowUp),
+            ..frame()
+        };
+        assert_eq!(actions_for(&up), vec![Action::PreviousFile]);
+    }
+
+    #[test]
+    fn l_collapses_the_file_list() {
+        let f = Frame {
+            keys: key(Key::L),
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::ToggleFileList]);
+    }
+
+    #[test]
     fn i_toggles_the_header_panel() {
         let f = Frame {
             keys: key(Key::I),
@@ -308,7 +340,10 @@ mod tests {
             Key::D,
             Key::S,
             Key::F,
+            Key::L,
             Key::ArrowRight,
+            Key::ArrowDown,
+            Key::ArrowUp,
             Key::Home,
             Key::F5,
             Key::F2,

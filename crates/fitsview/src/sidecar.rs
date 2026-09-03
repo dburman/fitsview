@@ -181,7 +181,12 @@ mod tests {
     #[test]
     fn settings_from_a_newer_version_are_preserved_across_a_save() {
         // Otherwise opening a folder in an older build would silently discard
-        // the calibration paths a later phase stores here.
+        // settings a later version stores here.
+        //
+        // `master_dark` was an unknown key when this test was written and is a
+        // real field now, which is exactly the migration being guarded: a
+        // key that a later version understands must survive a round trip
+        // whether it is recognised or not.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             path_for(dir.path()),
@@ -191,17 +196,29 @@ mod tests {
 
         let mut s = load(dir.path());
         assert!(s.is_flagged("a.fits"));
-        assert_eq!(s.unknown.len(), 2, "unknown keys should be retained");
+        assert_eq!(
+            s.master_dark.as_deref(),
+            Some("/darks/master.fits"),
+            "a key this version understands should land in its field"
+        );
+        assert!(
+            s.unknown.contains_key("future"),
+            "a key this version does not understand should be kept: {:?}",
+            s.unknown
+        );
 
         s.set_flagged(vec!["b.fits".into()]);
         save(dir.path(), &s).unwrap();
 
         let text = std::fs::read_to_string(path_for(dir.path())).unwrap();
         assert!(
-            text.contains("master_dark"),
-            "lost a newer version's setting"
+            text.contains("master_dark") && text.contains("/darks/master.fits"),
+            "lost a recognised setting: {text}"
         );
-        assert!(text.contains("/darks/master.fits"));
+        assert!(
+            text.contains("future"),
+            "lost an unrecognised setting: {text}"
+        );
         assert!(text.contains("b.fits"));
     }
 

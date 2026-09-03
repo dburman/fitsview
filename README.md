@@ -211,8 +211,17 @@ not cost a round trip. See section 3.6 for why that matters on a private
 repository:
 
 ```bash
-cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-features && ./scripts/check-unsafe.sh
+./scripts/check.sh
 ```
+
+That covers formatting, lints, the tests, the unsafe guard, and, when the
+toolchain and target for them are installed, a build at the minimum supported
+Rust version and a compile for Windows.
+
+**Use the script rather than assembling the commands by hand.** Summarising
+`cargo test` by adding up the "N passed" numbers looks like it works and
+silently ignores failures; a broken test survived two phases of this project
+that way. Exit status is the only summary worth trusting.
 
 You can also compile for another platform without one to hand, which is how a
 Windows-only build failure was caught during development:
@@ -471,10 +480,10 @@ Making the repository public would make all of it free and this restriction
 unnecessary.
 
 **Check locally before pushing.** A failed run still costs minutes, so run what
-CI runs first. This is the whole set:
+CI runs first:
 
 ```bash
-cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-features && ./scripts/check-unsafe.sh
+./scripts/check.sh
 ```
 
 **Keep the toolchain current.** `rust-toolchain.toml` names `stable`, and CI
@@ -583,6 +592,7 @@ fitsview/
 ├── docs/
 │   └── manual-tests.md     # per-phase manual test checklist for UI-only criteria
 ├── scripts/
+│   ├── check.sh            # everything CI runs, in one command
 │   └── check-unsafe.sh     # unsafe guard, run by CI and locally
 ├── rust-toolchain.toml     # pins the stable channel plus rustfmt and clippy
 ├── Cargo.lock              # committed: this workspace produces a binary
@@ -1279,14 +1289,16 @@ model, not the renderer.
 
 | Key | Action |
 |-----|--------|
-| `→` `Space` `PgDn` | Next file |
-| `←` `PgUp` | Previous file |
+| `→` `↓` `Space` `PgDn` | Next file |
+| `←` `↑` `PgUp` | Previous file |
 | `Home` / `End` | First / last file |
 | `K` | Toggle keep flag |
 | `Delete` / `Backspace` | Delete (to trash) |
 | `Shift+Delete` | Confirm delete of flagged file |
 | `F2` | Rename |
 | `Ctrl+Z` | Undo last delete (where supported) |
+| `L` | Hide or show the file list |
+| `I` | Show the FITS header |
 | `S` | Toggle stretch (Phase 5) |
 | `D` | Toggle dark calibration (Phase 6) |
 | `Shift+F` | Toggle flat calibration (Phase 7) |

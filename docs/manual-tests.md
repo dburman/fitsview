@@ -78,8 +78,14 @@ cargo run --release --package fitsview -- /tmp/fitsview-samples
 - [ ] The list is in natural order: `light_1`, `light_2`, `light_10`, not
       `light_1`, `light_10`, `light_2`.
 - [ ] Clicking a row in the list shows that image.
-- [ ] Arrow keys, Space, Page Up and Page Down move through the list, and stop
-      at both ends rather than wrapping.
+- [ ] Left, right, up and down arrows all move through the list, along with
+      Space, Page Up and Page Down, and stop at both ends rather than wrapping.
+- [ ] Holding down or up scrolls the list so the highlighted row stays in view.
+- [ ] `L`, and the arrow button at the left of the toolbar, collapse the file
+      list so the image fills the window, and bring it back.
+- [ ] Dragging the file list's right edge all the way left collapses it too, and
+      the toolbar arrow flips to point the other way.
+- [ ] A collapsed file list is still collapsed after quitting and reopening.
 - [ ] Home and End jump to the first and last file.
 - [ ] Holding the right arrow key through a folder of large files leaves the
       window responsive, with no beachball or freeze.

@@ -25,6 +25,7 @@ const KEY_STRETCH_SHADOWS: &str = "stretch_shadows_clip";
 const KEY_STRETCH_TARGET: &str = "stretch_target_bg";
 const KEY_CONFIRM_EVERY_DELETE: &str = "confirm_every_delete";
 const KEY_LAST_FOLDER: &str = "last_folder";
+const KEY_SHOW_FILELIST: &str = "show_filelist";
 
 /// The `eframe` application: a model, a cached texture, and the glue between
 /// them.
@@ -73,6 +74,7 @@ impl FitsViewApp {
         };
         app.model.confirm_every_delete =
             eframe::get_value(storage, KEY_CONFIRM_EVERY_DELETE).unwrap_or(false);
+        app.model.show_filelist = eframe::get_value(storage, KEY_SHOW_FILELIST).unwrap_or(true);
 
         // Reopen the folder from last time, but only when the command line did
         // not name something, and only if it is still there.
@@ -155,6 +157,7 @@ impl eframe::App for FitsViewApp {
             KEY_CONFIRM_EVERY_DELETE,
             &self.model.confirm_every_delete,
         );
+        eframe::set_value(storage, KEY_SHOW_FILELIST, &self.model.show_filelist);
         if let Some(folder) = self.model.folder.as_ref() {
             eframe::set_value(storage, KEY_LAST_FOLDER, &folder.dir.display().to_string());
         }
@@ -195,6 +198,9 @@ impl eframe::App for FitsViewApp {
         for action in dialogs::show(ui, &self.model) {
             self.model.handle(action);
         }
+
+        // The scroll request is for the frame that has just been drawn.
+        self.model.scroll_to_selection = false;
 
         // Toasts disappear on their own, so keep painting while one is up.
         self.model.expire_toast();
@@ -260,6 +266,25 @@ mod tests {
             restored.model.stretch_params.target_bg
         );
         assert!(restored.model.confirm_every_delete);
+    }
+
+    #[test]
+    fn the_collapsed_file_list_stays_collapsed_next_time() {
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::ToggleFileList);
+        assert!(!app.model.show_filelist);
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(!restored.model.show_filelist);
+    }
+
+    #[test]
+    fn the_file_list_is_visible_on_a_first_run() {
+        let app = FitsViewApp::with_storage(None, Some(&MemoryStorage::default()));
+        assert!(app.model.show_filelist, "it should not start hidden");
     }
 
     #[test]

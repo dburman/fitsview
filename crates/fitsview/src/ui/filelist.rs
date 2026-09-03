@@ -8,14 +8,21 @@ use crate::folder::FileEntry;
 /// Width of the panel. Wide enough for a typical capture file name.
 const PANEL_WIDTH: f32 = 260.0;
 
-/// Draws the file list, returning a selection change if the user clicked one.
+/// Draws the file list, returning whatever the user asked for.
+///
+/// The panel can be collapsed to give the image the whole window. `egui` also
+/// collapses it when the resize edge is dragged past the minimum width, or when
+/// that edge is double-clicked, so the state has to be read back afterwards
+/// rather than only written.
 pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
     let mut actions = Vec::new();
+    let mut expanded = model.show_filelist;
 
     Panel::left("filelist")
         .default_size(PANEL_WIDTH)
+        .min_size(140.0)
         .resizable(true)
-        .show(ui, |ui| {
+        .show_collapsible(ui, &mut expanded, |ui| {
             let Some(folder) = &model.folder else {
                 ui.add_space(8.0);
                 ui.label(RichText::new("No folder open").weak());
@@ -28,6 +35,15 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 if model.loading {
                     ui.label(RichText::new("loading…").weak());
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("◀")
+                        .on_hover_text("Hide the file list (L)")
+                        .clicked()
+                    {
+                        actions.push(Action::ToggleFileList);
+                    }
+                });
             });
             ui.separator();
 
@@ -36,18 +52,38 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (index, entry) in folder.files.iter().enumerate() {
-                        if row(ui, entry, Some(index) == selected) {
+                        let response = row(ui, entry, Some(index) == selected);
+                        if response.clicked {
                             actions.push(Action::Select(index));
+                        }
+                        // Keep the selection in view when the keyboard moves it.
+                        if Some(index) == selected && model.scroll_to_selection {
+                            if let Some(rect) = response.rect {
+                                ui.scroll_to_rect(rect, None);
+                            }
                         }
                     }
                 });
         });
 
+    if expanded != model.show_filelist {
+        // The panel collapsed itself, from a drag or a double-click.
+        actions.push(Action::SetFileListVisible(expanded));
+    }
+
     actions
 }
 
-/// Draws one row. Returns whether it was clicked.
-fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> bool {
+/// What drawing one row produced.
+pub struct RowResponse {
+    /// Whether the row was clicked.
+    pub clicked: bool,
+    /// Where it was drawn, so the list can scroll to it.
+    pub rect: Option<egui::Rect>,
+}
+
+/// Draws one row.
+fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> RowResponse {
     let response = ui
         .scope(|ui| {
             ui.horizontal(|ui| {
@@ -75,7 +111,10 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool) -> bool {
             Color32::from_rgba_unmultiplied(90, 130, 200, 40),
         );
     }
-    response.clicked()
+    RowResponse {
+        clicked: response.clicked(),
+        rect: Some(response.rect),
+    }
 }
 
 /// Formats a byte count for the list, in the units an astrophotographer thinks

@@ -144,6 +144,10 @@ pub enum Action {
     SetStretchParams(StretchParams),
     /// Return the stretch settings to their defaults.
     ResetStretchParams,
+    /// Collapse the file list to the left edge, or bring it back.
+    ToggleFileList,
+    /// Set whether the file list is showing, when the panel itself decides.
+    SetFileListVisible(bool),
     /// Show or hide the FITS header panel.
     ToggleHeader,
     /// Narrow the header panel to matching cards.
@@ -343,6 +347,13 @@ pub struct Model {
     pub confirm_every_delete: bool,
     /// Whether the shortcut overlay is showing.
     pub show_help: bool,
+    /// Whether the file list is showing. Collapsing it gives the image the
+    /// whole window, which matters when culling on a laptop screen.
+    pub show_filelist: bool,
+    /// Set for one frame after the keyboard moves the selection, so the list
+    /// scrolls to follow it. Clicking a row must not scroll it under the
+    /// pointer, which is why this is not simply always on.
+    pub scroll_to_selection: bool,
     /// Whether the FITS header panel is showing.
     pub show_header: bool,
     /// Text narrowing the header panel.
@@ -392,6 +403,8 @@ impl Model {
             pending: Pending::None,
             confirm_every_delete: false,
             show_help: false,
+            show_filelist: true,
+            scroll_to_selection: false,
             show_header: false,
             header_filter: String::new(),
             calibration: Calibration::default(),
@@ -420,11 +433,27 @@ impl Model {
     pub fn handle(&mut self, action: Action) {
         match action {
             Action::Open(path) => self.open(&path),
-            Action::Select(index) => self.move_selection(|f| f.select(index)),
-            Action::NextFile => self.move_selection(Folder::select_next),
-            Action::PreviousFile => self.move_selection(Folder::select_previous),
-            Action::FirstFile => self.move_selection(Folder::select_first),
-            Action::LastFile => self.move_selection(Folder::select_last),
+            Action::Select(index) => {
+                // A click already has the row under the pointer.
+                self.move_selection(|f| f.select(index));
+                self.scroll_to_selection = false;
+            }
+            Action::NextFile => {
+                self.move_selection(Folder::select_next);
+                self.scroll_to_selection = true;
+            }
+            Action::PreviousFile => {
+                self.move_selection(Folder::select_previous);
+                self.scroll_to_selection = true;
+            }
+            Action::FirstFile => {
+                self.move_selection(Folder::select_first);
+                self.scroll_to_selection = true;
+            }
+            Action::LastFile => {
+                self.move_selection(Folder::select_last);
+                self.scroll_to_selection = true;
+            }
             Action::Rescan => self.rescan(),
             Action::FitToWindow => {
                 if let Some(l) = &self.loaded {
@@ -562,6 +591,8 @@ impl Model {
                     self.invalidate_texture();
                 }
             }
+            Action::ToggleFileList => self.show_filelist = !self.show_filelist,
+            Action::SetFileListVisible(visible) => self.show_filelist = visible,
             Action::ToggleHeader => self.show_header = !self.show_header,
             Action::SetHeaderFilter(text) => self.header_filter = text,
             Action::ToggleHelp => self.show_help = !self.show_help,
@@ -2657,6 +2688,77 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes[..2880]);
         assert!(text.contains("dark subtracted"), "{text}");
         assert!(text.contains("flat divided"));
+    }
+
+    #[test]
+    fn the_file_list_can_be_collapsed_and_brought_back() {
+        let mut m = Model::new();
+        assert!(m.show_filelist, "it starts visible");
+
+        m.handle(Action::ToggleFileList);
+        assert!(!m.show_filelist);
+
+        m.handle(Action::ToggleFileList);
+        assert!(m.show_filelist);
+    }
+
+    #[test]
+    fn the_panel_can_report_that_it_collapsed_itself() {
+        // Dragging the resize edge past the minimum collapses the panel, and
+        // the model has to learn about it or the toolbar arrow points the wrong
+        // way.
+        let mut m = Model::new();
+        m.handle(Action::SetFileListVisible(false));
+        assert!(!m.show_filelist);
+        m.handle(Action::SetFileListVisible(true));
+        assert!(m.show_filelist);
+    }
+
+    #[test]
+    fn collapsing_the_list_does_not_disturb_the_image() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+        let shown = m.loaded.as_ref().unwrap().path.clone();
+        let generation = m.generation;
+
+        m.handle(Action::ToggleFileList);
+
+        assert_eq!(m.loaded.as_ref().unwrap().path, shown);
+        assert_eq!(
+            m.generation, generation,
+            "hiding a panel is not a reason to rebuild the texture"
+        );
+    }
+
+    #[test]
+    fn keyboard_navigation_asks_the_list_to_follow_the_selection() {
+        // Otherwise stepping past the bottom of a long folder leaves the
+        // highlighted row out of sight.
+        let dir = folder_of(3, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        m.handle(Action::NextFile);
+        assert!(m.scroll_to_selection, "the list should follow the keyboard");
+
+        // A click already has the row under the pointer, so it must not scroll.
+        m.scroll_to_selection = false;
+        m.handle(Action::Select(0));
+        assert!(!m.scroll_to_selection, "clicking must not move the list");
+    }
+
+    #[test]
+    fn the_vertical_arrows_move_through_the_folder() {
+        let dir = folder_of(3, 10, 10);
+        let (mut m, _spy) = model_over(dir.path());
+
+        // The actions the down and up arrows produce.
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        assert_eq!(m.position_label(), "2 / 3");
+
+        m.handle(Action::PreviousFile);
+        settle(&mut m);
+        assert_eq!(m.position_label(), "1 / 3");
     }
 
     #[test]

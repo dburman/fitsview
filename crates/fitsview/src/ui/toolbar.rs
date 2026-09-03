@@ -11,6 +11,21 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
     Panel::top("toolbar").show(ui, |ui| {
         ui.horizontal(|ui| {
+            // The way back when the file list is collapsed to the edge.
+            let arrow = if model.show_filelist { "◀" } else { "▶" };
+            if ui
+                .button(arrow)
+                .on_hover_text(if model.show_filelist {
+                    "Hide the file list, so the image fills the window (L)"
+                } else {
+                    "Show the file list (L)"
+                })
+                .clicked()
+            {
+                actions.push(Action::ToggleFileList);
+            }
+            ui.separator();
+
             if ui
                 .button("Open File…")
                 .on_hover_text("Open a single FITS image")
