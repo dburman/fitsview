@@ -377,6 +377,22 @@ const fn keep(value: f32) -> f32 {
     }
 }
 
+/// The three channels at one pixel of a mosaic.
+///
+/// The same interpolation [`debayer`] uses, for a single pixel. Exposed so a
+/// readout can report the colour at a point without reconstructing the whole
+/// frame, and without the answer differing from what is on screen.
+///
+/// `y` counts from the first row **as stored in the file**, which is the bottom
+/// of the picture.
+#[must_use]
+pub fn colour_at(image: &FitsImage, pattern: BayerPattern, x: usize, y: usize) -> [f32; 3] {
+    if image.channels != 1 || x >= image.width || y >= image.height {
+        return [f32::NAN; 3];
+    }
+    reconstruct(image, pattern, x, y)
+}
+
 /// The three channels at one pixel.
 fn reconstruct(image: &FitsImage, pattern: BayerPattern, x: usize, y: usize) -> [f32; 3] {
     let own = pattern.colour_at(x, y);
@@ -742,6 +758,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_single_pixel_reconstructs_the_same_as_the_whole_frame() {
+        // A readout must not disagree with the picture beside it.
+        let (w, h) = (16, 16);
+        let source = [1200.0, 700.0, 250.0];
+        let img = mosaic_from(w, h, BayerPattern::Rggb, |_, _| source);
+        let whole = debayer(&img, BayerPattern::Rggb).unwrap();
+        let plane = w * h;
+
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1), (7, 9), (15, 15)] {
+            let one = colour_at(&img, BayerPattern::Rggb, x, y);
+            for (channel, value) in one.iter().enumerate() {
+                let from_whole = whole.data[channel * plane + y * w + x];
+                assert_eq!(
+                    value.to_bits(),
+                    from_whole.to_bits(),
+                    "at ({x}, {y}) channel {channel}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconstructing_outside_the_image_gives_nothing_rather_than_panicking() {
+        let img = mosaic(4, 4, &[100.0; 16]);
+        assert!(colour_at(&img, BayerPattern::Rggb, 99, 0)[0].is_nan());
+        assert!(colour_at(&img, BayerPattern::Rggb, 0, 99)[0].is_nan());
+    }
+
+    #[test]
+    fn reconstructing_a_pixel_of_a_colour_image_gives_nothing() {
+        let spec = SyntheticSpec::new(4, 4, -32).with_channels(3);
+        let colour = read_fits_from_bytes(&synthetic_fits(&spec, &[1.0; 48]).unwrap()).unwrap();
+        assert!(colour_at(&colour, BayerPattern::Rggb, 1, 1)[0].is_nan());
     }
 
     #[test]

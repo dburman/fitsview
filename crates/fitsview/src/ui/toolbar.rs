@@ -177,8 +177,15 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 ui.label(model.status_text());
                 if let Some(readout) = model.pixel_readout() {
                     ui.separator();
+                    let explanation = if readout.reconstructed {
+                        "The values in the file, before calibration or stretching.\n\
+                         A tilde marks colour interpolated from the filter grid: \
+                         each pixel measured only one of the three."
+                    } else {
+                        "The value in the file, before calibration or stretching"
+                    };
                     ui.label(RichText::new(readout.describe()).monospace())
-                        .on_hover_text("The value in the file, before calibration or stretching");
+                        .on_hover_text(explanation);
                 }
             }
         });

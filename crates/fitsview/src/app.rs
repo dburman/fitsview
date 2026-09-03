@@ -381,6 +381,9 @@ pub struct PixelReadout {
     pub values: [f32; 3],
     /// How many of those are meaningful: 1 for mono, 3 for colour.
     pub channels: usize,
+    /// True when the three values were reconstructed from a colour mosaic
+    /// rather than measured directly, so the readout can say so.
+    pub reconstructed: bool,
 }
 
 impl PixelReadout {
@@ -409,7 +412,10 @@ impl PixelReadout {
             ),
             _ => value(self.values[0]),
         };
-        format!("({}, {})  {samples}", self.x, self.y)
+        // A tilde marks values that were interpolated from the filter grid
+        // rather than measured, so a reading is never taken for more than it is.
+        let note = if self.reconstructed { "~" } else { "" };
+        format!("({}, {})  {note}{samples}", self.x, self.y)
     }
 }
 
@@ -1530,6 +1536,24 @@ impl Model {
         let plane = raw.width * raw.height;
         let index = source_y * raw.width + x;
 
+        // On a one-shot colour frame each pixel measured only one colour, so a
+        // single number would be misleading: neighbouring values differ because
+        // they sit under different filters, not because the sky does. When
+        // colour is being reconstructed, report the same three values the
+        // picture is showing, from the raw samples rather than the calibrated
+        // ones.
+        if raw.channels == 1 {
+            if let Some(pattern) = self.bayer.active() {
+                return Some(PixelReadout {
+                    x,
+                    y,
+                    values: debayer::colour_at(raw, pattern, x, source_y),
+                    channels: 3,
+                    reconstructed: true,
+                });
+            }
+        }
+
         let mut values = [f32::NAN; 3];
         for (channel, slot) in values.iter_mut().enumerate().take(raw.channels.min(3)) {
             *slot = raw.data[channel * plane + index];
@@ -1540,6 +1564,7 @@ impl Model {
             y,
             values,
             channels: raw.channels.min(3),
+            reconstructed: false,
         })
     }
 
@@ -3571,9 +3596,126 @@ mod tests {
             y: 2,
             values: [f32::NAN, 0.0, 0.0],
             channels: 1,
+            reconstructed: false,
         };
         assert!(readout.describe().contains('—'), "{}", readout.describe());
         assert!(readout.describe().contains("(1, 2)"));
+    }
+
+    #[test]
+    fn a_colour_mosaic_reads_out_three_reconstructed_values() {
+        // A single number on a one-shot colour frame is misleading: neighbours
+        // differ because they sit under different filters, not because the sky
+        // does. With colour reconstruction on, the readout should say what the
+        // picture says.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 16usize);
+        let bayer = BayerPattern::Rggb;
+        let source = [3000.0, 1200.0, 400.0];
+        let pixels: Vec<f64> = (0..w * h)
+            .map(|i| source[bayer.colour_at(i % w, i / w).plane()])
+            .collect();
+        let spec = SyntheticSpec::new(w, h, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("BAYERPAT", "'RGGB    '");
+        write_synthetic(dir.path(), "osc.fits", &spec, &pixels).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        assert!(m.bayer.enabled, "the header declares a pattern");
+
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+        m.view = ViewState::centred(Vec2::new(16.0, 16.0), viewport, 20.0);
+        m.pointer = Some(m.view.image_to_screen(Vec2::new(8.5, 8.5)));
+
+        let readout = m.pixel_readout().expect("should have a readout");
+        assert_eq!(
+            readout.channels, 3,
+            "a colour frame should read out in colour"
+        );
+        assert!(
+            readout.reconstructed,
+            "and say the values were interpolated"
+        );
+        for (channel, expected) in source.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = *expected as f32;
+            assert!(
+                (readout.values[channel] - expected).abs() < 1.0,
+                "channel {channel}: got {} wanted {expected}",
+                readout.values[channel]
+            );
+        }
+        assert!(readout.describe().contains('~'), "{}", readout.describe());
+    }
+
+    #[test]
+    fn turning_colour_off_returns_the_readout_to_one_mosaic_value() {
+        // Without reconstruction there is no colour to report, and the honest
+        // answer is the single sample the pixel actually measured.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 16usize);
+        let bayer = BayerPattern::Rggb;
+        let source = [3000.0, 1200.0, 400.0];
+        let pixels: Vec<f64> = (0..w * h)
+            .map(|i| source[bayer.colour_at(i % w, i / w).plane()])
+            .collect();
+        let spec = SyntheticSpec::new(w, h, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("BAYERPAT", "'RGGB    '");
+        write_synthetic(dir.path(), "osc.fits", &spec, &pixels).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleDebayer);
+        assert!(!m.bayer.enabled);
+
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+        m.view = ViewState::centred(Vec2::new(16.0, 16.0), viewport, 20.0);
+        m.pointer = Some(m.view.image_to_screen(Vec2::new(8.5, 8.5)));
+
+        let readout = m.pixel_readout().expect("should have a readout");
+        assert_eq!(readout.channels, 1);
+        assert!(!readout.reconstructed);
+        assert!(!readout.describe().contains('~'));
+    }
+
+    #[test]
+    fn a_reconstructed_readout_agrees_with_the_displayed_picture() {
+        // The readout sits beside the image; the two must not disagree.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 16usize);
+        let bayer = BayerPattern::Rggb;
+        let pixels: Vec<f64> = (0..w * h)
+            .map(|i| [5000.0, 2000.0, 800.0][bayer.colour_at(i % w, i / w).plane()])
+            .collect();
+        let spec = SyntheticSpec::new(w, h, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("BAYERPAT", "'RGGB    '");
+        write_synthetic(dir.path(), "osc.fits", &spec, &pixels).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+        m.view = ViewState::centred(Vec2::new(16.0, 16.0), viewport, 20.0);
+
+        let (x, y) = (6usize, 9usize);
+        m.pointer = Some(
+            m.view
+                .image_to_screen(Vec2::new(x as f32 + 0.5, y as f32 + 0.5)),
+        );
+        let readout = m.pixel_readout().expect("should have a readout");
+
+        let shown = &m.loaded.as_ref().unwrap().image;
+        let plane = shown.width * shown.height;
+        for channel in 0..3 {
+            let displayed = shown.data[channel * plane + y * shown.width + x];
+            assert_eq!(
+                readout.values[channel].to_bits(),
+                displayed.to_bits(),
+                "channel {channel} differs from what is on screen"
+            );
+        }
     }
 
     #[test]

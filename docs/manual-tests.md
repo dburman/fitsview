@@ -300,6 +300,11 @@ Needs a real session, ideally one with a few frames spoiled by cloud or wind.
       the calibrated one. Toggle the dark with D and check the number does not
       move.
 - [ ] On a colour frame, three values are shown.
+- [ ] On a one-shot colour frame with reconstruction on, three values are shown
+      with a tilde marking them as interpolated, and they match the colour on
+      screen at that point.
+- [ ] Turning reconstruction off with B returns the readout to a single value,
+      which is what that pixel actually measured.
 - [ ] `G` shows the histogram, and it has the shape of a sky frame: one tall
       peak near the left with a thin tail.
 - [ ] With the stretch on, the black point and midtone are marked on the

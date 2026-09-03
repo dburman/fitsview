@@ -13,9 +13,11 @@ For what the application does and how to build it, see
 
 ## 0. Product Summary
 
-**Status:** All phases complete. Phases 0 to 9 delivered the application as
-originally specified; phases 10 to 14 improved its speed and added what turns a
-viewer into a culling tool.
+**Status:** Phases 0 to 14 complete. Phases 0 to 9 delivered the application as
+originally specified; 10 to 14 improved its speed and added what turns a viewer
+into a culling tool. Phase 15, star detection, is planned and not started: it
+replaces Phase 13's sharpness proxy with the measurement astrophotographers
+actually judge frames by.
 
 Two gaps remain that need a human rather than more code: the application has
 never been tried against real capture files, and the manual checklist has never
@@ -38,6 +40,7 @@ been run on Linux or Windows. See section 10.
 | 12 — Faster colour, fewer copies | Done |
 | 13 — Frame quality measures | Done |
 | 14 — Readouts | Done |
+| 15 — Star detection | Not started |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 9
 deliver the requirements below, and phases 10 onwards improve on them.
@@ -2388,6 +2391,139 @@ bug and confirming the check fails. **The declaration has to be checked against
 the file's own parent**: two crates each have a `histogram.rs`, and finding one
 declared says nothing about the other, which is exactly how the first attempt at
 this guard passed while the bug was present.
+
+---
+
+## Phase 15 — Star Detection
+
+**Goal:** Measure the stars, rather than approximating them.
+
+Phase 13 gives every frame a background level and a sharpness proxy, and says
+plainly what that proxy is not: it finds gross problems, not small differences
+in focus. Stars are the real measurement. Their count, their width and their
+roundness are what an astrophotographer judges a frame by, and they answer
+questions the proxy cannot: whether the focus drifted, whether the mount slipped
+for thirty seconds, whether the seeing softened halfway through the night.
+
+Optional throughout. Detection costs real time, so it happens only when asked
+for, behind a toggle beside the stretch button where the other display
+decisions live.
+
+### Concepts
+
+- **Detection.** Threshold the frame at the background plus a few deviations,
+  both already measured by Phase 13. Group the pixels above the threshold into
+  connected regions. Each region that survives the filters below is a star.
+- **Rejection matters more than detection.** A raw frame is full of things that
+  pass a threshold and are not stars:
+  - single hot pixels and cosmic ray hits, rejected by requiring a minimum area;
+  - satellite trails and aeroplane lights, rejected by an upper bound on
+    elongation and on area;
+  - nebulosity and galaxies, rejected by an upper bound on area;
+  - the frame edges, where a star is cut in half and its shape is a lie, so
+    regions touching the border are ignored.
+- **Measurement.** For each star, the intensity-weighted centroid gives its
+  position to better than a pixel. The second moments of the same weights give
+  its width and its shape: the full width at half maximum follows from the mean
+  moment, and roundness from the ratio of the two axes. A trailed star is
+  elongated, and its roundness falls.
+- **Saturation.** A star whose peak sits at the top of the range has a flat top,
+  so its width is understated and its centroid is unreliable. Saturated stars
+  are counted but excluded from the width and roundness figures, and the count
+  of them is worth reporting on its own: a frame with many is overexposed.
+- **Detection runs on the raw frame**, after calibration but before debayering.
+  A colour mosaic would otherwise show every star as a cluster of four, one per
+  filter site. For a one-shot colour frame, detect on the green sites, which are
+  half the pixels and the closest thing to luminance the sensor offers.
+
+### Implementation in `fits-core/src/stars.rs`
+
+```rust
+/// One detected star.
+pub struct Star {
+    /// Centroid, in image pixels, to sub-pixel precision.
+    pub x: f64,
+    pub y: f64,
+    /// Total signal above the background.
+    pub flux: f64,
+    /// Full width at half maximum, in pixels.
+    pub fwhm: f64,
+    /// 1.0 is circular; a trailed star tends towards 0.
+    pub roundness: f64,
+    /// Whether the peak reached the top of the range.
+    pub saturated: bool,
+}
+
+/// What a frame's stars say about it.
+pub struct StarField {
+    pub stars: Vec<Star>,
+    /// Median width, over the unsaturated stars.
+    pub fwhm: Option<f64>,
+    /// Median roundness, over the unsaturated stars.
+    pub roundness: Option<f64>,
+    /// How many peaked at the top of the range.
+    pub saturated: usize,
+}
+
+/// How hard to look.
+pub struct DetectionParams {
+    /// Deviations above the background a pixel must reach. Default 5.
+    pub threshold: f64,
+    /// Smallest region worth calling a star, in pixels. Default 4, which
+    /// rejects single hot pixels and cosmic ray hits.
+    pub minimum_area: usize,
+    /// Largest region worth calling a star. Default 400, which rejects
+    /// nebulosity and satellite trails.
+    pub maximum_area: usize,
+    /// Most stars to measure, so a rich field cannot cost unbounded time.
+    pub limit: usize,
+}
+
+pub fn detect(image: &FitsImage, params: &DetectionParams) -> StarField;
+```
+
+Connected regions are found with a scan and a union-find, which is a single pass
+over the frame plus near-constant work per pixel, rather than a flood fill per
+seed. The threshold pass is the expensive part and parallelises over rows.
+
+### UI
+
+1. A **Stars** toggle in the toolbar, **beside the stretch button**, since both
+   are decisions about what the display shows rather than about the file.
+2. When on, detection runs on the **worker thread**, like measuring, and the
+   result is cached with the frame. The interface never waits for it.
+3. Detected stars are drawn as circles over the image, sized to their measured
+   width, so what was detected is visible and a bad detection is obvious rather
+   than hidden inside a number.
+4. Count, median width and median roundness join the metadata panel beside the
+   Phase 13 figures, and become sort keys in the file list alongside background
+   and sharpness.
+5. The detection settings are worth exposing, behind the same gear menu pattern
+   the stretch uses, because a rich field and a sparse one want different
+   thresholds. Defaults must be sensible enough that the menu is rarely opened.
+
+### Acceptance criteria
+
+- [ ] Unit test: a synthetic field of a known number of Gaussian stars is
+      detected, with the right count.
+- [ ] Unit test: centroids are recovered to better than half a pixel.
+- [ ] Unit test: the measured width recovers the synthetic width, within 15%,
+      across at least three different widths.
+- [ ] Unit test: a blurred frame measures a larger width than the same frame
+      unblurred, which is the claim the whole feature rests on.
+- [ ] Unit test: single hot pixels and cosmic ray hits are not counted as stars.
+- [ ] Unit test: a trailed star measures a lower roundness than a round one of
+      the same flux.
+- [ ] Unit test: saturated stars are counted and excluded from the width figure.
+- [ ] Unit test: stars touching the frame edge are ignored rather than measured
+      wrongly.
+- [ ] Unit test: a frame of pure noise finds no stars, and an all-undefined
+      frame does not panic.
+- [ ] Unit test: the star limit is respected on a dense field, so time stays
+      bounded.
+- [ ] Detection on a 24 MP frame is measured and recorded here, and runs on the
+      worker thread; the navigation tests still pass, which is what proves it.
+- [ ] The toggle is off by default and its state persists.
 
 ---
 
