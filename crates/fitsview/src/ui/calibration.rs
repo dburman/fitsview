@@ -265,13 +265,23 @@ fn flats_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
     actions
 }
 
+/// Whether the current frame is a mosaic that colour can be reconstructed from.
+///
+/// Judged from the frame **as it came off the disk**, never from what is on
+/// screen. Once colour has been reconstructed the displayed image has three
+/// channels, so asking the display would disable the control the moment it was
+/// used, leaving no way to turn reconstruction off again.
+#[must_use]
+pub fn can_debayer(model: &Model) -> bool {
+    model.loaded.as_ref().is_some_and(|l| l.raw.channels == 1)
+}
+
 /// The one-shot colour section.
 fn colour_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
     let mut actions = Vec::new();
     let bayer = &model.bayer;
 
-    // Only a single-channel image can be a mosaic.
-    let is_mosaic = model.loaded.as_ref().is_some_and(|l| l.image.channels == 1);
+    let is_mosaic = can_debayer(model);
 
     ui.add_space(4.0);
     ui.label(RichText::new("One-shot colour").strong());
@@ -399,4 +409,90 @@ fn save_file(title: &str, name: &str) -> Option<std::path::PathBuf> {
 /// Asks for a folder.
 fn pick_folder(title: &str) -> Option<std::path::PathBuf> {
     rfd::FileDialog::new().set_title(title).pick_folder()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Action;
+    use fits_core::testutil::{write_synthetic, SyntheticSpec};
+    use fits_core::BayerPattern;
+    use std::time::{Duration, Instant};
+
+    /// Pumps a model until the selected image is on screen.
+    fn settle(model: &mut Model) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            model.poll();
+            if !model.loading && (model.loaded.is_some() || model.error.is_some()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("image never arrived");
+    }
+
+    /// A model showing one file of the given shape.
+    fn model_showing(spec: &SyntheticSpec, pixels: &[f64]) -> (tempfile::TempDir, Model) {
+        let dir = tempfile::tempdir().unwrap();
+        write_synthetic(dir.path(), "frame.fits", spec, pixels).unwrap();
+        let mut model = Model::new();
+        model.handle(Action::Open(dir.path().to_path_buf()));
+        settle(&mut model);
+        (dir, model)
+    }
+
+    #[test]
+    fn a_mosaic_can_be_debayered() {
+        let (_dir, model) = model_showing(&SyntheticSpec::new(8, 8, 16), &[100.0; 64]);
+        assert!(can_debayer(&model));
+    }
+
+    #[test]
+    fn a_mosaic_can_still_be_undebayered_once_it_is_showing_colour() {
+        // The control has to stay usable after it has been used, or there is no
+        // way back. Judging from the displayed image rather than the raw one
+        // disables it the moment it takes effect.
+        let (w, h) = (16usize, 16usize);
+        let pattern = BayerPattern::Rggb;
+        let pixels: Vec<f64> = (0..w * h)
+            .map(|i| [2000.0, 800.0, 300.0][pattern.colour_at(i % w, i / w).plane()])
+            .collect();
+        let spec = SyntheticSpec::new(w, h, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("BAYERPAT", "'RGGB    '");
+
+        let (_dir, mut model) = model_showing(&spec, &pixels);
+        assert!(model.bayer.enabled, "a declared pattern is applied at once");
+        assert_eq!(
+            model.loaded.as_ref().unwrap().image.channels,
+            3,
+            "it should be showing colour"
+        );
+
+        assert!(
+            can_debayer(&model),
+            "the control must stay usable so it can be turned off again"
+        );
+
+        model.handle(Action::ToggleDebayer);
+        assert!(!model.bayer.enabled);
+        assert!(can_debayer(&model), "and usable again to turn it back on");
+    }
+
+    #[test]
+    fn a_genuinely_colour_file_cannot_be_debayered() {
+        let spec = SyntheticSpec::new(4, 4, 16).with_channels(3);
+        let (_dir, model) = model_showing(&spec, &[100.0; 48]);
+        assert_eq!(model.loaded.as_ref().unwrap().raw.channels, 3);
+        assert!(
+            !can_debayer(&model),
+            "there is no filter grid to reconstruct from"
+        );
+    }
+
+    #[test]
+    fn nothing_can_be_debayered_with_no_image_open() {
+        assert!(!can_debayer(&Model::new()));
+    }
 }
