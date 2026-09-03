@@ -14,6 +14,8 @@ pub mod input;
 mod toolbar;
 mod viewer;
 
+use std::sync::Arc;
+
 use egui::{TextureHandle, TextureOptions, Ui};
 
 /// What the histogram strip needs, computed once per image.
@@ -47,6 +49,12 @@ pub struct FitsViewApp {
     /// The uploaded overview texture, tagged with the model generation it was
     /// built from, so it is rebuilt only when the displayed image changes.
     texture: Option<(u64, TextureHandle)>,
+    /// How samples are turned into display bytes, built once per image.
+    ///
+    /// Shared by the overview texture, the detail texture and the histogram's
+    /// marks. Each used to build its own, which measured the image's background
+    /// three times over, and again on every pan once zoomed in.
+    mapping: Option<(u64, Mapping)>,
     /// The distribution of the displayed image's samples, and where the
     /// stretch puts its black point and midtone.
     ///
@@ -74,6 +82,7 @@ impl FitsViewApp {
             model,
             texture: None,
             detail: None,
+            mapping: None,
             histogram: None,
         }
     }
@@ -157,18 +166,31 @@ impl FitsViewApp {
                 image.height
             );
         }
-        let mapping = if self.model.stretch_enabled {
-            Mapping::stretched(image, &self.model.stretch_params)
-        } else {
-            Mapping::linear(image)
-        };
-        let colour = texture::to_color_image(image, &mapping, factor);
+        let image = Arc::clone(image);
+        let mapping = self.mapping_for(&image);
+        let colour = texture::to_color_image(&image, &mapping, factor);
         let handle = ui
             .ctx()
             .load_texture("fits-image", colour, TextureOptions::LINEAR);
         self.texture = Some((self.model.generation, handle));
         // The overview changed, so any detail built from the old one is stale.
         self.detail = None;
+    }
+
+    /// The tone mapping for the displayed image, built once and reused.
+    fn mapping_for(&mut self, image: &fits_core::FitsImage) -> Mapping {
+        if let Some((generation, mapping)) = &self.mapping {
+            if *generation == self.model.generation {
+                return mapping.clone();
+            }
+        }
+        let mapping = if self.model.stretch_enabled {
+            Mapping::stretched(image, &self.model.stretch_params)
+        } else {
+            Mapping::linear(image)
+        };
+        self.mapping = Some((self.model.generation, mapping.clone()));
+        mapping
     }
 
     /// Recomputes the histogram when the displayed image changes.
@@ -191,18 +213,13 @@ impl FitsViewApp {
             return;
         }
 
-        // Only worth measuring when it will actually be drawn.
-        let stretch = if self.model.stretch_enabled {
-            fits_core::compute_stretch(&loaded.image, &self.model.stretch_params)
-                .first()
-                .copied()
-        } else {
-            None
-        };
+        // The stretch comes from the mapping the texture already built.
+        let image = Arc::clone(&loaded.image);
+        let stretch = self.mapping_for(&image).stretch();
 
         self.histogram = Some(HistogramView {
             generation: self.model.generation,
-            histogram: fits_core::histogram::compute(&loaded.image),
+            histogram: fits_core::histogram::compute(&image),
             stretch,
         });
     }
@@ -249,12 +266,9 @@ impl FitsViewApp {
             return;
         }
 
-        let mapping = if self.model.stretch_enabled {
-            Mapping::stretched(image, &self.model.stretch_params)
-        } else {
-            Mapping::linear(image)
-        };
-        let colour = texture::to_color_image_region(image, &mapping, &region);
+        let image = Arc::clone(image);
+        let mapping = self.mapping_for(&image);
+        let colour = texture::to_color_image_region(&image, &mapping, &region);
         log::debug!(
             "detail texture {}x{} at ({}, {})",
             colour.size[0],
@@ -409,6 +423,79 @@ mod tests {
             restored.model.stretch_params.target_bg
         );
         assert!(restored.model.confirm_every_delete);
+    }
+
+    /// An application showing one small frame, settled and ready to draw.
+    fn app_showing_a_frame() -> (tempfile::TempDir, FitsViewApp) {
+        use fits_core::testutil::{write_synthetic, SyntheticSpec};
+        let dir = tempfile::tempdir().unwrap();
+        write_synthetic(
+            dir.path(),
+            "light.fits",
+            &SyntheticSpec::new(32, 32, 16),
+            &(0..1024).map(f64::from).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::Open(dir.path().to_path_buf()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.model.loaded.is_none() && std::time::Instant::now() < deadline {
+            app.model.poll();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        (dir, app)
+    }
+
+    #[test]
+    fn the_tone_mapping_is_built_once_and_shared() {
+        // The overview texture, the detail texture and the histogram all need
+        // it. Each building its own measured the image's background three times
+        // over, and again on every pan once zoomed in.
+        let (_dir, mut app) = app_showing_a_frame();
+        app.model.handle(Action::ToggleStretch);
+
+        let image = Arc::clone(&app.model.loaded.as_ref().unwrap().image);
+        let first = app.mapping_for(&image);
+        assert!(first.stretch().is_some(), "the stretch should be recorded");
+
+        // A second request for the same image must not measure it again.
+        let cached = app
+            .mapping
+            .as_ref()
+            .map(|(generation, _)| *generation)
+            .expect("it should have been cached");
+        assert_eq!(cached, app.model.generation);
+
+        let again = app.mapping_for(&image);
+        assert_eq!(
+            again.stretch(),
+            first.stretch(),
+            "the same mapping should come back"
+        );
+    }
+
+    #[test]
+    fn a_changed_image_gets_a_fresh_mapping() {
+        let (_dir, mut app) = app_showing_a_frame();
+        let image = Arc::clone(&app.model.loaded.as_ref().unwrap().image);
+        let _ = app.mapping_for(&image);
+        let before = app.mapping.as_ref().unwrap().0;
+
+        app.model.generation += 1;
+        let _ = app.mapping_for(&image);
+        assert_ne!(
+            app.mapping.as_ref().unwrap().0,
+            before,
+            "a new image must not keep the old mapping"
+        );
+    }
+
+    #[test]
+    fn a_linear_mapping_records_no_stretch_to_mark() {
+        let (_dir, mut app) = app_showing_a_frame();
+        assert!(!app.model.stretch_enabled);
+        let image = Arc::clone(&app.model.loaded.as_ref().unwrap().image);
+        assert_eq!(app.mapping_for(&image).stretch(), None);
     }
 
     #[test]

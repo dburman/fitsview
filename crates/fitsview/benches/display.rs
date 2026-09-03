@@ -80,6 +80,33 @@ fn bench_per_frame(c: &mut Criterion) {
         });
     });
 
+    // The pixel readout, which runs every frame with no way to turn it off.
+    {
+        use egui::{Pos2, Rect, Vec2};
+        use fitsview::app::{Action, Model};
+        let dir = tempfile::tempdir().unwrap();
+        fits_core::testutil::write_synthetic(
+            dir.path(),
+            "light.fits",
+            &SyntheticSpec::new(512, 512, 16),
+            &vec![100.0; 512 * 512],
+        )
+        .unwrap();
+        let mut model = Model::new();
+        model.handle(Action::Open(dir.path().to_path_buf()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while model.loaded.is_none() && std::time::Instant::now() < deadline {
+            model.poll();
+        }
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        model.set_viewport(viewport);
+        model.pointer = Some(Pos2::new(700.0, 450.0));
+
+        group.bench_function("pixel readout", |b| {
+            b.iter(|| black_box(model.pixel_readout()));
+        });
+    }
+
     // What it costs now: counting the samples, also once per image.
     group.bench_function("histogram, once per image", |b| {
         b.iter(|| black_box(fits_core::histogram::compute(black_box(&full))));

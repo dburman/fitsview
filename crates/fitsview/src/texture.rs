@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use egui::{Color32, ColorImage, Rect, Vec2};
-use fits_core::stretch::{self, Lut, StretchParams};
+use fits_core::stretch::{self, Lut, Stretch, StretchParams};
 use fits_core::FitsImage;
 use rayon::prelude::*;
 
@@ -45,6 +45,9 @@ pub struct Mapping {
     /// Shared rather than copied, because a table is 64 KB and the mapping is
     /// cloned for every texture rebuild.
     luts: Arc<Vec<Box<Lut>>>,
+    /// The stretch the tables were built from, kept so the histogram can mark
+    /// the black point and midtone without measuring the image a second time.
+    stretch: Option<Stretch>,
 }
 
 impl Mapping {
@@ -61,6 +64,7 @@ impl Mapping {
             low,
             high,
             luts: Arc::new(Vec::new()),
+            stretch: None,
         }
     }
 
@@ -70,15 +74,25 @@ impl Mapping {
     /// keeps a stretched redraw as cheap as a linear one.
     #[must_use]
     pub fn stretched(image: &FitsImage, params: &StretchParams) -> Self {
-        let luts = stretch::compute_stretch(image, params)
-            .iter()
-            .map(stretch::build_lut)
-            .collect();
+        let stretches = stretch::compute_stretch(image, params);
+        let luts = stretches.iter().map(stretch::build_lut).collect();
         Self {
             low: image.min,
             high: image.max,
             luts: Arc::new(luts),
+            // Every channel shares one stretch, so the first describes them all.
+            stretch: stretches.first().copied(),
         }
+    }
+
+    /// The stretch this mapping applies, if it applies one.
+    ///
+    /// Measuring an image's background costs 12 ms on a full frame, so anything
+    /// else that needs the same answer takes it from here rather than working
+    /// it out again.
+    #[must_use]
+    pub fn stretch(&self) -> Option<Stretch> {
+        self.stretch
     }
 
     /// Whether this mapping applies a stretch.

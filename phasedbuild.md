@@ -2347,9 +2347,24 @@ the sync again, asserting the mark survives, which a rebuild would destroy.
 
 | Work | Before | After |
 |------|--------|-------|
-| Stretch marks | 12.4 ms **every frame** | once per image |
+| Stretch marks | 12.4 ms **every frame** | shared, no extra cost |
+| Measuring the stretch | **three times per image** | once |
 | Counting the samples | once per image | 2.2 ms, once per image |
+| Pixel readout, every frame | 7.7 ns | unchanged |
 | Phase 13's outlier range, over 200 files | 1.2 µs per frame | unchanged |
+
+**Asking what it cost found a second, larger waste.** The stretch was being
+measured **three times for every image**: once for the overview texture, once
+for the detail texture, and once for the histogram's marks. Worse, the detail
+one repeated on **every pan** once zoomed past the overview, so dragging around
+a stretched full frame paid 12.4 ms per rebuild for an answer it already had.
+
+The tone mapping is now built once per image and shared by all three. It carries
+the stretch it was built from, so nothing else needs to work it out.
+
+**Nothing here needs a toggle it does not already have.** The histogram has one,
+on `G`, and starts hidden. The pixel readout has none and needs none: at 7.7
+nanoseconds it is five millionths of a frame.
 
 Phase 13 turned out to cost nothing worth measuring: the file list works out
 what counts as unusual on every frame, and that takes **1.2 microseconds** over
