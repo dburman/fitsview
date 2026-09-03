@@ -4,28 +4,7 @@ use egui::{Align2, Color32, Key, Modal, RichText, TextEdit, Ui, Window};
 
 use crate::app::{Action, Model, Pending};
 
-/// Every shortcut, shown in the help overlay.
-///
-/// Kept next to the interface rather than in a document, so that a shortcut
-/// cannot be changed without the overlay changing with it.
-pub const SHORTCUTS: &[(&str, &str)] = &[
-    ("→  Space  PgDn", "Next file"),
-    ("←  PgUp", "Previous file"),
-    ("Home / End", "First / last file"),
-    ("K", "Toggle keep flag"),
-    ("Delete / Backspace", "Delete to trash"),
-    ("Shift+Delete", "Delete a flagged file without asking"),
-    ("F2", "Rename"),
-    ("S", "Toggle the automatic stretch"),
-    ("D", "Toggle dark calibration"),
-    ("Shift+F", "Toggle flat calibration"),
-    ("F / 1", "Fit to window / actual size"),
-    ("Scroll", "Zoom about the pointer"),
-    ("Drag", "Pan"),
-    ("F5", "Rescan the folder"),
-    ("Esc", "Cancel, or dismiss an error"),
-    ("? or H", "Show or hide this list"),
-];
+use crate::shortcuts::SHORTCUTS;
 
 /// Draws whatever is currently waiting on the user.
 pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
@@ -190,41 +169,4 @@ fn show_toast(ui: &mut Ui, text: &str) {
                     ui.label(RichText::new(text).color(Color32::WHITE));
                 });
         });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_overlay_documents_every_shortcut_the_application_responds_to() {
-        // If a shortcut is added without a line here, the overlay silently
-        // stops being a complete reference.
-        let text = SHORTCUTS
-            .iter()
-            .map(|(k, _)| *k)
-            .collect::<Vec<_>>()
-            .join(" ");
-        for expected in [
-            "→",
-            "←",
-            "Home",
-            "K",
-            "Delete",
-            "Shift+Delete",
-            "F2",
-            "F5",
-            "Esc",
-        ] {
-            assert!(text.contains(expected), "the overlay is missing {expected}");
-        }
-    }
-
-    #[test]
-    fn every_shortcut_line_has_a_description() {
-        for (keys, description) in SHORTCUTS {
-            assert!(!keys.trim().is_empty());
-            assert!(!description.trim().is_empty(), "{keys} has no description");
-        }
-    }
 }

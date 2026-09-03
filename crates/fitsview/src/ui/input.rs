@@ -84,6 +84,7 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             // View.
             Key::S => out.push(Action::ToggleStretch),
             Key::D => out.push(Action::ToggleApplyDark),
+            Key::I => out.push(Action::ToggleHeader),
             // Plain F fits the image to the window, so the flat takes Shift+F
             // rather than stealing a key people use constantly.
             Key::F if modifiers.shift => out.push(Action::ToggleApplyFlat),
@@ -256,6 +257,15 @@ mod tests {
             ..frame()
         };
         assert_eq!(actions_for(&shifted), vec![Action::ToggleApplyFlat]);
+    }
+
+    #[test]
+    fn i_toggles_the_header_panel() {
+        let f = Frame {
+            keys: key(Key::I),
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::ToggleHeader]);
     }
 
     #[test]

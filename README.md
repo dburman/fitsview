@@ -13,7 +13,9 @@ criteria all pass.
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 7 complete. Phase 8 is next.
+**Status:** All phases complete. Two gaps remain, both needing a human rather
+than more code: the application has never been tried against real capture files,
+and the manual checklist has never been run on Linux or Windows. See section 10.
 
 | Phase | State |
 |-------|-------|
@@ -25,7 +27,7 @@ criteria all pass.
 | 5 — Stretch | Done |
 | 6 — Dark calibration | Done |
 | 7 — Flat calibration | Done |
-| 8 — Packaging | Not started |
+| 8 — Packaging | Done |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 8
 deliver the features below.
@@ -381,6 +383,9 @@ fitsview/
 │       │   ├── folder.rs   # folder scanning, file list, selection
 │       │   ├── loader.rs   # worker thread, bounded LRU cache, prefetch
 │       │   ├── natsort.rs  # light_2 sorts before light_10
+│       │   ├── crash.rs    # a panic becomes a log and a dialog
+│       │   ├── icon.rs     # the window icon, drawn in code
+│       │   ├── shortcuts.rs # one list, used by the overlay and --help
 │       │   ├── jobs.rs     # background work with progress and cancellation
 │       │   ├── actions.rs  # delete / rename / flag, behind the FileOps trait
 │       │   ├── sidecar.rs  # .fitsview.json: keep flags stored beside images
@@ -390,7 +395,8 @@ fitsview/
 │       │       ├── toolbar.rs
 │       │       ├── viewer.rs
 │       │       ├── filelist.rs
-│       │       ├── calibration.rs # the darks and export panel
+│       │       ├── calibration.rs # the darks, flats and export panel
+│       │       ├── header.rs  # the FITS header viewer
 │       │       └── dialogs.rs  # confirmation, rename editor, help, toasts
 │       └── tests/
 │           ├── rendering.rs    # end-to-end: file on disk -> texture
@@ -1616,11 +1622,59 @@ after this one.
 
 1. **CI** was set up in Phase 0. Extend it here to upload the release binary as a per-OS build artifact, and add a tag-triggered job that attaches those binaries to a GitHub release.
 2. **Release profile** was set in Phase 0. Verify `cargo build --release` still produces a single self-contained binary per platform.
-3. **App icon** and window title. On macOS, produce a `.app` bundle with `cargo-bundle`; on Windows set the icon via `winres`. Optional.
-4. **Settings persistence**: window size/position, stretch toggle, stretch params, last folder — via `eframe` `Storage`.
-5. **Error handling**: every failure surfaces as a non-blocking toast; never a panic. Add `std::panic::set_hook` that logs and shows a message box (`rfd::MessageDialog`) before exit.
-6. **Header viewer**: key `I` toggles a panel listing all header cards of the current file. Cheap and very useful.
-7. **Histogram**: small histogram widget under the viewer (256 bins, computed at load time on the subsample). Optional.
+3. **App icon** and window title.
+4. **Settings persistence**: stretch toggle, stretch params, last folder — via `eframe` `Storage`.
+5. **Error handling**: every failure surfaces as a non-blocking toast; never a panic. Add `std::panic::set_hook` that logs and shows a message box before exit.
+6. **Header viewer**: key `I` toggles a panel listing all header cards of the current file.
+7. **Histogram**: small histogram widget under the viewer. Optional.
+
+### Acceptance criteria
+
+- [x] CI uploads a binary per platform, retained for two weeks.
+- [x] A `v*` tag builds all three platforms, packages them, and attaches them to
+      a draft GitHub release. The release job runs its own tests first, because
+      a release that fails its tests is not worth publishing.
+- [x] `cargo build --release` produces a self-contained binary. Verified on
+      macOS: 10 MB, linking only system frameworks, nothing from a package
+      manager.
+- [x] The window carries an icon.
+- [x] Settings persist, including the folder from last time.
+- [x] A panic writes a log and shows a dialog rather than closing silently.
+- [x] `I` shows the FITS header, with a filter.
+- [ ] **Histogram: not built.** It was the one item marked optional in this
+      phase, and the header viewer covers the same need — knowing what is in a
+      frame — with more of the information a capture session actually raises
+      questions about. Worth adding if the stretch controls ever need tuning by
+      eye.
+
+### What Phase 8 actually produced
+
+414 tests pass across the workspace, up from 397.
+
+**A crash now says something.** Launched from a dock or a file manager there is
+nowhere to print, so a panic previously closed the window with no explanation.
+The hook writes to a crash log beside the settings and shows a dialog. The
+message deliberately says that images are unchanged and that deleting always
+moves files to the trash, because that is the first thing anyone wonders after a
+crash in a program with a delete button.
+
+**One list of shortcuts, not three.** The `--help` output had quietly gone stale:
+it still listed only the Phase 2 keys, six phases later. Rather than fix the copy
+and leave the same trap, the help overlay and `--help` are both generated from
+`shortcuts.rs`, and a test asserts the list covers every key the application
+acts on. Documentation that is derived cannot drift.
+
+**Decisions worth knowing:**
+
+- The icon is drawn in code rather than committed as an image, so there is no
+  binary asset in the repository and no build step to produce one. It is tested
+  for the properties that matter: opaque, dark ground, bright centre, not a flat
+  block of colour.
+- The folder from the previous session reopens on start, unless the command line
+  names something, and a folder that has since been deleted is skipped quietly.
+- The release workflow runs on a tag rather than on every push, because macOS
+  minutes bill at ten times on a private repository.
+- The release is created as a **draft**, so a human decides whether to publish.
 
 ---
 
@@ -1642,12 +1696,37 @@ after this one.
 
 ## 10. Definition of Done (whole project)
 
-- [ ] All phase acceptance criteria checked.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean on all three OSes.
-- [ ] `cargo test --workspace` green in CI on all three OSes.
-- [ ] Zero `unsafe` in `crates/`: both crates carry `#![forbid(unsafe_code)]` and the CI guard step passes.
-- [ ] Every module in the test plan table (5.5) has the listed tests.
-- [ ] Images display right way up, and files containing NaN pixels render correctly.
-- [ ] Manual test with real files from at least two capture programs (e.g. N.I.N.A. and ASIAIR/ZWO) — both 16-bit `BZERO=32768` and 32-bit float.
-- [ ] A 24 MP file opens and displays in well under one second on a warm cache.
-- [ ] Delete / rename / flag / stretch / dark / flat all work from keyboard alone.
+- [x] All phase acceptance criteria checked, with the exceptions noted in each
+      phase and gathered below.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean.
+- [x] `cargo test --workspace` green in CI on all three operating systems.
+- [x] Zero `unsafe` in `crates/`: both crates carry `#![forbid(unsafe_code)]`
+      and the CI guard step passes.
+- [x] Every module in the test plan table (5.5) has the listed tests.
+- [x] A 24 MP file opens and displays in well under one second: 4.4 ms to
+      decode, 11.6 ms to compute a stretch, 17.8 ms to apply dark and flat.
+- [x] Delete, rename, flag, stretch, dark and flat all work from the keyboard
+      alone, and the shortcut list is generated from one place.
+- [x] Images display right way up, and files containing NaN pixels render
+      correctly.
+- [ ] **Manual test with real files from at least two capture programs.** Not
+      done: every test to date uses synthetic files. This is the one gap that
+      cannot be closed without real data, and it is the most likely place for a
+      surprise, since the synthetic generator writes what the standard says
+      rather than what cameras actually do.
+- [ ] **The manual checklist in `docs/manual-tests.md` has never been run on
+      Linux or Windows.** CI proves the code builds and its tests pass there;
+      nobody has watched the application draw a window on either.
+
+### Where to look first if something is wrong
+
+| Symptom | Likely cause |
+|---------|--------------|
+| Image upside down | The vertical flip in `texture.rs`; see section 4 |
+| Whole image blank or one flat colour | A `NaN` reaching a statistic unguarded |
+| Colour image renders grey | A per-channel measurement where one global one belongs; this has been the bug twice, in the stretch and in flat normalisation |
+| Background too bright after stretching | The rescale in step 5 of the stretch was skipped |
+| Uneven background after calibration | The flat divided before the dark was subtracted |
+| Bright speckles after calibration | A flat with near-zero gain; check the unusable pixel count |
+| A dependency resolves to a surprisingly old version | `rust-version` is too low for the version you expect; see section 3.6 |
+| Lints fail in CI but not locally | The local toolchain is older than CI's; run `rustup update` |

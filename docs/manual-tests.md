@@ -210,4 +210,12 @@ Real flats matter here: synthetic ones cannot show dust shadows.
 
 - [ ] The release binary runs on a machine without a Rust toolchain.
 - [ ] The application icon appears in the dock, taskbar or launcher.
-- [ ] A crash message appears rather than a silent exit if startup fails.
+- [ ] `I` shows the header, and the filter narrows it as you type.
+- [ ] Quitting and reopening restores the folder you were in, the stretch
+      setting, and the stretch parameters.
+- [ ] `fitsview --help` lists every key that actually works.
+- [ ] A crash shows a dialog rather than the window vanishing, and writes to the
+      crash log named in that dialog. To provoke one deliberately, build with a
+      temporary `panic!` early in `main`.
+- [ ] Pushing a `v0.1.0` tag produces a draft release with three binaries
+      attached. Check each downloads and runs.

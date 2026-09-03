@@ -6,7 +6,10 @@
 //! - [`app`] holds the state and every rule that changes it.
 //! - [`actions`] deletes, renames and flags files, behind a trait so tests
 //!   never touch the real trash.
+//! - [`crash`] turns a panic into a message the user can act on.
 //! - [`folder`] is the file list and the selection within it.
+//! - [`shortcuts`] is the single list of key bindings, used by both the help
+//!   overlay and `--help`.
 //! - [`sidecar`] remembers keep flags beside the images.
 //! - [`jobs`] runs slow work, such as combining darks or exporting a folder,
 //!   on a background thread with progress and cancellation.
@@ -26,10 +29,13 @@
 
 pub mod actions;
 pub mod app;
+pub mod crash;
 pub mod folder;
+pub mod icon;
 pub mod jobs;
 pub mod loader;
 pub mod natsort;
+pub mod shortcuts;
 pub mod sidecar;
 pub mod texture;
 pub mod ui;

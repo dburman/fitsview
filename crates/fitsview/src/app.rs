@@ -144,6 +144,10 @@ pub enum Action {
     SetStretchParams(StretchParams),
     /// Return the stretch settings to their defaults.
     ResetStretchParams,
+    /// Show or hide the FITS header panel.
+    ToggleHeader,
+    /// Narrow the header panel to matching cards.
+    SetHeaderFilter(String),
     /// Show or hide the keyboard shortcut overlay.
     ToggleHelp,
     /// Dismiss the current error message.
@@ -339,6 +343,10 @@ pub struct Model {
     pub confirm_every_delete: bool,
     /// Whether the shortcut overlay is showing.
     pub show_help: bool,
+    /// Whether the FITS header panel is showing.
+    pub show_header: bool,
+    /// Text narrowing the header panel.
+    pub header_filter: String,
     /// Calibration frames and whether they are applied.
     pub calibration: Calibration,
     /// The background job in progress, if any.
@@ -384,6 +392,8 @@ impl Model {
             pending: Pending::None,
             confirm_every_delete: false,
             show_help: false,
+            show_header: false,
+            header_filter: String::new(),
             calibration: Calibration::default(),
             job: None,
             calibrated: Cache::new(4, 512 * 1024 * 1024),
@@ -552,6 +562,8 @@ impl Model {
                     self.invalidate_texture();
                 }
             }
+            Action::ToggleHeader => self.show_header = !self.show_header,
+            Action::SetHeaderFilter(text) => self.header_filter = text,
             Action::ToggleHelp => self.show_help = !self.show_help,
             Action::ClearError => self.error = None,
         }

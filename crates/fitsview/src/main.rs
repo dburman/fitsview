@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use fitsview::{ui::FitsViewApp, version_string};
+use fitsview::{crash, icon, shortcuts, ui::FitsViewApp, version_string};
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq)]
@@ -45,24 +45,33 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
     Invocation::Run(path)
 }
 
-const USAGE: &str = "\
-Usage: fitsview [FILE]
-
-Opens a FITS image for viewing. With no FILE, starts with an empty window.
-
-Options:
-  -h, --help       Show this message
-  -V, --version    Show the version
-
-Keys:
-  F                Fit the image to the window
-  1                Show one image pixel per screen pixel
-  Escape           Dismiss an error message
-  Scroll           Zoom about the pointer
-  Drag             Pan";
+/// The usage message.
+///
+/// The key list comes from [`shortcuts`], so it cannot drift out of step with
+/// the help overlay or with what the application actually does.
+fn usage() -> String {
+    format!(
+        "Usage: fitsview [PATH]\n\
+         \n\
+         Opens a FITS image, or a folder of them, for viewing. With no PATH,\n\
+         reopens the folder from last time.\n\
+         \n\
+         Options:\n\
+         \x20 -h, --help       Show this message\n\
+         \x20 -V, --version    Show the version\n\
+         \n\
+         Keys:\n\
+         {}\n",
+        shortcuts::as_text()
+    )
+}
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Launched from a dock or a file manager there is nowhere to print, so a
+    // panic would otherwise close the window with no explanation.
+    crash::install();
 
     let initial = match parse_args(std::env::args().skip(1)) {
         Invocation::Version => {
@@ -70,7 +79,7 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
         Invocation::Help => {
-            println!("{USAGE}");
+            print!("{}", usage());
             return Ok(());
         }
         Invocation::Run(path) => path,
@@ -81,7 +90,12 @@ fn main() -> eframe::Result<()> {
             .with_title(version_string())
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([600.0, 400.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(egui::IconData {
+                rgba: icon::rgba(),
+                width: icon::SIZE as u32,
+                height: icon::SIZE as u32,
+            }),
         ..Default::default()
     };
 
@@ -149,8 +163,17 @@ mod tests {
 
     #[test]
     fn the_usage_text_lists_every_key_the_viewer_responds_to() {
-        for expected in ["F", "1", "Escape", "Scroll", "Drag"] {
-            assert!(USAGE.contains(expected), "usage is missing {expected}");
+        // Generated from the shared list, so this checks the wiring rather than
+        // a hand-maintained copy.
+        let text = usage();
+        for expected in [
+            "Next file",
+            "Toggle the automatic stretch",
+            "Show the FITS header",
+        ] {
+            assert!(text.contains(expected), "usage is missing {expected}");
         }
+        assert!(text.contains("Usage: fitsview"));
+        assert!(text.contains("--version"));
     }
 }

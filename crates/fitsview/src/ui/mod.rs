@@ -8,6 +8,7 @@
 mod calibration;
 mod dialogs;
 mod filelist;
+mod header;
 pub mod input;
 mod toolbar;
 mod viewer;
@@ -23,6 +24,7 @@ const KEY_STRETCH_ENABLED: &str = "stretch_enabled";
 const KEY_STRETCH_SHADOWS: &str = "stretch_shadows_clip";
 const KEY_STRETCH_TARGET: &str = "stretch_target_bg";
 const KEY_CONFIRM_EVERY_DELETE: &str = "confirm_every_delete";
+const KEY_LAST_FOLDER: &str = "last_folder";
 
 /// The `eframe` application: a model, a cached texture, and the glue between
 /// them.
@@ -71,6 +73,21 @@ impl FitsViewApp {
         };
         app.model.confirm_every_delete =
             eframe::get_value(storage, KEY_CONFIRM_EVERY_DELETE).unwrap_or(false);
+
+        // Reopen the folder from last time, but only when the command line did
+        // not name something, and only if it is still there.
+        if app.model.folder.is_none() {
+            if let Some(last) = eframe::get_value::<String>(storage, KEY_LAST_FOLDER) {
+                let path = std::path::PathBuf::from(last);
+                if path.is_dir() {
+                    app.model.handle(Action::Open(path));
+                    // Reopening is not news, and a folder that has since been
+                    // emptied should not greet the user with an error.
+                    app.model.error = None;
+                    app.model.toast = None;
+                }
+            }
+        }
         app
     }
 
@@ -138,6 +155,9 @@ impl eframe::App for FitsViewApp {
             KEY_CONFIRM_EVERY_DELETE,
             &self.model.confirm_every_delete,
         );
+        if let Some(folder) = self.model.folder.as_ref() {
+            eframe::set_value(storage, KEY_LAST_FOLDER, &folder.dir.display().to_string());
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -160,6 +180,9 @@ impl eframe::App for FitsViewApp {
             self.model.handle(action);
         }
         for action in calibration::show(ui, &self.model) {
+            self.model.handle(action);
+        }
+        for action in header::show(ui, &self.model) {
             self.model.handle(action);
         }
 
@@ -237,6 +260,74 @@ mod tests {
             restored.model.stretch_params.target_bg
         );
         assert!(restored.model.confirm_every_delete);
+    }
+
+    #[test]
+    fn the_last_folder_is_reopened_on_a_later_run() {
+        use fits_core::testutil::{write_synthetic, SyntheticSpec};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_synthetic(
+            dir.path(),
+            "light.fits",
+            &SyntheticSpec::new(4, 4, 16),
+            &[1.0; 16],
+        )
+        .unwrap();
+
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::Open(dir.path().to_path_buf()));
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored = FitsViewApp::with_storage(None, Some(&storage));
+        assert_eq!(
+            restored.model.folder.as_ref().map(|f| f.dir.clone()),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_folder_named_on_the_command_line_wins_over_the_saved_one() {
+        use fits_core::testutil::{write_synthetic, SyntheticSpec};
+
+        let saved_dir = tempfile::tempdir().unwrap();
+        let asked_dir = tempfile::tempdir().unwrap();
+        for dir in [saved_dir.path(), asked_dir.path()] {
+            write_synthetic(dir, "light.fits", &SyntheticSpec::new(4, 4, 16), &[1.0; 16]).unwrap();
+        }
+
+        let mut storage = MemoryStorage::default();
+        eframe::set_value(
+            &mut storage,
+            KEY_LAST_FOLDER,
+            &saved_dir.path().display().to_string(),
+        );
+
+        let app = FitsViewApp::with_storage(Some(asked_dir.path().to_path_buf()), Some(&storage));
+        assert_eq!(
+            app.model.folder.as_ref().map(|f| f.dir.clone()),
+            Some(asked_dir.path().to_path_buf()),
+            "the command line should take precedence"
+        );
+    }
+
+    #[test]
+    fn a_saved_folder_that_no_longer_exists_is_skipped_quietly() {
+        let mut storage = MemoryStorage::default();
+        eframe::set_value(
+            &mut storage,
+            KEY_LAST_FOLDER,
+            &"/definitely/not/here".to_string(),
+        );
+
+        let app = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(app.model.folder.is_none());
+        assert!(
+            app.model.error.is_none(),
+            "a missing folder is not an error"
+        );
     }
 
     #[test]
