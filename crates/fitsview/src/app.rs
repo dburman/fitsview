@@ -1741,6 +1741,18 @@ impl Model {
         "No image. Use Open File or Open Folder, or drop a FITS file on the window.".to_string()
     }
 
+    /// Whether a worker still owes an answer.
+    ///
+    /// The interface asks for another frame while this holds. Without it a
+    /// result that lands after the image has been drawn — the stars, which are
+    /// found well after the frame they belong to — sits in its channel until
+    /// something else, a moved mouse or a pressed key, happens to cause a
+    /// repaint.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.loading || self.detector.is_busy()
+    }
+
     /// Cached images and the bytes they occupy.
     ///
     /// Exposed so that the memory bound can be asserted in tests and shown in
@@ -4084,6 +4096,24 @@ mod tests {
         m.handle(Action::ToggleStars);
         assert!(!m.stars_enabled);
         assert!(m.stars.is_none(), "stale stars must not be drawn");
+    }
+
+    #[test]
+    fn the_interface_keeps_drawing_until_the_stars_arrive() {
+        // The bug: stepping through a folder with the arrow keys left the star
+        // figures showing the previous frame's until the mouse was moved.
+        // Nothing asked for another frame once the image itself had been
+        // drawn, so the result sat in its channel unnoticed.
+        let dir = starry_folder();
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleStars);
+        assert!(
+            m.busy(),
+            "a frame must be asked for while the stars are still being found"
+        );
+
+        wait_for_stars(&mut m);
+        assert!(!m.busy(), "and no longer once they have arrived");
     }
 
     #[test]

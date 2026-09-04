@@ -68,6 +68,7 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 ui.label(RichText::new("Stars").strong());
                 ui.label(match field {
                     None => "finding…".to_string(),
+                    Some(f) if f.capped => format!("{} or more", f.count()),
                     Some(f) => f.count().to_string(),
                 });
                 ui.end_row();
@@ -86,6 +87,15 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 });
                 ui.end_row();
 
+                if let Some(scale) = field
+                    .filter(|f| f.threshold_was_raised())
+                    .map(|f| f.threshold_scale)
+                {
+                    ui.label(RichText::new("Threshold").strong());
+                    ui.label(format!("raised {scale:.0}x"));
+                    ui.end_row();
+                }
+
                 if let Some(saturated) = field.map(|f| f.saturated).filter(|s| *s > 0) {
                     ui.label(RichText::new("Saturated").strong());
                     ui.label(saturated.to_string());
@@ -96,7 +106,9 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
             RichText::new(
                 "Width is the full width at half maximum, in pixels; smaller is \
                  sharper. Roundness falls when stars are trailed. Saturated \
-                 stars are counted but not measured.",
+                 stars are counted but not measured. A raised threshold means \
+                 the frame was too bright to search at the setting asked for, \
+                 so only its brighter stars are counted.",
             )
             .weak()
             .small(),

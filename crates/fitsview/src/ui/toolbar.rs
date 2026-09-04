@@ -169,7 +169,7 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 .on_hover_text(
                     "Find the stars and measure them: how many, how wide, how round (Shift+S).\n\
                      Runs in the background and draws a circle on each.\n\
-                     Costs about 60 ms a frame, so it is off unless asked for.",
+                     Costs about 16 ms a frame, so it is off unless asked for.",
                 )
                 .changed()
             {
@@ -179,10 +179,23 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
             if model.stars_enabled {
                 let summary = match &model.stars {
                     None => "finding…".to_string(),
-                    Some(field) => match field.fwhm {
-                        Some(fwhm) => format!("{} stars, {fwhm:.1} px", field.count()),
-                        None => format!("{} stars", field.count()),
-                    },
+                    Some(field) => {
+                        let mut text = match field.fwhm {
+                            Some(fwhm) => format!("{} stars, {fwhm:.1} px", field.count()),
+                            None => format!("{} stars", field.count()),
+                        };
+                        if field.capped {
+                            // "5,000 stars" on two frames that hold twelve and
+                            // twenty thousand would look like a match.
+                            text.insert(0, '\u{2265}');
+                        }
+                        if field.threshold_was_raised() {
+                            // The count cannot be compared with a neighbouring
+                            // frame's, so it must not look as though it can.
+                            text.push_str(" (bright frame)");
+                        }
+                        text
+                    }
                 };
                 // At the end of a row that is already full, this label can be
                 // offered less width than one word, and egui then breaks the
@@ -330,7 +343,9 @@ fn star_settings(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
             ui.horizontal(|ui| {
                 ui.label("Most stars").on_hover_text(
-                    "The brightest this many are kept, so a dense field stays quick.",
+                    "The brightest this many are kept. A count that reaches it \
+                     is shown with a ≥, because it can no longer be compared \
+                     with another frame's.",
                 );
                 ui.add(
                     DragValue::new(&mut params.limit)

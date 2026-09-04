@@ -334,6 +334,9 @@ Needs a real session, ideally one with a few frames spoiled by cloud or wind.
 - [ ] The gear beside the box is greyed out until detection is on. Opening it
       and lowering the threshold finds more stars; **Reset** returns to the
       original count.
+- [ ] Step through the folder with the arrow keys and do not touch the mouse.
+      The circles and the figures follow each frame on their own; they never
+      wait for the pointer to move before catching up.
 - [ ] Untick the box: the circles go, and the figures leave the metadata panel.
 - [ ] Tick it, quit, and reopen: it is still ticked, and detection starts on
       the frame that reopens.

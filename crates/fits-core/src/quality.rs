@@ -90,7 +90,39 @@ pub fn measure(image: &FitsImage) -> Quality {
 
 /// Up to [`MAX_SAMPLES`] finite samples, evenly spread through the frame.
 fn subsample(image: &FitsImage) -> Vec<f64> {
-    let stride = (image.data.len() / MAX_SAMPLES).max(1);
+    sample_evenly(image, MAX_SAMPLES)
+}
+
+/// Samples for a threshold rather than for comparing one frame with another.
+///
+/// A quarter of the samples: the median of 250,000 values sits within about a
+/// four-hundredth of a deviation of the median of a million, which no
+/// threshold can tell apart, and the medians are most of the cost of
+/// [`measure`].
+const THRESHOLD_SAMPLES: usize = 250_000;
+
+/// The sky background and its spread, without the sharpness figure.
+///
+/// What star detection needs. It does not use sharpness, and it thresholds
+/// against the background rather than comparing it with another frame, so it
+/// can take the cheaper estimate. Use [`measure`] for a figure that will be
+/// shown or compared.
+#[must_use]
+pub fn background_and_noise(image: &FitsImage) -> (f64, f64) {
+    if image.data.is_empty() || image.width == 0 {
+        return (0.0, 0.0);
+    }
+    let sample = sample_evenly(image, THRESHOLD_SAMPLES);
+    if sample.is_empty() {
+        return (0.0, 0.0);
+    }
+    let background = measure_background(&sample);
+    (background.median, background.sigma)
+}
+
+/// Up to `wanted` finite samples, evenly spread through the frame.
+fn sample_evenly(image: &FitsImage, wanted: usize) -> Vec<f64> {
+    let stride = (image.data.len() / wanted).max(1);
     image
         .data
         .iter()

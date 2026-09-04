@@ -28,7 +28,9 @@ pub type Lut = [u8; LUT_LEN];
 
 /// Scales the median absolute deviation to a standard-deviation equivalent for
 /// normally distributed data.
-const MAD_TO_SIGMA: f64 = 1.482_602_218_505_602;
+/// Turns a median absolute deviation into a standard deviation, for the
+/// normal distribution the sky background approximates.
+pub const MAD_TO_SIGMA: f64 = 1.482_602_218_505_602;
 
 /// How the stretch is chosen.
 #[derive(Debug, Clone, Copy, PartialEq)]

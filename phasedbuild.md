@@ -13,7 +13,7 @@ For what the application does and how to build it, see
 
 ## 0. Product Summary
 
-**Status:** Phases 0 to 15 complete. Phases 0 to 9 delivered the application as
+**Status:** Phases 0 to 16 complete. Phases 0 to 9 delivered the application as
 originally specified; 10 to 15 improved its speed and added what turns a viewer
 into a culling tool, ending with the star measurements astrophotographers
 actually judge frames by.
@@ -40,6 +40,7 @@ been run on Linux or Windows. See section 10.
 | 13 — Frame quality measures | Done |
 | 14 — Readouts | Done |
 | 15 — Star detection | Done |
+| 16 — Faster star detection | Done |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 9
 deliver the requirements below, and phases 10 onwards improve on them.
@@ -2552,8 +2553,9 @@ is off unless asked for, and the Phase 3 navigation timing tests still pass,
 which is what proves it never ran on the UI thread.
 
 **Measured:** **64 ms** for 3,000 stars on a 24 MP frame (`stars/detect on
-24 MP`). That is twelve times the cost of decoding the frame, which is why the
-toggle exists rather than the measurement simply always being taken.
+24 MP`) as first written, brought to **16 ms** afterwards — see Phase 16. That
+is still three times the cost of decoding the frame, which is why the toggle
+exists rather than the measurement simply always being taken.
 
 #### Two things that went wrong
 
@@ -2576,9 +2578,101 @@ the thing actually worth guaranteeing. Timing assertions belong in benchmarks.
 
 Star width is not a sort key in the file list. Every other sort key is measured
 as the folder loads, at about 1 ms a frame; adding detection there would put
-64 ms on every file in the folder for an ordering the sharpness key already
-approximates. Sorting by width would need the measurement cached to disk beside
-the keep flags, which is a phase of its own.
+another 16 ms on every file in the folder for an ordering the sharpness key
+already approximates. Sorting by width would need the measurement cached to
+disk beside the keep flags, which is a phase of its own.
+
+---
+
+## Phase 16 — Faster Star Detection
+
+Phase 15 shipped at 64 ms for a 24 MP frame, which was fast enough to be
+useful and slow enough to need a toggle. This phase asked where that time
+actually went, rather than guessing.
+
+### What the measurements said
+
+Timing the parts, rather than reasoning about them, moved the target twice:
+
+| Part | Before |
+|------|--------|
+| Estimating background and noise | 9.5 ms |
+| Thresholding 24 M pixels | 11.1 ms |
+| Grouping bright pixels into regions | 5.9 ms |
+| Measuring each star | 16.4 ms |
+| **Total** | **63.9 ms** |
+
+The comment above the grouping code claimed the threshold pass was the
+expensive part and that it parallelised over rows. It was neither: it was a
+serial loop, and it was not even the largest cost. Measuring the stars was.
+
+### What changed
+
+**Each star is measured on its own thread.** Stars share nothing — each is
+measured from its own window — so this is the one part of the work that divides
+perfectly. The cheap rejections (area, edge, elongation) now happen in one pass
+first, so a thread is only ever spent on a region that could be a star.
+16.4 ms → 3.5 ms.
+
+**The threshold pass parallelises over rows**, as its comment always claimed.
+It counts first and collects second: counting is the same scan without the
+allocation, and it keeps the bail-out on a mostly-bright frame from building a
+list of millions of indices before noticing it should not.
+11.1 ms → 4.1 ms.
+
+**Grouping no longer hashes anything.** Bright pixel indices ascend, so the
+previous row can be walked in step with the current one, and a neighbour costs
+a couple of comparisons instead of a hash lookup. Collecting the regions is a
+counting sort over the roots for the same reason. 5.9 ms → 5.5 ms, which is
+the smallest of the three wins but brought something better with it: regions
+now come out in a fixed order, so **the same frame always yields the same
+stars**. Under a hash map, which stars survived the limit could change between
+runs of the same build.
+
+**Detection takes the cheaper background estimate.** It needs a threshold, not
+a figure to compare with another frame, and it never uses the sharpness number
+at all. A quarter of the samples puts the median within about a four-hundredth
+of a deviation, which no threshold can tell apart. 9.5 ms → 4.5 ms.
+`quality::measure` is untouched, so the numbers shown in the interface and used
+for sorting are exactly as they were.
+
+**Result: 63.9 ms → 15.8 ms**, a little under four times faster.
+
+### On proving the rewrite equivalent
+
+Two of these changes replaced an obvious algorithm with a non-obvious one, so
+the tests had to grow accordingly:
+
+- `grouping_agrees_with_a_flood_fill` runs the new grouping and a plain flood
+  fill over forty random patterns and asserts they partition identically.
+- `a_region_does_not_wrap_around_the_end_of_a_row` pins the specific error the
+  index arithmetic invites: the last pixel of one row and the first of the next
+  are adjacent in memory and nowhere near each other on the sky.
+- `the_same_frame_always_gives_the_same_stars` asserts the determinism the
+  counting sort brought, with the limit deliberately set low enough to bite.
+
+Both grouping tests were checked by breaking the guard on purpose and watching
+them fail. A test that has never failed has not been shown to test anything.
+
+### Acceptance criteria
+
+- [x] Detection on a 24 MP frame is at least twice as fast, measured with the
+      same benchmark: 63.9 ms → 15.8 ms.
+- [x] Every Phase 15 test still passes, unchanged.
+- [x] The new grouping is checked against a flood fill on random input.
+- [x] Repeated runs on one frame give identical stars.
+- [x] `quality::measure`, which the file list sorts by, is not altered.
+- [x] The figures quoted in the interface and the README are corrected to
+      match.
+
+### Not done
+
+`quality::measure` still runs on the frame inside `detect`, even though the
+loader has already measured that file. Reusing it would save another 4.5 ms,
+but the loader measures the **raw** frame while detection may run on a
+calibrated one, whose background is not the same number. Passing the wrong
+background would shift every threshold. It needs the measurement to be tracked
+per calibration state, which is more bookkeeping than the saving justifies.
 
 ---
 

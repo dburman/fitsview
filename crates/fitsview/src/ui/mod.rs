@@ -27,6 +27,7 @@ pub struct HistogramView {
     /// The stretch in force, for marking the black point and midtone.
     pub stretch: Option<fits_core::Stretch>,
 }
+use fits_core::stars::DetectionParams;
 use fits_core::stretch::StretchParams;
 
 use crate::app::{Action, Model};
@@ -42,6 +43,9 @@ const KEY_SHOW_FILELIST: &str = "show_filelist";
 const KEY_SHOW_HEADER: &str = "show_header";
 const KEY_SHOW_HISTOGRAM: &str = "show_histogram";
 const KEY_STARS: &str = "stars_enabled";
+const KEY_STAR_THRESHOLD: &str = "star_threshold";
+const KEY_STAR_MINIMUM_AREA: &str = "star_minimum_area";
+const KEY_STAR_LIMIT: &str = "star_limit";
 
 /// The `eframe` application: a model, a cached texture, and the glue between
 /// them.
@@ -115,6 +119,19 @@ impl FitsViewApp {
         app.model.show_filelist = eframe::get_value(storage, KEY_SHOW_FILELIST).unwrap_or(true);
         app.model.show_header = eframe::get_value(storage, KEY_SHOW_HEADER).unwrap_or(true);
         app.model.show_histogram = eframe::get_value(storage, KEY_SHOW_HISTOGRAM).unwrap_or(false);
+        app.model.stars_enabled = eframe::get_value(storage, KEY_STARS).unwrap_or(false);
+        // A rich field and a sparse one want different settings, and finding
+        // the ones that suit a camera and a sky takes several frames. Losing
+        // them at every restart would make that work worthless.
+        let star_defaults = DetectionParams::default();
+        app.model.star_params = DetectionParams {
+            threshold: eframe::get_value(storage, KEY_STAR_THRESHOLD)
+                .unwrap_or(star_defaults.threshold),
+            minimum_area: eframe::get_value(storage, KEY_STAR_MINIMUM_AREA)
+                .unwrap_or(star_defaults.minimum_area),
+            limit: eframe::get_value(storage, KEY_STAR_LIMIT).unwrap_or(star_defaults.limit),
+            ..star_defaults
+        };
 
         // Reopen the folder from last time, but only when the command line did
         // not name something, and only if it is still there.
@@ -308,6 +325,17 @@ impl eframe::App for FitsViewApp {
         eframe::set_value(storage, KEY_SHOW_HEADER, &self.model.show_header);
         eframe::set_value(storage, KEY_SHOW_HISTOGRAM, &self.model.show_histogram);
         eframe::set_value(storage, KEY_STARS, &self.model.stars_enabled);
+        eframe::set_value(
+            storage,
+            KEY_STAR_THRESHOLD,
+            &self.model.star_params.threshold,
+        );
+        eframe::set_value(
+            storage,
+            KEY_STAR_MINIMUM_AREA,
+            &self.model.star_params.minimum_area,
+        );
+        eframe::set_value(storage, KEY_STAR_LIMIT, &self.model.star_params.limit);
         if let Some(folder) = self.model.folder.as_ref() {
             eframe::set_value(storage, KEY_LAST_FOLDER, &folder.dir.display().to_string());
         }
@@ -319,9 +347,9 @@ impl eframe::App for FitsViewApp {
         if self.model.poll() {
             ui.ctx().request_repaint();
         }
-        // While a decode is outstanding, keep asking for frames so the result
+        // While any worker is outstanding, keep asking for frames so the result
         // appears as soon as it lands rather than on the next input event.
-        if self.model.loading {
+        if self.model.busy() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(16));
         }
@@ -394,6 +422,41 @@ mod tests {
             self.values.remove(key);
         }
         fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn the_star_settings_survive_a_save_and_restore() {
+        // The toggle was written and never read back: it saved, and restored
+        // to off every time. Nothing tested it, and the phase that added it
+        // claimed it persisted.
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::ToggleStars);
+        app.model.handle(Action::SetStarParams(DetectionParams {
+            threshold: 10.0,
+            minimum_area: 6,
+            limit: 10_000,
+            ..DetectionParams::default()
+        }));
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(restored.model.stars_enabled, "the toggle must come back on");
+        assert!(
+            (restored.model.star_params.threshold - 10.0).abs() < f64::EPSILON,
+            "threshold came back as {}",
+            restored.model.star_params.threshold
+        );
+        assert_eq!(restored.model.star_params.minimum_area, 6);
+        assert_eq!(restored.model.star_params.limit, 10_000);
+    }
+
+    #[test]
+    fn star_settings_start_at_their_defaults_when_nothing_was_saved() {
+        let app = FitsViewApp::with_storage(None, Some(&MemoryStorage::default()));
+        assert!(!app.model.stars_enabled, "detection is off until asked for");
+        assert_eq!(app.model.star_params, DetectionParams::default());
     }
 
     #[test]

@@ -10,9 +10,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod background;
 pub mod calib;
 pub mod debayer;
 pub mod error;
+pub mod filter;
 pub mod header;
 pub mod histogram;
 pub mod image;

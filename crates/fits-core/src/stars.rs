@@ -11,10 +11,11 @@
 //! galaxy or a star cut in half by the frame edge is what makes the numbers
 //! worth trusting.
 
-use std::collections::HashMap;
+use rayon::prelude::*;
 
+use crate::background::BackgroundMap;
+use crate::filter;
 use crate::image::FitsImage;
-use crate::quality;
 
 /// Turns a Gaussian's standard deviation into a full width at half maximum.
 const FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949;
@@ -47,8 +48,19 @@ pub struct DetectionParams {
     /// two or three, and that is a measurement worth reporting rather than a
     /// detection to discard.
     pub maximum_elongation: f64,
-    /// Most stars to measure, so a rich field cannot cost unbounded time.
+    /// Most stars to keep: the brightest this many.
+    ///
+    /// Applied after measuring, so that rejected regions do not eat into it
+    /// and the stars kept are spread over the whole frame rather than taken
+    /// from wherever the scan happened to begin.
     pub limit: usize,
+    /// Width of the blur applied before thresholding, in pixels.
+    ///
+    /// The matched filter. About the size of a star is right: it adds a star's
+    /// own pixels together while averaging the noise down, so the threshold
+    /// can be stated in deviations and mean something. Zero turns it off,
+    /// which makes detection cheaper and much more sensitive to noise.
+    pub smoothing: f64,
 }
 
 impl Default for DetectionParams {
@@ -58,17 +70,44 @@ impl Default for DetectionParams {
             minimum_area: 4,
             maximum_area: 2_000,
             maximum_elongation: 5.0,
-            limit: 5_000,
+            // High enough that it does not bind on an ordinary frame: a
+            // 61-megapixel broadband exposure holds about ten thousand stars,
+            // and a count that saturates cannot be compared with the next
+            // frame's, which is most of what the count is for.
+            limit: 20_000,
+            smoothing: 1.2,
         }
     }
 }
 
-/// A fraction of the frame above threshold beyond which it is not a star field.
+/// A fraction of the frame above threshold beyond which grouping is not worth
+/// attempting at that threshold.
 ///
-/// A flat, a badly overexposed frame or one full of cloud can put most of its
-/// pixels above any threshold. Labelling those would cost a great deal and
-/// answer nothing.
-const MAX_BRIGHT_FRACTION: f64 = 0.10;
+/// This is a guard on cost, not a judgement about the frame. A flat, a badly
+/// overexposed frame or one full of cloud can put most of its pixels over any
+/// threshold, and joining ten million of them into regions takes seconds and
+/// answers nothing.
+///
+/// A rich broadband frame can cross it honestly: a five-minute luminance
+/// exposure of a Milky Way field has nebulosity and thousands of stars, and a
+/// fifth of it stands above five deviations. Such a frame is not a failure, so
+/// the threshold is raised until the work is bounded rather than the frame
+/// being reported as empty.
+const MAX_BRIGHT_FRACTION: f64 = 0.20;
+
+/// Most regions to measure, however many the frame holds.
+///
+/// A guard on cost rather than a choice about the answer: measuring is
+/// parallel and cheap per star, but a frame of pure gradient can produce
+/// millions of regions, and there is no sense measuring those.
+const MAX_CANDIDATES: usize = 200_000;
+
+/// How far the threshold may be raised when a frame is too bright to group.
+///
+/// Eight times the asked-for threshold is enough for the brightest real frame
+/// tested and still finite; past that the frame is a flat or a fog, and there
+/// is nothing to find.
+const MAX_THRESHOLD_SCALE: f64 = 8.0;
 
 /// One detected star.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -88,7 +127,7 @@ pub struct Star {
 }
 
 /// What a frame's stars say about it.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StarField {
     /// Every star that survived the filters.
     pub stars: Vec<Star>,
@@ -100,9 +139,44 @@ pub struct StarField {
     pub roundness: Option<f64>,
     /// How many ran out of range.
     pub saturated: usize,
+    /// Whether more stars were found than the limit allowed, so that only the
+    /// brightest are reported.
+    ///
+    /// A capped count says "at least this many" and cannot be compared with a
+    /// neighbouring frame's, which is what counts are mostly used for.
+    pub capped: bool,
+    /// What the threshold had to be multiplied by to make the frame
+    /// searchable.
+    ///
+    /// One for almost every frame. Above one when the frame was so bright that
+    /// grouping at the asked-for threshold would have cost seconds — a rich
+    /// broadband exposure does this honestly — and the figures then describe
+    /// the brighter stars only. Worth saying rather than hiding, because it
+    /// explains a count that cannot be compared with a neighbouring frame's.
+    pub threshold_scale: f64,
+}
+
+impl Default for StarField {
+    /// Nothing found, at the threshold that was asked for.
+    fn default() -> Self {
+        Self {
+            stars: Vec::new(),
+            fwhm: None,
+            roundness: None,
+            saturated: 0,
+            threshold_scale: 1.0,
+            capped: false,
+        }
+    }
 }
 
 impl StarField {
+    /// Whether the frame was too bright to search at the threshold asked for.
+    #[must_use]
+    pub fn threshold_was_raised(&self) -> bool {
+        self.threshold_scale > 1.0
+    }
+
     /// How many stars were found.
     #[must_use]
     pub fn count(&self) -> usize {
@@ -126,44 +200,117 @@ const MINIMUM_FOR_A_MEDIAN: usize = 3;
 /// would otherwise be found four times, once per filter site.
 #[must_use]
 pub fn detect(image: &FitsImage, params: &DetectionParams) -> StarField {
-    if image.width < 3 || image.height < 3 || image.channels != 1 {
+    if image.width < 3 || image.height < 3 {
+        return StarField::default();
+    }
+    // A colour image — a stacked result, or a frame from a camera that writes
+    // three planes — is searched on its luminance. Running on one plane would
+    // throw away two thirds of the signal, and running on all three would find
+    // every star three times.
+    if image.channels == 3 {
+        let Some(grey) = luminance(image) else {
+            return StarField::default();
+        };
+        return detect(&grey, params);
+    }
+    if image.channels != 1 {
         return StarField::default();
     }
 
-    let measured = quality::measure(image);
-    if measured.noise <= 0.0 {
+    // The frame the threshold is applied to: blurred, so that a star's pixels
+    // are added together and the noise is averaged down. Stars are measured on
+    // the original further below, because a blur widens whatever it touches.
+    let filtered = if params.smoothing > 0.0 {
+        Some(filter::gaussian_blur(image, params.smoothing))
+    } else {
+        None
+    };
+    let searched = match filtered.as_ref() {
+        Some(data) => &FitsImage {
+            width: image.width,
+            height: image.height,
+            channels: 1,
+            data: data.clone(),
+            header: image.header.clone(),
+            min: image.min,
+            max: image.max,
+        },
+        None => image,
+    };
+
+    // The background tile by tile rather than once for the frame, so that a
+    // light pollution gradient does not put one side of the frame over the
+    // threshold everywhere at once.
+    //
+    // Measured on the frame as it came, never on the blurred one: see
+    // `filter::noise_attenuation`. A normalised blur leaves the background
+    // where it was and shrinks the noise by a known factor, so the threshold
+    // is scaled by that factor instead of being measured again.
+    let sky = BackgroundMap::measure_level_and_noise(searched, image);
+    let (_, noise) = sky.typical();
+    if noise <= 0.0 {
         // No noise means no scale to threshold against.
         return StarField::default();
     }
-    let threshold = measured.background + params.threshold * measured.noise;
+    let base = params.threshold * filter::noise_attenuation(params.smoothing);
 
-    let Some(bright) = bright_pixels(image, threshold) else {
-        return StarField::default();
+    // A frame too bright to group at the asked-for threshold is searched at a
+    // higher one rather than reported as empty. Each attempt costs only the
+    // counting pass, which stops before anything is collected.
+    let mut scale = 1.0f64;
+    let bright = loop {
+        match bright_pixels(searched, &sky, base * scale) {
+            Some(bright) => break bright,
+            None if scale < MAX_THRESHOLD_SCALE => scale *= 2.0,
+            None => {
+                log::debug!("nothing to find: bright at every threshold tried");
+                return StarField::default();
+            }
+        }
     };
     let regions = group(&bright, image.width);
 
-    let mut stars: Vec<Star> = Vec::new();
-    for pixels in regions.values() {
-        if stars.len() >= params.limit {
-            break;
-        }
-        if pixels.len() < params.minimum_area || pixels.len() > params.maximum_area {
-            continue;
-        }
-        if touches_edge(pixels, image.width, image.height) {
-            // Half a star has a shape that is a lie.
-            continue;
-        }
-        if elongation(pixels, image.width) > params.maximum_elongation {
-            // A line, not a point: a satellite or an aeroplane.
-            continue;
-        }
-        if let Some(star) = measure_star(image, pixels, measured.background) {
-            stars.push(star);
-        }
+    // The cheap rejections first, in one pass, so that the expensive
+    // measurement is only ever done on regions that could be stars. Taking
+    // them in order keeps the result the same from one run to the next when
+    // the limit bites.
+    let candidates: Vec<&[usize]> = regions
+        .iter()
+        .filter(|pixels| {
+            pixels.len() >= params.minimum_area
+                && pixels.len() <= params.maximum_area
+                // Half a star has a shape that is a lie.
+                && !touches_edge(pixels, image.width, image.height)
+                // A line, not a point: a satellite or an aeroplane.
+                && elongation(pixels, image.width) <= params.maximum_elongation
+        })
+        .take(MAX_CANDIDATES)
+        .collect();
+
+    // Each star is measured from its own window and nothing is shared between
+    // them, so this is the one part of the work that divides perfectly.
+    let mut stars: Vec<Star> = candidates
+        .par_iter()
+        .filter_map(|pixels| {
+            // The background under this star, not the frame's average: on a
+            // frame with a gradient they differ by more than a faint star is
+            // worth.
+            let first = pixels[0];
+            let (local, _) = sky.at(first % image.width, first / image.width);
+            measure_star(image, pixels, f64::from(local))
+        })
+        .collect();
+
+    // The brightest, when there are more than asked for. Sorting on flux
+    // rather than stopping at the first `limit` found is what keeps the answer
+    // from describing one corner of the frame.
+    let capped = stars.len() > params.limit;
+    if capped {
+        stars.sort_unstable_by(|a, b| b.flux.total_cmp(&a.flux));
+        stars.truncate(params.limit);
     }
 
-    summarise(stars)
+    summarise(stars, scale, capped)
 }
 
 /// Finds and measures the stars in a one-shot colour mosaic.
@@ -199,6 +346,51 @@ pub fn detect_mosaic(
     field
 }
 
+/// One plane holding the brightness of a three-plane colour image.
+///
+/// The plain mean of the three, not a weighted luminance: the weights that
+/// suit human vision are wrong for a telescope, where a red star's photons
+/// count as much as a green one's.
+fn luminance(image: &FitsImage) -> Option<FitsImage> {
+    let pixels = image.width.checked_mul(image.height)?;
+    if image.data.len() < pixels * 3 {
+        return None;
+    }
+    let (red, green, blue) = (
+        &image.data[0..pixels],
+        &image.data[pixels..pixels * 2],
+        &image.data[pixels * 2..pixels * 3],
+    );
+
+    let mut data = vec![f32::NAN; pixels];
+    data.par_iter_mut()
+        .zip(red.par_iter().zip(green).zip(blue))
+        .for_each(|(out, ((r, g), b))| {
+            let mut total = 0.0f32;
+            let mut count = 0u8;
+            for value in [*r, *g, *b] {
+                if value.is_finite() {
+                    total += value;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                *out = total / f32::from(count);
+            }
+        });
+
+    let (min, max) = crate::image::finite_min_max(&data);
+    Some(FitsImage {
+        width: image.width,
+        height: image.height,
+        channels: 1,
+        data,
+        header: image.header.clone(),
+        min,
+        max,
+    })
+}
+
 /// A half-size image of the green sites of a mosaic.
 ///
 /// Each 2x2 tile has two greens; averaging them is both a reasonable estimate
@@ -214,8 +406,10 @@ fn green_channel(image: &FitsImage, pattern: crate::debayer::BayerPattern) -> Op
     }
 
     let mut data = vec![f32::NAN; width * height];
-    for y in 0..height {
-        for x in 0..width {
+    // A row of the half-size image reads two rows of the mosaic, and no row
+    // depends on another.
+    data.par_chunks_mut(width).enumerate().for_each(|(y, out)| {
+        for (x, slot) in out.iter_mut().enumerate() {
             let mut total = 0.0f64;
             let mut count = 0u32;
             for dy in 0..2 {
@@ -234,11 +428,11 @@ fn green_channel(image: &FitsImage, pattern: crate::debayer::BayerPattern) -> Op
             if count > 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 {
-                    data[y * width + x] = (total / f64::from(count)) as f32;
+                    *slot = (total / f64::from(count)) as f32;
                 }
             }
         }
-    }
+    });
 
     let (min, max) = crate::image::finite_min_max(&data);
     Some(FitsImage {
@@ -256,10 +450,7 @@ fn green_channel(image: &FitsImage, pattern: crate::debayer::BayerPattern) -> Op
 ///
 /// Returns `None` when so much of the frame is bright that it cannot be a star
 /// field, which saves labelling a flat or a cloud-ruined frame pixel by pixel.
-fn bright_pixels(image: &FitsImage, threshold: f64) -> Option<Vec<usize>> {
-    #[allow(clippy::cast_possible_truncation)]
-    let threshold = threshold as f32;
-    let mut bright = Vec::new();
+fn bright_pixels(image: &FitsImage, sky: &BackgroundMap, deviations: f64) -> Option<Vec<usize>> {
     let cap = {
         #[allow(
             clippy::cast_precision_loss,
@@ -271,60 +462,163 @@ fn bright_pixels(image: &FitsImage, threshold: f64) -> Option<Vec<usize>> {
         }
     };
 
-    for (index, value) in image.data.iter().enumerate() {
-        if value.is_finite() && *value > threshold {
-            bright.push(index);
-            if bright.len() > cap {
-                log::debug!(
-                    "more than {MAX_BRIGHT_FRACTION} of the frame is bright; not a star field"
-                );
-                return None;
-            }
-        }
+    // Counted before anything is collected. Counting is the same scan without
+    // the allocation, and it keeps the bail-out honest: a flat, or a frame
+    // full of cloud, can put millions of pixels over any threshold, and
+    // building that list before noticing would cost more memory than the
+    // image.
+    let width = image.width.max(1);
+    let bright_count: usize = image
+        .data
+        .par_chunks(width)
+        .enumerate()
+        .map(|(y, row)| {
+            let mut thresholds = Vec::new();
+            sky.row_thresholds(y, deviations, row.len(), &mut thresholds);
+            row.iter()
+                .zip(&thresholds)
+                .filter(|(v, t)| v.is_finite() && *v > t)
+                .count()
+        })
+        .sum();
+    if bright_count > cap {
+        log::debug!("more than {MAX_BRIGHT_FRACTION} of the frame is bright; not a star field");
+        return None;
     }
-    Some(bright)
+
+    // Rayon's `collect` keeps the order of an ordered iterator, and the
+    // grouping below depends on the indices ascending.
+    Some(
+        image
+            .data
+            .par_chunks(width)
+            .enumerate()
+            .flat_map_iter(move |(y, row)| {
+                let mut thresholds = Vec::new();
+                sky.row_thresholds(y, deviations, row.len(), &mut thresholds);
+                row.iter()
+                    .zip(thresholds)
+                    .enumerate()
+                    .filter(|(_, (v, t))| v.is_finite() && **v > *t)
+                    .map(move |(x, _)| y * width + x)
+            })
+            .collect(),
+    )
+}
+
+/// Bright pixels arranged so that each region's own are next to each other.
+///
+/// One allocation rather than a vector per region, which matters when a rich
+/// field holds thousands of them.
+struct Regions {
+    /// Every bright pixel, region by region.
+    order: Vec<usize>,
+    /// Where each region begins in `order`, with a final entry at the end.
+    starts: Vec<usize>,
+}
+
+impl Regions {
+    /// Each region's pixels, in ascending index order.
+    fn iter(&self) -> impl Iterator<Item = &[usize]> {
+        self.starts.windows(2).map(|w| &self.order[w[0]..w[1]])
+    }
 }
 
 /// Groups bright pixels into connected regions, eight-connected.
 ///
 /// Works over the sparse set rather than the whole frame: a star field puts a
 /// fraction of a percent of its pixels above threshold, so this is thousands of
-/// lookups rather than tens of millions.
-fn group(bright: &[usize], width: usize) -> HashMap<usize, Vec<usize>> {
-    let position: HashMap<usize, usize> = bright
-        .iter()
-        .enumerate()
-        .map(|(slot, index)| (*index, slot))
-        .collect();
+/// steps rather than tens of millions.
+///
+/// The neighbours of a pixel are found by walking the previous row in step with
+/// the current one rather than by looking each one up in a map. Both are
+/// sorted, so the walk never goes backwards, and the pass costs a couple of
+/// comparisons per pixel instead of a hash. Collecting the results is a
+/// counting sort over the roots for the same reason: the roots are small
+/// integers, so nothing needs hashing at all.
+fn group(bright: &[usize], width: usize) -> Regions {
+    let n = bright.len();
+    let mut parent: Vec<usize> = (0..n).collect();
 
-    let mut parent: Vec<usize> = (0..bright.len()).collect();
-    for (slot, index) in bright.iter().enumerate() {
-        let (x, y) = (index % width, index / width);
-        // Only the neighbours already visited, which is enough to connect
-        // everything by the time the scan finishes.
-        for (dx, dy) in [(-1i64, -1i64), (0, -1), (1, -1), (-1, 0)] {
-            let (nx, ny) = (x as i64 + dx, y as i64 + dy);
-            if nx < 0 || ny < 0 {
+    // Rows are contiguous runs, because the indices ascend.
+    let mut row_start = 0usize;
+    let mut previous: std::ops::Range<usize> = 0..0;
+    let mut previous_row: Option<usize> = None;
+
+    while row_start < n {
+        let y = bright[row_start] / width;
+        let mut row_end = row_start + 1;
+        while row_end < n && bright[row_end] < (y + 1) * width {
+            row_end += 1;
+        }
+
+        // The first row has nothing above it, and `None == None` would say it
+        // did.
+        let above = y > 0 && previous_row == Some(y - 1);
+        let mut cursor = previous.start;
+        for slot in row_start..row_end {
+            let index = bright[slot];
+            let x = index - y * width;
+
+            // The pixel to the left, when there is one and it really is to the
+            // left rather than the last pixel of the row above.
+            if x > 0 && slot > row_start && bright[slot - 1] + 1 == index {
+                union(&mut parent, slot, slot - 1);
+            }
+
+            if !above {
                 continue;
             }
-            #[allow(clippy::cast_sign_loss)]
-            let neighbour = ny as usize * width + nx as usize;
-            #[allow(clippy::cast_sign_loss)]
-            if nx as usize >= width {
-                continue;
+            // The three above, clamped so that column 0 is never joined to the
+            // last column of the row above.
+            let lo = index - width - usize::from(x > 0);
+            let hi = index - width + usize::from(x + 1 < width);
+            while cursor < previous.end && bright[cursor] < lo {
+                cursor += 1;
             }
-            if let Some(other) = position.get(&neighbour) {
-                union(&mut parent, slot, *other);
+            let mut peek = cursor;
+            while peek < previous.end && bright[peek] <= hi {
+                union(&mut parent, slot, peek);
+                peek += 1;
             }
         }
+
+        previous = row_start..row_end;
+        previous_row = Some(y);
+        row_start = row_end;
     }
 
-    let mut regions: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (slot, index) in bright.iter().enumerate() {
-        let root = find(&mut parent, slot);
-        regions.entry(root).or_default().push(*index);
+    // A counting sort over the roots. Regions come out ordered by their first
+    // pixel, so the same frame always yields the same stars in the same order,
+    // which a hash map's iteration order did not guarantee.
+    let mut count = vec![0usize; n];
+    let roots: Vec<usize> = (0..n)
+        .map(|slot| {
+            let root = find(&mut parent, slot);
+            count[root] += 1;
+            root
+        })
+        .collect();
+
+    let mut starts = Vec::new();
+    let mut offset = vec![0usize; n];
+    let mut total = 0usize;
+    for (root, size) in count.iter().enumerate() {
+        if *size > 0 {
+            offset[root] = total;
+            starts.push(total);
+            total += size;
+        }
     }
-    regions
+    starts.push(total);
+
+    let mut order = vec![0usize; n];
+    for (slot, root) in roots.iter().enumerate() {
+        order[offset[*root]] = bright[slot];
+        offset[*root] += 1;
+    }
+
+    Regions { order, starts }
 }
 
 /// Union-find root, with path compression.
@@ -380,6 +674,7 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
     let mut sum_x = 0.0f64;
     let mut sum_y = 0.0f64;
     let mut peak = f64::NEG_INFINITY;
+    let mut peak_at = 0usize;
     let mut at_peak = 0usize;
 
     for index in pixels {
@@ -394,6 +689,7 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
 
         if value > peak {
             peak = value;
+            peak_at = *index;
             at_peak = 1;
         } else if (value - peak).abs() < f64::EPSILON {
             at_peak += 1;
@@ -408,6 +704,20 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
     // A flat top means the star ran out of range: its width is understated and
     // its centroid unreliable, so it is counted but not measured.
     let saturated = at_peak >= 3;
+
+    // How much the brightest pixel stands above the ring around it. A star is
+    // spread across many pixels by the atmosphere and the optics, so its
+    // neighbours are nearly as bright as its centre; a hot pixel or a cosmic
+    // ray has everything in one pixel and almost nothing beside it.
+    //
+    // The blur that makes faint stars detectable also spreads a single hot
+    // pixel into a blob several pixels across, which is enough to pass a test
+    // on area alone. On a frame taken with the cover on, that turned tens of
+    // thousands of hot pixels into reported stars. This is measured on the
+    // frame as it came, where a spike is still a spike.
+    if !saturated && ring_fraction(image, peak_at, background) < MINIMUM_RING_FRACTION {
+        return None;
+    }
 
     // A window wide enough to hold the wings, from the region's own extent.
     #[allow(
@@ -452,6 +762,58 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
     })
 }
 
+/// Least of its peak that a star's immediate neighbours must carry.
+///
+/// The atmosphere and the optics spread a star over many pixels, so the ring
+/// around its centre holds nearly as much as the centre does — nine tenths for
+/// a well sampled star. A hot pixel or a cosmic ray has nothing beside it.
+///
+/// Stated as the ring over the peak rather than the peak over the ring, which
+/// is the same test but for the arithmetic: the peak of a detected star is a
+/// large, well determined number, while the ring of a faint one sits close to
+/// the background, and dividing by it turned ordinary noise into an enormous
+/// ratio. That rejected the faint stars the matched filter exists to find —
+/// nine detections in ten on a narrowband frame.
+const MINIMUM_RING_FRACTION: f64 = 0.3;
+
+/// How much of the peak the eight pixels around it carry, above the
+/// background. Near one for anything the sky produced, near zero for a defect.
+fn ring_fraction(image: &FitsImage, peak_at: usize, background: f64) -> f64 {
+    let (width, height) = (image.width, image.height);
+    let (x, y) = (peak_at % width, peak_at / width);
+    if x == 0 || y == 0 || x + 1 >= width || y + 1 >= height {
+        // Nothing to compare against; the edge filter has this case anyway.
+        return 1.0;
+    }
+
+    let mut total = 0.0f64;
+    let mut count = 0u32;
+    for dy in [-1i64, 0, 1] {
+        for dx in [-1i64, 0, 1] {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            let index = ((y as i64 + dy) as usize) * width + (x as i64 + dx) as usize;
+            let value = f64::from(image.data[index]) - background;
+            if value.is_finite() {
+                total += value;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return 1.0;
+    }
+
+    let centre = f64::from(image.data[peak_at]) - background;
+    if centre <= 0.0 {
+        // Not above the background at all on the frame as it came.
+        return 0.0;
+    }
+    (total / f64::from(count)) / centre
+}
+
 /// Second central moments of the background-subtracted signal about a centre.
 fn moments(
     image: &FitsImage,
@@ -485,7 +847,7 @@ fn moments(
 }
 
 /// Turns a list of stars into the summary a frame is judged by.
-fn summarise(stars: Vec<Star>) -> StarField {
+fn summarise(stars: Vec<Star>, threshold_scale: f64, capped: bool) -> StarField {
     let saturated = stars.iter().filter(|s| s.saturated).count();
 
     let mut widths: Vec<f64> = stars
@@ -514,6 +876,8 @@ fn summarise(stars: Vec<Star>) -> StarField {
         fwhm: median(&mut widths),
         roundness: median(&mut roundnesses),
         saturated,
+        threshold_scale,
+        capped,
         stars,
     }
 }
@@ -596,6 +960,112 @@ mod tests {
             y += spacing;
         }
         pixels
+    }
+
+    /// Groups bright pixels the obvious way: a flood fill from each unvisited
+    /// pixel, over a set. Slow, and plainly correct, which is the point.
+    fn group_by_flood_fill(bright: &[usize], width: usize) -> Vec<Vec<usize>> {
+        use std::collections::HashSet;
+        let all: HashSet<usize> = bright.iter().copied().collect();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut out = Vec::new();
+
+        for start in bright {
+            if seen.contains(start) {
+                continue;
+            }
+            let mut region = Vec::new();
+            let mut stack = vec![*start];
+            seen.insert(*start);
+            while let Some(index) = stack.pop() {
+                region.push(index);
+                let (x, y) = ((index % width) as i64, (index / width) as i64);
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx < 0 || ny < 0 || nx as usize >= width {
+                            continue;
+                        }
+                        let neighbour = ny as usize * width + nx as usize;
+                        if all.contains(&neighbour) && seen.insert(neighbour) {
+                            stack.push(neighbour);
+                        }
+                    }
+                }
+            }
+            region.sort_unstable();
+            out.push(region);
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn grouping_agrees_with_a_flood_fill() {
+        // The fast grouping walks two sorted rows in step and collects the
+        // result by counting. Neither resembles the obvious algorithm, so it
+        // is checked against the obvious algorithm on a scattering of shapes.
+        let (w, h) = (61usize, 37usize);
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for _ in 0..40 {
+            let mut bright: Vec<usize> = (0..w * h).filter(|_| next() % 5 == 0).collect();
+            bright.sort_unstable();
+
+            let mine: Vec<Vec<usize>> = {
+                let regions = group(&bright, w);
+                let mut v: Vec<Vec<usize>> = regions.iter().map(<[usize]>::to_vec).collect();
+                for region in &mut v {
+                    region.sort_unstable();
+                }
+                v.sort();
+                v
+            };
+            assert_eq!(mine, group_by_flood_fill(&bright, w));
+        }
+    }
+
+    #[test]
+    fn a_region_does_not_wrap_around_the_end_of_a_row() {
+        // The last pixel of one row and the first of the next are neighbours
+        // in memory and nowhere near each other on the sky. Joining them would
+        // merge two stars into one long one and lose both.
+        let width = 10;
+        let bright = vec![
+            9,  // (9, 0)
+            10, // (0, 1)
+        ];
+        let regions = group(&bright, width);
+        assert_eq!(regions.iter().count(), 2, "opposite edges are not adjacent");
+    }
+
+    #[test]
+    fn the_same_frame_always_gives_the_same_stars() {
+        // Grouping used to hand back regions in a hash map's order, so which
+        // stars survived the limit could change from one run to the next.
+        let (w, h) = (400usize, 400usize);
+        let pixels = star_field(w, h, 60, 2.0);
+        let image = image(w, h, &pixels);
+        let params = DetectionParams {
+            limit: 20,
+            ..DetectionParams::default()
+        };
+
+        let first = detect(&image, &params);
+        assert_eq!(
+            first.count(),
+            20,
+            "the limit should bite for this to prove anything"
+        );
+        for _ in 0..4 {
+            assert_eq!(detect(&image, &params).stars, first.stars);
+        }
     }
 
     #[test]
@@ -938,6 +1408,198 @@ mod tests {
             let field = detect(&image(w, h, &pixels), &DetectionParams::default());
             assert!(field.count() <= 1, "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn a_faint_star_survives_the_test_that_rejects_hot_pixels() {
+        // Both are a few deviations above the background, so amplitude alone
+        // cannot separate them: the star is spread over its neighbours and the
+        // hot pixel is not. Written because the first form of this test
+        // divided by the neighbours rather than by the peak, and a faint
+        // star's neighbours sit close enough to the background that ordinary
+        // noise made the ratio enormous — it threw away nine detections in ten
+        // on a real narrowband frame.
+        let (w, h) = (200usize, 200usize);
+        let mut pixels = gaussian_background(w, h, 1000.0, 10.0, 51);
+
+        // Faint: a peak only six deviations up, which is what the matched
+        // filter exists to find.
+        add_star(
+            &mut pixels,
+            w,
+            &StarSpec {
+                cx: 60.0,
+                cy: 60.0,
+                peak: 60.0,
+                sigma_x: 2.0,
+                sigma_y: 2.0,
+                clip: None,
+            },
+        );
+        // Bright, for contrast.
+        add_star(
+            &mut pixels,
+            w,
+            &StarSpec {
+                cx: 140.0,
+                cy: 140.0,
+                peak: 9000.0,
+                sigma_x: 2.0,
+                sigma_y: 2.0,
+                clip: None,
+            },
+        );
+        // A hot pixel of the same height as the bright star.
+        pixels[100 * w + 100] += 9000.0;
+
+        let field = detect(&image(w, h, &pixels), &DetectionParams::default());
+        let near = |x: f64, y: f64| {
+            field
+                .stars
+                .iter()
+                .any(|s| (s.x - x).abs() < 2.0 && (s.y - y).abs() < 2.0)
+        };
+
+        assert!(near(140.0, 140.0), "the bright star must be found");
+        assert!(near(60.0, 60.0), "and so must the faint one");
+        assert!(
+            !near(100.0, 100.0),
+            "but the hot pixel must not be counted as a star"
+        );
+    }
+
+    #[test]
+    fn the_limit_keeps_the_brightest_and_says_that_it_did() {
+        // It used to stop at the first regions the scan reached, which took
+        // them all from the top of the frame and let rejected regions eat the
+        // budget: a good narrowband frame reported seventy-six stars out of
+        // nearly three thousand, which is what a frame shot with the cover on
+        // looks like.
+        let (w, h) = (400usize, 400usize);
+        let pixels = star_field(w, h, 60, 2.0);
+        let image = image(w, h, &pixels);
+
+        let all = detect(&image, &DetectionParams::default());
+        assert!(!all.capped);
+        let limited = detect(
+            &image,
+            &DetectionParams {
+                limit: 10,
+                ..DetectionParams::default()
+            },
+        );
+
+        assert_eq!(limited.count(), 10);
+        assert!(limited.capped, "a capped count must say so");
+
+        let faintest_kept = limited
+            .stars
+            .iter()
+            .map(|s| s.flux)
+            .fold(f64::INFINITY, f64::min);
+        let brighter_dropped = all.stars.iter().filter(|s| s.flux > faintest_kept).count();
+        assert!(
+            brighter_dropped <= 10,
+            "the ten kept must be the ten brightest; {brighter_dropped} brighter ones were dropped"
+        );
+
+        // And they must not all come from one corner, which is what taking
+        // them in scan order did.
+        let rows: Vec<f64> = limited.stars.iter().map(|s| s.y).collect();
+        let spread = rows.iter().cloned().fold(f64::MIN, f64::max)
+            - rows.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            spread > f64::from(u16::try_from(h).unwrap()) / 4.0,
+            "the stars kept span only {spread} rows of {h}"
+        );
+    }
+
+    #[test]
+    fn a_colour_image_is_searched_on_its_brightness() {
+        // A stacked result is three planes. Reporting nothing for it made a
+        // perfectly good image look like an empty one.
+        let (w, h) = (200usize, 200usize);
+        let mut mono = gaussian_background(w, h, 500.0, 8.0, 41);
+        let places = [(50usize, 60usize), (120, 80), (160, 150), (70, 170)];
+        for (cx, cy) in places {
+            add_star(
+                &mut mono,
+                w,
+                &StarSpec {
+                    cx: cx as f64,
+                    cy: cy as f64,
+                    peak: 9000.0,
+                    sigma_x: 2.0,
+                    sigma_y: 2.0,
+                    clip: None,
+                },
+            );
+        }
+
+        // The same sky in three planes, the star redder than the background.
+        let mut colour = Vec::with_capacity(w * h * 3);
+        for weight in [1.4f64, 1.0, 0.6] {
+            colour.extend(mono.iter().map(|v| v * weight));
+        }
+        let spec = SyntheticSpec::new(w, h, -32).with_channels(3);
+        let image = read_fits_from_bytes(&synthetic_fits(&spec, &colour).unwrap()).unwrap();
+        assert_eq!(image.channels, 3, "the test needs a three-plane image");
+
+        let field = detect(&image, &DetectionParams::default());
+        assert_eq!(field.count(), places.len(), "every star, once each");
+        assert!(field.fwhm.is_some());
+    }
+
+    #[test]
+    fn a_frame_too_bright_to_search_is_searched_higher_rather_than_given_up_on() {
+        // A rich broadband exposure has nebulosity and thousands of stars, and
+        // honestly puts a fifth of itself above five deviations. Reporting it
+        // as empty made it look exactly like a frame taken with the cover on.
+        let (w, h) = (300usize, 300usize);
+        let mut pixels = gaussian_background(w, h, 1000.0, 10.0, 31);
+
+        // A broad glow over most of the frame, with real stars on top of it.
+        for y in 0..h {
+            for x in 0..w {
+                if x > 20 && x < 280 && y > 20 && y < 280 {
+                    pixels[y * w + x] += 400.0;
+                }
+            }
+        }
+        for (cx, cy) in [(60usize, 60usize), (150, 90), (220, 200), (100, 240)] {
+            add_star(
+                &mut pixels,
+                w,
+                &StarSpec {
+                    cx: cx as f64,
+                    cy: cy as f64,
+                    peak: 20_000.0,
+                    sigma_x: 2.0,
+                    sigma_y: 2.0,
+                    clip: None,
+                },
+            );
+        }
+
+        let field = detect(&image(w, h, &pixels), &DetectionParams::default());
+        assert!(
+            field.count() >= 4,
+            "the stars on the glow must still be found, got {}",
+            field.count()
+        );
+        assert!(
+            field.threshold_was_raised(),
+            "and the frame must say the threshold was raised"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_frame_does_not_report_a_raised_threshold() {
+        let (w, h) = (300usize, 300usize);
+        let pixels = star_field(w, h, 20, 2.0);
+        let field = detect(&image(w, h, &pixels), &DetectionParams::default());
+        assert!(!field.threshold_was_raised());
+        assert!((field.threshold_scale - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

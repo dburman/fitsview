@@ -51,7 +51,7 @@ that is what a stacker wants.
 wide (the full width at half maximum, in pixels) and how round. That is what
 tells you whether a frame is in focus and whether the mount tracked, and it is
 the measurement to cull on. Each star is circled on the image, so a bad
-detection is obvious rather than hidden inside a number. It takes about 60 ms on
+detection is obvious rather than hidden inside a number. It takes about 16 ms on
 a 24-megapixel frame, runs in the background, and is off until asked for.
 
 **Knowing what you are looking at.** The metadata panel shows the FITS header,
@@ -62,6 +62,86 @@ figures. The histogram shows where the stretch is putting things.
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
 by 610 automated tests that run on all three operating systems.
+
+---
+
+## Installing a Release Build
+
+Every tagged release carries a ready-built binary for each platform on its
+[releases page](https://github.com/dburman/fitsview/releases). Take the one that
+matches your machine. There is no installer and no runtime to install
+separately: the download is a single executable.
+
+| File | For |
+|------|-----|
+| `fitsview-macos-arm64.tar.gz` | Apple silicon Macs (M1 and later) |
+| `fitsview-linux-x86_64.tar.gz` | 64-bit Intel and AMD Linux |
+| `fitsview-windows-x86_64.zip` | 64-bit Windows |
+
+An Intel Mac needs a build of its own; see [Building and
+Running](#building-and-running) below.
+
+### macOS
+
+```bash
+tar xzf fitsview-macos-arm64.tar.gz
+xattr -d com.apple.quarantine ./fitsview
+./fitsview
+```
+
+The second line matters. The binary carries only the signature the linker
+applies, so macOS quarantines anything downloaded and refuses to open it,
+usually with a message about the developer not being verified. Clearing the
+quarantine flag is what that dialog's *Open Anyway* button does. Right-clicking
+the binary and choosing **Open** works too.
+
+To keep it to hand, move it somewhere on your `PATH`:
+
+```bash
+sudo mv fitsview /usr/local/bin/
+```
+
+There is no `.app` bundle, so it starts from a terminal rather than from
+Launchpad or Spotlight.
+
+### Linux
+
+```bash
+tar xzf fitsview-linux-x86_64.tar.gz
+chmod +x fitsview
+./fitsview
+```
+
+The binary needs a working graphics driver, which on most systems means Mesa,
+and `xdg-desktop-portal` with a backend for your desktop — the file dialogs go
+through the portal, so a missing one shows up as the Open buttons doing
+nothing. Both are present on an ordinary desktop install. To keep it to hand:
+
+```bash
+sudo mv fitsview /usr/local/bin/
+```
+
+### Windows
+
+Unzip the archive and run `fitsview.exe`. SmartScreen will warn that the
+publisher is unknown, because the binary is not signed with a certificate;
+choose **More info** and then **Run anyway**. Nothing else is needed — the
+graphics go through Direct3D and the file dialogs are the system's own.
+
+### Checking what you have
+
+```bash
+fitsview --version
+```
+
+Then point it at a folder:
+
+```bash
+fitsview path/to/folder
+```
+
+If a newly opened image looks black, that is a raw astronomical frame doing what
+raw astronomical frames do. Press `S`.
 
 ---
 
@@ -204,6 +284,23 @@ but cannot write to it, whatever the permissions say. Copy the folder to the
 Mac, or reformat the drive as **exFAT**, which both systems can write. Images
 still open and display normally either way.
 
+### Checking detection against real frames
+
+Synthetic frames cannot say whether a detection threshold is right: they have
+stars hundreds of deviations above a flat background, so any threshold looks
+correct on them. `star-probe` runs detection over a folder of real
+sub-exposures and prints what it made of each one:
+
+```bash
+cargo run --release -p fits-core --all-features --example star-probe -- path/to/folder
+```
+
+Read the columns for a sequence that should be alike. Noise far larger than it
+should be means something structural is being read as noise; a frame taken with
+the cover on reporting thousands of stars means the rejections are not working;
+counts that jump about between consecutive frames mean the measurement is
+describing the algorithm rather than the sky.
+
 ### Building the sample files
 
 Useful for trying the application without a capture session to hand, and needed
@@ -262,7 +359,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in sixteen phases, each with its own acceptance criteria
+`fitsview` was built in seventeen phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in
