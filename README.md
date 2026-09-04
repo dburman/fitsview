@@ -23,7 +23,8 @@ when you want the image to fill the screen.
 
 **Culling.** Mark a frame to keep with `K`, delete one with `Delete`. Deleting
 always moves the file to the system trash, never destroys it, and a frame marked
-to keep always asks first. Rename with `F2`. Keep marks are stored beside the
+to keep always asks first. A folder on a volume that cannot be written to says
+so in the status line and greys out the buttons that would fail. Rename with `F2`. Keep marks are stored beside the
 images, so they survive restarting and travel with the folder if you copy it.
 The list can be ordered by sky background or by sharpness instead of by name,
 both measured as the folder loads, which brings the frames worth throwing out to
@@ -195,6 +196,13 @@ fitsview --help               # every keyboard shortcut
 
 A raw astronomical frame looks almost black until it is stretched, so press `S`
 first if a newly opened image appears empty.
+
+**On external drives.** If the status line says *Read-only volume* and deleting
+is greyed out, the drive is mounted read-only and nothing can change files on
+it. On macOS the usual cause is a drive formatted for Windows: macOS reads NTFS
+but cannot write to it, whatever the permissions say. Copy the folder to the
+Mac, or reformat the drive as **exFAT**, which both systems can write. Images
+still open and display normally either way.
 
 ### Building the sample files
 

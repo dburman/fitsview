@@ -535,6 +535,11 @@ pub struct Model {
     /// How files are deleted and renamed. Swapped in tests so that nothing
     /// reaches the real trash.
     ops: Box<dyn FileOps + Send>,
+    /// Whether the open folder is on a volume that cannot be written to.
+    ///
+    /// Probed once when the folder is opened rather than guessed from
+    /// permission bits, which lie about read-only mounts.
+    pub read_only: bool,
 }
 
 impl Default for Model {
@@ -583,6 +588,7 @@ impl Model {
             toast: None,
             loader: Loader::default(),
             ops: Box::new(RealFileOps),
+            read_only: false,
         }
     }
 
@@ -841,7 +847,14 @@ impl Model {
         let Some(Outcome::Flagged { name, flagged }) = actions::toggle_flag(folder) else {
             return;
         };
-        if let Err(e) = actions::save_flags(folder) {
+        if self.read_only {
+            // The flag still applies to this session, which is worth having
+            // while culling; it simply cannot be written beside the images.
+            self.error = Some(format!(
+                "{} Marks made now apply to this session only.",
+                actions::read_only_message(&folder.dir)
+            ));
+        } else if let Err(e) = actions::save_flags(folder) {
             // The flag is set in memory either way; say so rather than
             // pretending it will survive a restart.
             self.error = Some(format!("Could not save flags: {e}"));
@@ -862,6 +875,11 @@ impl Model {
         let Some(entry) = folder.selected_entry() else {
             return;
         };
+        if self.read_only {
+            // No point asking to confirm something that cannot happen.
+            self.error = Some(actions::read_only_message(&folder.dir));
+            return;
+        }
         if actions::needs_delete_confirmation(folder, self.confirm_every_delete) {
             self.pending = Pending::DeleteConfirm {
                 name: entry.name.clone(),
@@ -878,6 +896,13 @@ impl Model {
         let Some(folder) = self.folder.as_mut() else {
             return;
         };
+        if self.read_only {
+            // Better to say why up front than to let the trash call fail with
+            // a message about the volume having no trash, which describes a
+            // symptom rather than the cause.
+            self.error = Some(actions::read_only_message(&folder.dir));
+            return;
+        }
         match actions::delete_selected(folder, self.ops.as_ref()) {
             Ok(Outcome::Deleted { name }) => {
                 let hint = if actions::undo_supported() {
@@ -904,6 +929,14 @@ impl Model {
         else {
             return;
         };
+        if self.read_only {
+            // Opening the editor would invite the user to type a new name and
+            // then throw it away, which is worse than refusing now.
+            if let Some(folder) = self.folder.as_ref() {
+                self.error = Some(actions::read_only_message(&folder.dir));
+            }
+            return;
+        }
         self.pending = Pending::Rename {
             text: name,
             problem: None,
@@ -1233,6 +1266,12 @@ impl Model {
         let Some(folder) = self.folder.as_ref() else {
             return;
         };
+        if self.read_only {
+            // The settings still apply for as long as the folder is open. The
+            // user has already been told the folder cannot be written to, and
+            // repeating it every time a checkbox moves would be noise.
+            return;
+        }
         let mut existing = sidecar::load(&folder.dir);
         existing.master_dark = self
             .calibration
@@ -1392,6 +1431,17 @@ impl Model {
                 }
                 if folder.is_empty() {
                     self.error = Some(format!("No FITS files in {}", dir.display()));
+                }
+                self.read_only = !self.ops.writable(&dir);
+                if self.read_only {
+                    // Said on opening rather than only when a delete fails: it
+                    // changes what the folder is good for. It cannot be an
+                    // error, because displaying an image clears those, so the
+                    // status line carries it for as long as the folder is
+                    // open and the toast catches the eye now.
+                    self.toast = Some(Toast::new(
+                        "Read-only volume — files here cannot be changed",
+                    ));
                 }
                 self.loader.reset();
                 self.folder = Some(folder);
@@ -1672,8 +1722,15 @@ impl Model {
         if let Some(e) = &self.error {
             return format!("Error: {e}");
         }
+        // Carried for as long as the folder is open, because it is a property
+        // of the folder rather than a passing event.
+        let read_only = if self.read_only {
+            "Read-only volume · "
+        } else {
+            ""
+        };
         if let Some(l) = &self.loaded {
-            return format!("{}  {:.0}%", l.summary(), self.view.zoom * 100.0);
+            return format!("{read_only}{}  {:.0}%", l.summary(), self.view.zoom * 100.0);
         }
         if self.loading {
             return "Loading…".to_string();
@@ -2159,6 +2216,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct SpyOps {
         trashed: std::sync::Mutex<Vec<PathBuf>>,
+        /// Stands in for a folder on a volume that cannot be written to.
+        read_only: bool,
     }
 
     impl crate::actions::FileOps for std::sync::Arc<SpyOps> {
@@ -2172,11 +2231,26 @@ mod tests {
         fn exists(&self, path: &Path) -> bool {
             path.exists()
         }
+        fn writable(&self, _dir: &Path) -> bool {
+            !self.read_only
+        }
     }
 
     /// A model over `dir` that records deletes instead of performing them.
     fn model_over(dir: &Path) -> (Model, std::sync::Arc<SpyOps>) {
         let spy = std::sync::Arc::new(SpyOps::default());
+        let mut m = Model::with_file_ops(Box::new(std::sync::Arc::clone(&spy)));
+        m.handle(Action::Open(dir.to_path_buf()));
+        settle(&mut m);
+        (m, spy)
+    }
+
+    /// The same, over a folder that behaves like a read-only volume.
+    fn model_over_read_only(dir: &Path) -> (Model, std::sync::Arc<SpyOps>) {
+        let spy = std::sync::Arc::new(SpyOps {
+            read_only: true,
+            ..SpyOps::default()
+        });
         let mut m = Model::with_file_ops(Box::new(std::sync::Arc::clone(&spy)));
         m.handle(Action::Open(dir.to_path_buf()));
         settle(&mut m);
@@ -2298,6 +2372,117 @@ mod tests {
     }
 
     #[test]
+    fn a_read_only_volume_is_reported_when_the_folder_opens() {
+        // A drive formatted for Windows mounts read-only on macOS, and the
+        // trash error it produces blames the volume for having no trash, which
+        // sends the user looking in the wrong place.
+        let dir = folder_of(2, 10, 10);
+        let (m, _spy) = model_over_read_only(dir.path());
+        assert!(m.read_only);
+        assert!(
+            m.status_text().contains("Read-only volume"),
+            "the status line must carry it for as long as the folder is open: {}",
+            m.status_text()
+        );
+
+        // Displaying an image clears errors, so the notice must not be one.
+        assert!(m.loaded.is_some(), "the images still open and display");
+        assert!(m.error.is_none());
+
+        let message = crate::actions::read_only_message(dir.path());
+        assert!(message.contains("read-only volume"), "{message}");
+        assert!(
+            !message.contains("no trash") && !message.contains("doesn't have"),
+            "the volume's trash is a symptom, not the cause: {message}"
+        );
+    }
+
+    #[test]
+    fn deleting_on_a_read_only_volume_refuses_before_asking() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, spy) = model_over_read_only(dir.path());
+        m.error = None;
+
+        m.handle(Action::RequestDelete);
+        assert_eq!(
+            m.pending,
+            Pending::None,
+            "no point confirming what cannot happen"
+        );
+        assert!(m.error.is_some(), "and the reason must be given");
+        assert!(spy.trashed.lock().unwrap().is_empty());
+        assert_eq!(
+            m.folder.as_ref().unwrap().files.len(),
+            2,
+            "nothing left the list"
+        );
+    }
+
+    #[test]
+    fn renaming_on_a_read_only_volume_does_not_open_the_editor() {
+        // Letting someone type a new name and then throwing it away is worse
+        // than refusing.
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over_read_only(dir.path());
+        m.error = None;
+
+        m.handle(Action::BeginRename);
+        assert_eq!(m.pending, Pending::None);
+        assert!(m.error.is_some());
+    }
+
+    #[test]
+    fn flagging_on_a_read_only_volume_works_for_the_session_and_says_so() {
+        let dir = folder_of(2, 10, 10);
+        let (mut m, _spy) = model_over_read_only(dir.path());
+        m.error = None;
+
+        m.handle(Action::ToggleFlag);
+        assert!(
+            m.folder.as_ref().unwrap().files[0].flagged,
+            "culling should still be possible while browsing"
+        );
+        let message = m.error.clone().expect("but it must not pretend it saved");
+        assert!(message.contains("session only"), "{message}");
+        assert!(
+            !dir.path().join(crate::sidecar::SIDECAR_NAME).exists(),
+            "nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_writable_folder_is_not_treated_as_read_only() {
+        // The guard must not fire on the ordinary case, which is the risk with
+        // a probe: a false positive would disable deleting everywhere.
+        let dir = folder_of(2, 10, 10);
+        let (mut m, spy) = model_over(dir.path());
+        assert!(!m.read_only);
+        m.handle(Action::RequestDelete);
+        assert!(
+            !spy.trashed.lock().unwrap().is_empty(),
+            "deleting still works"
+        );
+    }
+
+    #[test]
+    fn the_real_probe_agrees_with_the_filesystem() {
+        // The double answers however the test asks it to, so the probe itself
+        // needs checking against a real directory at least once.
+        let dir = tempfile::tempdir().unwrap();
+        let ops = crate::actions::RealFileOps;
+        assert!(crate::actions::FileOps::writable(&ops, dir.path()));
+        assert!(
+            !crate::actions::FileOps::writable(&ops, &dir.path().join("no-such-folder")),
+            "a folder that cannot be written to must report so"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the probe must leave nothing behind"
+        );
+    }
+
+    #[test]
     fn a_delete_that_fails_is_reported_and_changes_nothing() {
         #[derive(Debug)]
         struct AlwaysFails;
@@ -2310,6 +2495,11 @@ mod tests {
             }
             fn exists(&self, _: &Path) -> bool {
                 false
+            }
+            // Writable, so the failure under test is the trash call itself
+            // rather than the folder being refused up front.
+            fn writable(&self, _: &Path) -> bool {
+                true
             }
         }
 

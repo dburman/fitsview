@@ -336,3 +336,24 @@ Needs a real session, ideally one with a few frames spoiled by cloud or wind.
 - [ ] Untick the box: the circles go, and the figures leave the metadata panel.
 - [ ] Tick it, quit, and reopen: it is still ticked, and detection starts on
       the frame that reopens.
+
+## Read-only volumes
+
+Needs a drive macOS cannot write to. An NTFS-formatted external disk is the
+easiest: macOS mounts it read-only. `mount | grep -i <name>` should show
+`read-only`.
+
+- [ ] Opening a folder on it shows the images normally, and a toast says the
+      volume is read-only.
+- [ ] The status line keeps saying *Read-only volume* after the toast has gone,
+      and after stepping to another frame.
+- [ ] Rename and Delete in the toolbar are greyed out, and hovering either says
+      why.
+- [ ] `Delete` on the keyboard gives the read-only message rather than a
+      confirmation dialog, and the file is still there afterwards.
+- [ ] `F2` gives the same message rather than opening the rename editor.
+- [ ] `K` still marks the frame to keep for this session, and says the mark
+      will not be saved.
+- [ ] Nothing named `.fitsview*` is left on the drive afterwards.
+- [ ] Open a folder on the internal disk again: deleting, renaming and flagging
+      all work as before, and the status line no longer mentions read-only.

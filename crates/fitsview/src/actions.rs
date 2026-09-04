@@ -36,6 +36,39 @@ pub trait FileOps: std::fmt::Debug {
 
     /// Whether a path already exists.
     fn exists(&self, path: &Path) -> bool;
+
+    /// Whether files in this folder can be changed at all.
+    ///
+    /// Nothing short of trying tells the truth here. A read-only *mount* — an
+    /// NTFS drive on macOS, a disk image, a network share exported read-only —
+    /// leaves the folder's own permission bits saying it is writable, so
+    /// asking the metadata gives the wrong answer. This writes a hidden file
+    /// and removes it again.
+    fn writable(&self, dir: &Path) -> bool;
+}
+
+/// What to tell the user when a folder cannot be written to.
+///
+/// Worth its own function because the underlying error is actively
+/// misleading: macOS reports a read-only volume as the volume having no
+/// trash, which sounds like a preference rather than a mounted-read-only
+/// disk.
+#[must_use]
+pub fn read_only_message(dir: &Path) -> String {
+    let where_ = dir.display();
+    if cfg!(target_os = "macos") {
+        format!(
+            "{where_} is on a read-only volume, so files there cannot be deleted, \
+             renamed, or flagged. A drive formatted for Windows (NTFS) does this: \
+             macOS can read it but not write to it. Copy the folder to this Mac, \
+             or reformat the drive as exFAT, which both systems can write."
+        )
+    } else {
+        format!(
+            "{where_} is on a read-only volume, so files there cannot be deleted, \
+             renamed, or flagged."
+        )
+    }
 }
 
 /// The real filesystem.
@@ -84,6 +117,21 @@ impl FileOps for RealFileOps {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn writable(&self, dir: &Path) -> bool {
+        // The name carries the process id so two copies running at once cannot
+        // delete each other's probe, and starts with a dot so that a crash
+        // between creating and removing it leaves something the folder scan
+        // ignores.
+        let probe = dir.join(format!(".fitsview-write-probe-{}", std::process::id()));
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -365,6 +413,7 @@ mod tests {
         existing: RefCell<HashSet<PathBuf>>,
         fail_trash: bool,
         fail_rename: bool,
+        read_only: bool,
     }
 
     impl RecordingOps {
@@ -407,6 +456,9 @@ mod tests {
         }
         fn exists(&self, path: &Path) -> bool {
             self.existing.borrow().contains(path)
+        }
+        fn writable(&self, _dir: &Path) -> bool {
+            !self.read_only
         }
     }
 

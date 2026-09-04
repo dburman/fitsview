@@ -97,16 +97,30 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
             {
                 actions.push(Action::ToggleFlag);
             }
+            // A read-only volume — a Windows-formatted drive on macOS is the
+            // common one — cannot have its files changed at all. Greying the
+            // buttons says so before they are pressed.
+            let can_change = has_selection && !model.read_only;
+            let refusal = "The volume this folder is on is read-only, so its files \
+                           cannot be changed";
             if ui
-                .add_enabled(has_selection, Button::new("Rename"))
-                .on_hover_text("Rename this file (F2)")
+                .add_enabled(can_change, Button::new("Rename"))
+                .on_hover_text(if model.read_only {
+                    refusal
+                } else {
+                    "Rename this file (F2)"
+                })
                 .clicked()
             {
                 actions.push(Action::BeginRename);
             }
             if ui
-                .add_enabled(has_selection, Button::new("🗑 Delete"))
-                .on_hover_text("Move this file to the trash (Delete)")
+                .add_enabled(can_change, Button::new("🗑 Delete"))
+                .on_hover_text(if model.read_only {
+                    refusal
+                } else {
+                    "Move this file to the trash (Delete)"
+                })
                 .clicked()
             {
                 actions.push(Action::RequestDelete);
