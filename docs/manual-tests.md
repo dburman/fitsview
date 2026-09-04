@@ -299,10 +299,11 @@ Needs a real session, ideally one with a few frames spoiled by cloud or wind.
 - [ ] With a dark applied, the readout still shows the file's value rather than
       the calibrated one. Toggle the dark with D and check the number does not
       move.
-- [ ] On a colour frame, three values are shown.
+- [ ] On a colour frame, three values are shown, bracketed and separated by
+      spaces: `[1234 2345 3456]`.
 - [ ] On a one-shot colour frame with reconstruction on, three values are shown
-      with a tilde marking them as interpolated, and they match the colour on
-      screen at that point.
+      as `~[1234 2345 3456]`, the tilde marking them as interpolated, and they
+      match the colour on screen at that point.
 - [ ] Turning reconstruction off with B returns the readout to a single value,
       which is what that pixel actually measured.
 - [ ] `G` shows the histogram, and it has the shape of a sky frame: one tall
@@ -357,3 +358,13 @@ easiest: macOS mounts it read-only. `mount | grep -i <name>` should show
 - [ ] Nothing named `.fitsview*` is left on the drive afterwards.
 - [ ] Open a folder on the internal disk again: deleting, renaming and flagging
       all work as before, and the status line no longer mentions read-only.
+
+## Message text
+
+- [ ] Narrow the window as far as it goes, then press `Shift+S`. The toast
+      reads *Finding stars…* on one line, or wrapped between words — never
+      broken in the middle of one.
+- [ ] The same with the read-only message, which is the longest the
+      application produces: it wraps between words and stays inside the window.
+- [ ] With stars on and the window narrow, the summary beside the toolbar
+      checkbox is not broken mid-word either.

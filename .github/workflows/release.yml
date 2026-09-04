@@ -64,7 +64,7 @@ jobs:
           fi
 
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fitsview-${{ matrix.name }}
           path: |
@@ -79,7 +79,7 @@ jobs:
     # Only a tag produces a release; a manual run just builds the binaries.
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true

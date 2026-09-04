@@ -75,7 +75,7 @@ jobs:
             echo "path=target/release/fitsview" >> "$GITHUB_OUTPUT"
           fi
       - name: Upload the binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fitsview-${{ matrix.os }}
           path: ${{ steps.binary.outputs.path }}
@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '22'
       - name: Install the mermaid parser

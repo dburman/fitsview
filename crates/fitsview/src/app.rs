@@ -413,8 +413,11 @@ impl PixelReadout {
             }
         };
         let samples = match self.channels {
+            // Bracketed and space-separated: three numbers with commas between
+            // them read as a list to be parsed, where the brackets make one
+            // reading the eye takes in at a glance.
             3 => format!(
-                "{}, {}, {}",
+                "[{} {} {}]",
                 value(self.values[0]),
                 value(self.values[1]),
                 value(self.values[2])
@@ -3871,7 +3874,7 @@ mod tests {
         assert!((readout.values[1] - 20.0).abs() < 0.01);
         assert!((readout.values[2] - 30.0).abs() < 0.01);
         assert!(
-            readout.describe().contains("10, 20, 30"),
+            readout.describe().contains("[10 20 30]"),
             "{}",
             readout.describe()
         );
@@ -3934,7 +3937,19 @@ mod tests {
                 readout.values[channel]
             );
         }
-        assert!(readout.describe().contains('~'), "{}", readout.describe());
+        let text = readout.describe();
+        assert!(text.contains('~'), "{text}");
+        let bracketed = text
+            .split_once('[')
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(inside, _)| inside.to_string())
+            .expect("the three values are bracketed");
+        assert_eq!(
+            bracketed.split_whitespace().count(),
+            3,
+            "three values, separated by spaces: {text}"
+        );
+        assert!(!bracketed.contains(','), "no commas between them: {text}");
     }
 
     #[test]

@@ -157,8 +157,28 @@ fn help(ui: &mut Ui) -> Vec<Action> {
     actions
 }
 
+/// How wide a floating message may be, in a window of this width.
+///
+/// A floating area has no width of its own, so without a limit the text is
+/// measured against whatever the area happens to offer. When that turns out to
+/// be narrower than a single word, the word itself is broken: "Finding stars…"
+/// came out split across two lines. Naming a width means any wrapping happens
+/// between words, and short messages still shrink to fit their text.
+fn toast_width(window_width: f32) -> f32 {
+    /// Kept clear of the window edges.
+    const MARGIN: f32 = 64.0;
+    /// Long messages read badly in one line across a wide screen.
+    const WIDEST: f32 = 560.0;
+    /// Narrower than this and words break again, so overflow a small window
+    /// instead.
+    const NARROWEST: f32 = 220.0;
+
+    (window_width - MARGIN).clamp(NARROWEST, WIDEST)
+}
+
 /// A transient message, floating near the bottom of the window.
 fn show_toast(ui: &mut Ui, text: &str) {
+    let width = toast_width(ui.ctx().content_rect().width());
     egui::Area::new("toast".into())
         .anchor(Align2::CENTER_BOTTOM, [0.0, -48.0])
         .interactable(false)
@@ -166,7 +186,48 @@ fn show_toast(ui: &mut Ui, text: &str) {
             egui::Frame::popup(ui.style())
                 .fill(Color32::from_black_alpha(220))
                 .show(ui, |ui| {
+                    ui.set_max_width(width);
                     ui.label(RichText::new(text).color(Color32::WHITE));
                 });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::toast_width;
+
+    /// The shortest word egui must never break, measured generously: the
+    /// widest message the application produces is the read-only explanation,
+    /// whose longest word is "read-only," at ten characters.
+    const LONGEST_WORD_PX: f32 = 140.0;
+
+    #[test]
+    fn a_message_always_has_room_for_a_whole_word() {
+        // The bug this replaces: a window narrow enough that the area offered
+        // less width than one word, so the word was broken mid-way.
+        for window in [0.0, 120.0, 240.0, 400.0, 800.0, 3840.0] {
+            assert!(
+                toast_width(window) >= LONGEST_WORD_PX,
+                "a {window} px window left only {} px for the text",
+                toast_width(window)
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_stays_clear_of_the_edges_of_an_ordinary_window() {
+        // Wide enough to matter, not so wide that a line becomes hard to read.
+        assert!(toast_width(1200.0) < 1200.0);
+        assert!(toast_width(1200.0) >= 400.0);
+    }
+
+    #[test]
+    fn a_wider_window_never_gives_a_narrower_message() {
+        let mut previous = 0.0;
+        for window in [200.0, 400.0, 600.0, 1000.0, 2000.0] {
+            let width = toast_width(window);
+            assert!(width >= previous, "{window} px window narrowed the message");
+            previous = width;
+        }
+    }
 }

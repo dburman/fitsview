@@ -184,7 +184,13 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                         None => format!("{} stars", field.count()),
                     },
                 };
-                ui.label(RichText::new(summary).weak().small());
+                // At the end of a row that is already full, this label can be
+                // offered less width than one word, and egui then breaks the
+                // word itself. Extending pushes the row instead.
+                ui.add(
+                    egui::Label::new(RichText::new(summary).weak().small())
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
