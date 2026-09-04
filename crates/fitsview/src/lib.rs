@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod adapter;
 pub mod app;
 pub mod crash;
 pub mod folder;

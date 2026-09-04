@@ -1599,6 +1599,15 @@ impl Model {
         let shown = self.calibrated_version(&path, &image);
         let image = Arc::clone(&image);
 
+        // Stepping through a folder keeps the zoom and the pan, so that
+        // comparing the same corner of one frame with the next — which is what
+        // the arrow keys are for — does not mean framing it again every time.
+        // A frame of a different size is a different sensor or a different
+        // binning, and nothing about the old view carries over to it.
+        #[allow(clippy::cast_precision_loss)]
+        let arriving = Vec2::new(shown.width as f32, shown.height as f32);
+        let refit = self.loaded.as_ref().map(Loaded::size) != Some(arriving);
+
         self.loaded = Some(Loaded {
             path,
             image: shown,
@@ -1606,7 +1615,7 @@ impl Model {
             load_ms,
         });
         self.error = None;
-        self.needs_fit = true;
+        self.needs_fit = refit;
         self.generation = self.generation.wrapping_add(1);
         self.update_calibration_warnings();
 
@@ -2689,6 +2698,7 @@ mod tests {
         m.handle(Action::SetStretchParams(StretchParams {
             target_bg: 0.45,
             shadows_clip: -1.0,
+            ..StretchParams::default()
         }));
         assert_ne!(m.stretch_params, StretchParams::default());
 
@@ -4192,6 +4202,99 @@ mod tests {
         }));
         assert_eq!(m.star_params.threshold, 8.0, "the setting is remembered");
         assert!(!m.detector.is_busy(), "but nothing is looked for");
+    }
+
+    #[test]
+    fn zoom_and_pan_survive_stepping_to_the_next_frame() {
+        // Comparing one frame with the next means looking at the same corner
+        // of each. Refitting on every step made that impossible.
+        let dir = folder_of(3, 40, 40);
+        let (mut m, _spy) = model_over(dir.path());
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+
+        m.view = ViewState::centred(Vec2::new(40.0, 40.0), viewport, 8.0);
+        let zoomed = m.view;
+
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        m.set_viewport(viewport);
+
+        assert!(
+            (m.view.zoom - zoomed.zoom).abs() < f32::EPSILON,
+            "zoom went from {} to {}",
+            zoomed.zoom,
+            m.view.zoom
+        );
+        assert_eq!(m.view.origin, zoomed.origin, "and the pan with it");
+    }
+
+    #[test]
+    fn a_frame_of_another_size_is_fitted_afresh() {
+        // Nothing about the old view carries over to a different sensor, and
+        // keeping it would leave the image off screen.
+        let dir = tempfile::tempdir().unwrap();
+        write_synthetic(
+            dir.path(),
+            "a_small.fits",
+            &SyntheticSpec::new(40, 40, -32),
+            &vec![1000.0; 40 * 40],
+        )
+        .unwrap();
+        write_synthetic(
+            dir.path(),
+            "b_large.fits",
+            &SyntheticSpec::new(400, 400, -32),
+            &vec![1000.0; 400 * 400],
+        )
+        .unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0));
+        m.set_viewport(viewport);
+        m.view = ViewState::centred(Vec2::new(40.0, 40.0), viewport, 8.0);
+
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        m.set_viewport(viewport);
+
+        assert!(
+            (m.view.zoom - 8.0).abs() > f32::EPSILON,
+            "a frame ten times the size must be fitted, not left at 8x"
+        );
+    }
+
+    #[test]
+    fn a_neutral_background_redraws_a_colour_frame() {
+        // The setting only means anything once the picture changes.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16usize, 16usize);
+        let bayer = BayerPattern::Rggb;
+        // Green well above red, the way a one-shot colour sensor records sky.
+        let source = [900.0, 1900.0, 1400.0];
+        let pixels: Vec<f64> = (0..w * h)
+            .map(|i| source[bayer.colour_at(i % w, i / w).plane()])
+            .collect();
+        let spec = SyntheticSpec::new(w, h, 16)
+            .with_scaling(32768.0, 1.0)
+            .with_card("BAYERPAT", "'RGGB    '");
+        write_synthetic(dir.path(), "osc.fits", &spec, &pixels).unwrap();
+
+        let (mut m, _spy) = model_over(dir.path());
+        if !m.stretch_enabled {
+            m.handle(Action::ToggleStretch);
+        }
+        let before = m.generation;
+
+        m.handle(Action::SetStretchParams(StretchParams {
+            linked: false,
+            ..m.stretch_params
+        }));
+        assert!(!m.stretch_params.linked);
+        assert_ne!(
+            m.generation, before,
+            "the image on screen has to be built again"
+        );
     }
 
     #[test]

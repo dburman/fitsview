@@ -95,50 +95,31 @@ pub struct Folder {
     pub selected: Option<usize>,
 }
 
-/// Scans a folder for FITS files.
+/// How many levels of subfolder are searched below the one that was opened.
 ///
-/// Non-recursive, because a session lives in one folder and descending into
-/// subfolders would mix calibration frames in with lights. Hidden files are
-/// skipped, as are anything without a FITS extension. Entries that cannot be
-/// read are skipped rather than failing the whole scan, so one bad file does
-/// not make the folder unopenable.
+/// Captures are filed as target, then date, then filter and frame, so opening a
+/// target has to reach two levels down to find anything. Deeper than that and
+/// opening an archive root would gather every frame ever shot.
+pub const MAX_DEPTH: usize = 2;
+
+/// Scans a folder for FITS files, and its subfolders to [`MAX_DEPTH`].
+///
+/// Hidden files and folders are skipped, as is anything without a FITS
+/// extension. Entries that cannot be read are skipped rather than failing the
+/// whole scan, so one bad file — or one subfolder there is no permission to
+/// read — does not make the folder unopenable.
+///
+/// A file below the folder is named by its path relative to it, so that two
+/// nights each holding `light_0001.fits` are told apart in the list, in the
+/// keep flags, and when renaming.
 ///
 /// # Errors
 ///
-/// Returns the underlying error if the folder itself cannot be listed.
+/// Returns the underlying error if the folder itself cannot be listed. A
+/// subfolder that cannot be listed is passed over.
 pub fn scan_folder(dir: &Path) -> std::io::Result<Folder> {
     let mut files = Vec::new();
-
-    for entry in std::fs::read_dir(dir)? {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        // Hidden files include our own sidecar, so this must come first.
-        if name.starts_with('.') {
-            continue;
-        }
-        if !is_fits_path(&path) {
-            continue;
-        }
-        // A folder named `something.fits` is not a file to open.
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => continue,
-            Err(_) => continue,
-            Ok(_) => {}
-        }
-
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        files.push(FileEntry {
-            name: name.to_string(),
-            path,
-            size,
-            flagged: false,
-            quality: None,
-        });
-    }
+    collect(dir, dir, 0, &mut files)?;
 
     files.sort_by(|a, b| natsort::natural_cmp(&a.name, &b.name));
 
@@ -155,6 +136,99 @@ pub fn scan_folder(dir: &Path) -> std::io::Result<Folder> {
         files,
         selected,
     })
+}
+
+/// Adds the FITS files in `dir` to `out`, descending while there is depth left.
+fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Hidden entries include our own sidecar, so this must come first.
+        if name.starts_with('.') {
+            continue;
+        }
+
+        // A symbolic link reports itself as neither file nor directory here,
+        // which is what stops a link pointing back up the tree from being
+        // followed round for ever.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if depth < MAX_DEPTH {
+                // One unreadable subfolder must not lose the rest of the scan.
+                if let Err(e) = collect(root, &path, depth + 1, out) {
+                    log::debug!("skipping {}: {e}", path.display());
+                }
+            }
+            continue;
+        }
+        // A folder named `something.fits` is handled above; anything else that
+        // is not a plain file is not ours to open.
+        if !kind.is_file() || !is_fits_path(&path) {
+            continue;
+        }
+
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push(FileEntry {
+            name: relative_name(root, &path),
+            path,
+            size,
+            flagged: false,
+            quality: None,
+        });
+    }
+    Ok(())
+}
+
+/// A file's name relative to the folder that was opened.
+///
+/// Always with forward slashes, whatever the platform, because it is written
+/// into the keep flags beside the images: a folder copied from Windows to a Mac
+/// has to keep its marks.
+fn relative_name(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let parts: Vec<String> = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.join("/")
+}
+
+impl FileEntry {
+    /// The file's own name, without the subfolder it sits in.
+    ///
+    /// What a rename edits, and what to show when the folder is already
+    /// obvious from elsewhere.
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        self.name.rsplit('/').next().unwrap_or(&self.name)
+    }
+
+    /// The subfolder the file sits in, relative to the folder that was opened,
+    /// or empty when it sits directly in it.
+    #[must_use]
+    pub fn subfolder(&self) -> &str {
+        match self.name.rfind('/') {
+            Some(cut) => &self.name[..cut],
+            None => "",
+        }
+    }
+
+    /// The name this file would have if its own name became `file_name`.
+    #[must_use]
+    pub fn renamed_to(&self, file_name: &str) -> String {
+        let folder = self.subfolder();
+        if folder.is_empty() {
+            file_name.to_string()
+        } else {
+            format!("{folder}/{file_name}")
+        }
+    }
 }
 
 impl Folder {
@@ -460,16 +534,102 @@ mod tests {
         assert_eq!(f.files[0].name, "real.fits");
     }
 
-    #[test]
-    fn scanning_is_not_recursive() {
-        let dir = folder_with(&["top.fits"]);
-        let sub = dir.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
+    /// Writes a small FITS file, creating the folder if it is not there.
+    fn write_at(dir: &Path, relative: &str) {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let spec = SyntheticSpec::new(2, 2, 16);
-        write_synthetic(&sub, "nested.fits", &spec, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        write_synthetic(
+            path.parent().unwrap(),
+            path.file_name().unwrap().to_str().unwrap(),
+            &spec,
+            &[1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_target_folder_finds_the_frames_filed_under_it_by_date_and_filter() {
+        // The layout captures actually use: target, then date, then filter and
+        // frame. Opening the target has to reach the frames.
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "loose.fits");
+        write_at(dir.path(), "2024-12-10/light_0001.fits");
+        write_at(dir.path(), "2024-12-10/Ha/light_0002.fits");
+        write_at(dir.path(), "2024-12-11/OIII/light_0003.fits");
 
         let f = scan_folder(dir.path()).unwrap();
-        assert_eq!(f.len(), 1, "subfolders must not be descended into");
+        let names: Vec<&str> = f.files.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "2024-12-10/Ha/light_0002.fits",
+                "2024-12-10/light_0001.fits",
+                "2024-12-11/OIII/light_0003.fits",
+                "loose.fits",
+            ],
+            "every frame, named by where it sits, grouped by folder"
+        );
+    }
+
+    #[test]
+    fn the_search_stops_two_folders_down() {
+        // Deep enough for target, date and filter; not deep enough to gather an
+        // entire archive when someone opens its root.
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "one/two/within.fits");
+        write_at(dir.path(), "one/two/three/too_deep.fits");
+
+        let f = scan_folder(dir.path()).unwrap();
+        let names: Vec<&str> = f.files.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["one/two/within.fits"]);
+    }
+
+    #[test]
+    fn two_nights_may_hold_the_same_file_name() {
+        // The reason a file is named by its path rather than by its own name:
+        // capture software numbers from zero every night.
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "2024-12-10/light_0001.fits");
+        write_at(dir.path(), "2024-12-11/light_0001.fits");
+
+        let f = scan_folder(dir.path()).unwrap();
+        assert_eq!(f.len(), 2, "neither night may hide the other");
+        assert_eq!(f.files[0].file_name(), f.files[1].file_name());
+        assert_ne!(f.files[0].name, f.files[1].name);
+        assert_eq!(f.files[0].subfolder(), "2024-12-10");
+    }
+
+    #[test]
+    fn a_hidden_subfolder_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "kept.fits");
+        write_at(dir.path(), ".Trashes/deleted.fits");
+
+        let f = scan_folder(dir.path()).unwrap();
+        let names: Vec<&str> = f.files.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["kept.fits"]);
+    }
+
+    #[test]
+    fn a_keep_flag_on_a_nested_file_survives_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        write_at(dir.path(), "2024-12-10/light_0001.fits");
+        write_at(dir.path(), "2024-12-11/light_0001.fits");
+
+        let mut f = scan_folder(dir.path()).unwrap();
+        f.selected = Some(1);
+        f.files[1].flagged = true;
+        let mut sidecar = sidecar::load(dir.path());
+        sidecar.set_flagged(vec![f.files[1].name.clone()]);
+        sidecar::save(dir.path(), &sidecar).unwrap();
+
+        let again = scan_folder(dir.path()).unwrap();
+        assert!(
+            !again.files[0].flagged,
+            "the wrong night must not be marked"
+        );
+        assert!(again.files[1].flagged, "and the right one must be");
     }
 
     #[test]

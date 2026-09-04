@@ -286,7 +286,7 @@ pub fn validate_new_name(
     }
 
     // Restore the original extension if the user dropped it.
-    let original_ext = Path::new(&entry.name)
+    let original_ext = Path::new(entry.file_name())
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
@@ -300,18 +300,26 @@ pub fn validate_new_name(
         format!("{trimmed}.{original_ext}")
     };
 
-    if final_name == entry.name {
+    if final_name == entry.file_name() {
         // Renaming a file to its own name is a no-op, not a clash.
         return Ok(final_name);
     }
+
+    // Only the files beside it can clash: two nights may each hold a
+    // `light_0001.fits` without either being in the other's way.
+    let taken = entry.renamed_to(&final_name);
+    let destination = entry
+        .path
+        .parent()
+        .map_or_else(|| folder.dir.join(&final_name), |p| p.join(&final_name));
 
     // Compare case-insensitively as well, because Windows and macOS filesystems
     // usually are, and a rename that only changes case would clobber the file.
     let clashes = folder
         .files
         .iter()
-        .any(|e| e.name.eq_ignore_ascii_case(&final_name))
-        || ops.exists(&folder.dir.join(&final_name));
+        .any(|e| e.name.eq_ignore_ascii_case(&taken))
+        || ops.exists(&destination);
     if clashes {
         return Err(RenameError::AlreadyExists(final_name));
     }
@@ -339,15 +347,20 @@ pub fn rename_selected(
 
     let index = folder.selected.ok_or(ActionError::NoSelection)?;
     let old_name = folder.files[index].name.clone();
-    if final_name == old_name {
+    let old_file_name = folder.files[index].file_name().to_string();
+    if final_name == old_file_name {
         return Ok(Outcome::NoChange);
     }
 
     let from = folder.files[index].path.clone();
-    let to = folder.dir.join(&final_name);
+    // Renaming moves nothing: the file stays in the folder it was found in,
+    // which for a file below the opened one is not the opened one.
+    let to = from
+        .parent()
+        .map_or_else(|| folder.dir.join(&final_name), |p| p.join(&final_name));
     ops.rename(&from, &to).map_err(ActionError::Failed)?;
 
-    folder.files[index].name.clone_from(&final_name);
+    folder.files[index].name = folder.files[index].renamed_to(&final_name);
     folder.files[index].path = to;
 
     // The new name may sort elsewhere, so re-order and follow the file.
@@ -356,8 +369,10 @@ pub fn rename_selected(
     folder.select_path(&moved);
 
     Ok(Outcome::Renamed {
+        // Both as they appear in the list, so that a file in a subfolder does
+        // not look as though it moved to the top of the tree.
         from: old_name,
-        to: final_name,
+        to: folder.files[folder.selected.unwrap_or(index)].name.clone(),
     })
 }
 
@@ -478,6 +493,63 @@ mod tests {
                 .collect(),
             selected: if names.is_empty() { None } else { Some(0) },
         }
+    }
+
+    #[test]
+    fn renaming_a_file_in_a_subfolder_leaves_it_there() {
+        // The path is built from the file's own folder, not from the one that
+        // was opened: joining the new name onto the opened folder would move
+        // the frame out of its night.
+        let mut f = folder(&["2024-12-10/light_0001.fits", "2024-12-11/other.fits"]);
+        let ops = RecordingOps::default();
+
+        let outcome = rename_selected(&mut f, &ops, "keeper").unwrap();
+
+        assert_eq!(
+            ops.renamed.borrow().as_slice(),
+            &[(
+                PathBuf::from("/session/2024-12-10/light_0001.fits"),
+                PathBuf::from("/session/2024-12-10/keeper.fits"),
+            )],
+            "the file stays in the folder it was found in"
+        );
+        assert_eq!(f.files[0].name, "2024-12-10/keeper.fits");
+        assert_eq!(f.files[0].subfolder(), "2024-12-10");
+        assert_eq!(
+            outcome,
+            Outcome::Renamed {
+                from: "2024-12-10/light_0001.fits".to_string(),
+                to: "2024-12-10/keeper.fits".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_same_name_in_another_night_is_not_a_clash() {
+        // Capture software numbers from zero every night, so identical names
+        // in different folders are the normal case, not a collision.
+        let mut f = folder(&["2024-12-10/light_0001.fits", "2024-12-11/keeper.fits"]);
+        let ops = RecordingOps::default();
+
+        assert!(
+            rename_selected(&mut f, &ops, "keeper").is_ok(),
+            "a name taken in another folder does not stand in the way"
+        );
+        assert_eq!(f.files[0].name, "2024-12-10/keeper.fits");
+    }
+
+    #[test]
+    fn a_name_already_used_beside_it_is_still_a_clash() {
+        let mut f = folder(&["2024-12-10/a.fits", "2024-12-10/taken.fits"]);
+        let ops = RecordingOps::default();
+
+        let result = validate_new_name(&f, &ops, "taken");
+        assert!(
+            matches!(result, Err(RenameError::AlreadyExists(_))),
+            "got {result:?}"
+        );
+        assert!(ops.renamed.borrow().is_empty());
+        f.selected = Some(0);
     }
 
     #[test]

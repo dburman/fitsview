@@ -323,6 +323,31 @@ fn colour_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
             });
     });
 
+    // A stretch setting, but it belongs here: it is only ever wanted for a
+    // colour frame, and the green cast that prompts it is a property of the
+    // filter grid rather than of the stretch.
+    let mut unlinked = !model.stretch_params.linked;
+    if ui
+        .checkbox(&mut unlinked, "Neutral background")
+        .on_hover_text(
+            "Stretch each colour separately, so the sky comes out grey.\n\
+             A one-shot colour frame looks green because that is what the \
+             sensor recorded: twice as many green pixels, a higher green \
+             response, and light pollution weighted towards green.\n\
+             This sets that aside to judge the colour of what was captured. It \
+             weakens real colour along with the cast, so it is a check rather \
+             than a way to view.",
+        )
+        .changed()
+    {
+        actions.push(Action::SetStretchParams(
+            fits_core::stretch::StretchParams {
+                linked: !unlinked,
+                ..model.stretch_params
+            },
+        ));
+    }
+
     let mut flip = bayer.flip_rows;
     if ui
         .checkbox(&mut flip, "Flip pattern rows")

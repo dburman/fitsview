@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use fitsview::adapter::{self, Candidate, Kind};
 use fitsview::{crash, icon, shortcuts, ui::FitsViewApp, version_string};
 
 /// What the command line asked for.
@@ -66,6 +67,71 @@ fn usage() -> String {
     )
 }
 
+/// Chooses the graphics adapter, preferring one that can draw to the window
+/// over one that is merely fast.
+///
+/// See [`fitsview::adapter`] for why: the default choice takes the most
+/// powerful adapter and gives up if it cannot present, which over Remote
+/// Desktop means giving up entirely.
+fn presentable_adapter_setup() -> eframe::egui_wgpu::WgpuSetup {
+    use eframe::wgpu;
+
+    let mut setup = match eframe::egui_wgpu::WgpuConfiguration::default().wgpu_setup {
+        eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => setup,
+        other => return other,
+    };
+
+    setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+        let candidates: Vec<Candidate> = adapters
+            .iter()
+            .map(|a| {
+                let info = a.get_info();
+                Candidate {
+                    kind: match info.device_type {
+                        wgpu::DeviceType::DiscreteGpu => Kind::DiscreteGpu,
+                        wgpu::DeviceType::IntegratedGpu => Kind::IntegratedGpu,
+                        wgpu::DeviceType::VirtualGpu => Kind::VirtualGpu,
+                        wgpu::DeviceType::Cpu => Kind::Cpu,
+                        wgpu::DeviceType::Other => Kind::Other,
+                    },
+                    // With no surface to check against there is nothing to
+                    // rule an adapter out, so all of them stay in the running.
+                    presents: surface.is_none_or(|s| a.is_surface_supported(s)),
+                }
+            })
+            .collect();
+
+        for (adapter, candidate) in adapters.iter().zip(&candidates) {
+            let info = adapter.get_info();
+            log::info!(
+                "adapter {} ({:?}, {:?}) {} draw to this window",
+                info.name,
+                info.backend,
+                info.device_type,
+                if candidate.presents { "can" } else { "cannot" }
+            );
+        }
+
+        match adapter::choose(&candidates) {
+            Some(index) => {
+                let chosen = adapters[index].clone();
+                log::info!("drawing with {}", chosen.get_info().name);
+                Ok(chosen)
+            }
+            None => Err(format!(
+                "none of the {} graphics adapters found can draw to a window. \
+                 Over Remote Desktop this is usual: the graphics card cannot \
+                 present to a remote session. Try running with the environment \
+                 variable WGPU_BACKEND set to dx12, which uses Microsoft's \
+                 software renderer.",
+                adapters.len()
+            )),
+        }
+    }));
+
+    setup.into()
+}
+
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -86,6 +152,10 @@ fn main() -> eframe::Result<()> {
     };
 
     let options = eframe::NativeOptions {
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: presentable_adapter_setup(),
+            ..Default::default()
+        },
         viewport: egui::ViewportBuilder::default()
             .with_title(version_string())
             .with_inner_size([1400.0, 900.0])
@@ -99,11 +169,20 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let started = eframe::run_native(
         "fitsview",
         options,
         Box::new(move |cc| Ok(Box::new(FitsViewApp::with_storage(initial, cc.storage)))),
-    )
+    );
+
+    // Returning the error would print one line to a console that a desktop
+    // launch does not have, and write nothing anywhere. Failing to open the
+    // window is the one failure a user cannot work around without being told
+    // something.
+    if let Err(error) = &started {
+        crash::report_startup_failure(&error.to_string());
+    }
+    started
 }
 
 #[cfg(test)]

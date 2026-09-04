@@ -42,6 +42,22 @@ pub struct StretchParams {
     pub shadows_clip: f32,
     /// Where the background should end up, from 0 for black to 1 for white.
     pub target_bg: f32,
+    /// Whether every colour channel shares one stretch.
+    ///
+    /// Linked — the default — measures the channels together and applies the
+    /// same curve to each, so the camera's colour response survives and a red
+    /// nebula stays red. A one-shot colour frame then looks green, because that
+    /// is what the sensor recorded: twice as many green sites, a higher green
+    /// response, and light pollution weighted towards green.
+    ///
+    /// Unlinked measures each channel on its own, which puts all three
+    /// backgrounds at the same brightness and so renders the sky neutral grey.
+    /// It is a colour-correction operation rather than a viewing one — it
+    /// weakens real colour along with the cast — but it is how the colour of a
+    /// frame is judged before stacking.
+    ///
+    /// Has no effect on a mono frame, which has one channel either way.
+    pub linked: bool,
 }
 
 impl Default for StretchParams {
@@ -49,6 +65,7 @@ impl Default for StretchParams {
         Self {
             shadows_clip: -2.8,
             target_bg: 0.25,
+            linked: true,
         }
     }
 }
@@ -214,15 +231,19 @@ fn median_of(values: &mut [f64]) -> f64 {
 ///
 /// Returns one [`Stretch`] per channel: length 1 for mono, 3 for colour.
 ///
-/// **Every channel gets the same stretch, measured from all of them together.**
-/// That is deliberate. Measuring each colour plane separately would put every
-/// channel's background at the same brightness, which is another way of saying
-/// it would divide out the camera's colour response and render a red nebula
+/// By default **every channel gets the same stretch, measured from all of them
+/// together.** That is deliberate: measuring each colour plane separately puts
+/// every channel's background at the same brightness, which is another way of
+/// saying it divides out the camera's colour response and renders a red nebula
 /// grey. Astronomy tools call this the linked variant, and it is the right
-/// default for looking at an image; the unlinked variant is a colour-correction
-/// operation, not a viewing one.
+/// default for looking at an image.
 ///
-/// Normalisation uses the image's overall range for the same reason.
+/// [`StretchParams::linked`] turns it off, measuring each channel separately.
+/// That neutralises the sky, which is how the colour of a frame is judged, at
+/// the cost of the real colour along with the cast.
+///
+/// Normalisation always uses the image's overall range, so that the levels the
+/// channels are compared against remain the same ones.
 #[must_use]
 pub fn compute_stretch(image: &FitsImage, params: &StretchParams) -> Vec<Stretch> {
     let channels = image.channels.max(1);
@@ -231,16 +252,33 @@ pub fn compute_stretch(image: &FitsImage, params: &StretchParams) -> Vec<Stretch
         return vec![Stretch::identity(); channels];
     }
     let low = f64::from(image.min);
+    let normalise = |v: f32| (f64::from(v) - low) / span;
 
-    // One measurement across the whole image, colour planes included.
-    let normalised: Vec<f64> = image
-        .data
-        .par_iter()
-        .map(|&v| (f64::from(v) - low) / span)
-        .collect();
+    // A mono frame has one channel whichever variant is asked for.
+    if params.linked || channels == 1 {
+        // One measurement across the whole image, colour planes included.
+        let normalised: Vec<f64> = image.data.par_iter().map(|&v| normalise(v)).collect();
+        let stretch = stretch_for(&measure_background(&normalised), params);
+        return vec![stretch; channels];
+    }
 
-    let stretch = stretch_for(&measure_background(&normalised), params);
-    vec![stretch; channels]
+    // One measurement per plane. The planes are stored one after another, so
+    // each is a contiguous run of the data.
+    let pixels = image.width * image.height;
+    (0..channels)
+        .map(|plane| {
+            let start = plane * pixels;
+            let end = (start + pixels).min(image.data.len());
+            if start >= end {
+                return Stretch::identity();
+            }
+            let normalised: Vec<f64> = image.data[start..end]
+                .par_iter()
+                .map(|&v| normalise(v))
+                .collect();
+            stretch_for(&measure_background(&normalised), params)
+        })
+        .collect()
 }
 
 /// Turns measured background statistics into a stretch.
@@ -520,6 +558,83 @@ mod tests {
         assert_relative_eq!(clean.midtones, with_nan.midtones, epsilon = 0.02);
     }
 
+    /// A colour image whose channels sit at different levels, the way a
+    /// one-shot colour sensor records the sky: green highest, red lowest.
+    fn unbalanced_colour(width: usize, height: usize) -> FitsImage {
+        let pixels = width * height;
+        let mut data = Vec::with_capacity(pixels * 3);
+        for level in [1000.0f64, 1900.0, 1500.0] {
+            for i in 0..pixels {
+                #[allow(clippy::cast_precision_loss)]
+                data.push(level + (i % 7) as f64);
+            }
+        }
+        let spec = SyntheticSpec::new(width, height, -32).with_channels(3);
+        read_fits_from_bytes(&synthetic_fits(&spec, &data).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn an_unlinked_stretch_puts_every_background_at_the_same_brightness() {
+        // What the option is for: the green cast of a one-shot colour frame is
+        // the sensor telling the truth, and this is how it is set aside to
+        // judge the colour of what was captured.
+        let image = unbalanced_colour(32, 32);
+        let params = StretchParams {
+            linked: false,
+            ..StretchParams::default()
+        };
+        let stretches = compute_stretch(&image, &params);
+        assert_eq!(stretches.len(), 3);
+
+        let luts: Vec<_> = stretches.iter().map(build_lut).collect();
+        let sample = |plane: usize| {
+            let pixels = image.width * image.height;
+            // The plane's median pixel, which is the background: the values
+            // run level..level+6, so the fourth is the middle one.
+            let value = image.data[plane * pixels + 3];
+            let span = f64::from(image.max) - f64::from(image.min);
+            let normalised = (f64::from(value) - f64::from(image.min)) / span;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let index = (normalised * 65535.0).round() as usize;
+            luts[plane][index.min(65535)]
+        };
+
+        let (red, green, blue) = (sample(0), sample(1), sample(2));
+        let spread = red.max(green).max(blue) - red.min(green).min(blue);
+        assert!(
+            spread <= 8,
+            "the three backgrounds should land together: {red} {green} {blue}"
+        );
+    }
+
+    #[test]
+    fn a_linked_stretch_keeps_the_channels_apart() {
+        // The other half of the claim: linked must not neutralise, or the
+        // option would mean nothing and real colour would be lost by default.
+        let image = unbalanced_colour(32, 32);
+        let stretches = compute_stretch(&image, &StretchParams::default());
+        assert_eq!(stretches[0], stretches[1]);
+        assert_eq!(stretches[1], stretches[2]);
+    }
+
+    #[test]
+    fn unlinking_does_nothing_to_a_mono_frame() {
+        let mut pixels = vec![1000.0f64; 32 * 32];
+        pixels[10] = 5000.0;
+        let spec = SyntheticSpec::new(32, 32, -32);
+        let image = read_fits_from_bytes(&synthetic_fits(&spec, &pixels).unwrap()).unwrap();
+
+        let linked = compute_stretch(&image, &StretchParams::default());
+        let unlinked = compute_stretch(
+            &image,
+            &StretchParams {
+                linked: false,
+                ..StretchParams::default()
+            },
+        );
+        assert_eq!(linked, unlinked);
+    }
+
     #[test]
     fn every_colour_channel_gets_the_same_stretch() {
         // Measuring each plane separately would put all three backgrounds at
@@ -730,6 +845,7 @@ mod tests {
                     &StretchParams {
                         shadows_clip,
                         target_bg,
+                        ..StretchParams::default()
                     },
                 );
                 assert!(

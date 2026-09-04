@@ -17,7 +17,11 @@ background thread and neighbours are fetched before you ask for them, so holding
 down the arrow key through a folder never makes the window wait.
 
 **Going through a folder.** Opens a folder and lists only the FITS files in it,
-in the order a human would expect: `light_2` before `light_10`. Step through with
+in the order a human would expect: `light_2` before `light_10`. Subfolders are
+searched two levels down, which is the way captures are filed — target, then
+date, then filter — so opening a target gathers every night of it. Zoom and pan
+stay put as you step between frames, so comparing the same corner of each is a
+matter of holding an arrow key. Step through with
 the arrow keys, Space, or Page Up and Down. The file list collapses to the edge
 when you want the image to fill the screen.
 
@@ -46,6 +50,13 @@ folder in the background, never touching the originals.
 of filters and displays as grey. `B` reconstructs the colour, automatically when
 the file records which filter pattern it used. Exports stay as mosaics, because
 that is what a stacker wants.
+
+Reconstructed colour looks green, and that is the sensor telling the truth:
+twice as many green pixels, a higher green response, and light pollution
+weighted towards green. **Neutral background** stretches each colour separately
+so the sky comes out grey, which is how the colour of a frame is judged before
+stacking. It weakens real colour along with the cast, so it is a check rather
+than a way to view.
 
 **Judging a frame.** `Shift+S` finds the stars and measures them: how many, how
 wide (the full width at half maximum, in pixels) and how round. That is what
@@ -78,8 +89,8 @@ separately: the download is a single executable.
 | `fitsview-linux-x86_64.tar.gz` | 64-bit Intel and AMD Linux |
 | `fitsview-windows-x86_64.zip` | 64-bit Windows |
 
-An Intel Mac needs a build of its own; see [Building and
-Running](#building-and-running) below.
+The Mac build is Apple silicon only. An Intel Mac has to build it from source;
+see [Building and Running](#building-and-running) below.
 
 ### macOS
 
@@ -175,20 +186,11 @@ cargo build --release
 ```
 
 The binary is built for the machine that built it, so an Apple silicon Mac
-produces an `arm64` binary that will not run on an Intel Mac. For one binary
-that runs on both, build each and join them:
-
-```bash
-rustup target add x86_64-apple-darwin aarch64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
-lipo -create -output fitsview \
-  target/x86_64-apple-darwin/release/fitsview \
-  target/aarch64-apple-darwin/release/fitsview
-```
-
-That produces one binary of about 23 MB carrying both architectures, against
-10 MB for a single one.
+produces an `arm64` binary that will not run on an Intel Mac. Releases carry
+the Apple silicon build alone: this application wants a machine that can hold a
+61-megapixel frame in memory and stretch it while you pan, and the Intel Macs
+still in service are not that. On one of them, build from source with the
+command above and you will get a binary for it.
 
 The binary carries only the ad-hoc signature the linker applies. That is fine on
 the machine that built it, but macOS will refuse to open it after it has been

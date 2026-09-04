@@ -371,3 +371,31 @@ easiest: macOS mounts it read-only. `mount | grep -i <name>` should show
       application produces: it wraps between words and stays inside the window.
 - [ ] With stars on and the window narrow, the summary beside the toolbar
       checkbox is not broken mid-word either.
+
+## Folders and zoom
+
+- [ ] Open a target folder holding `date/frames` or `date/filter/frames`. Every
+      night's frames are listed, grouped by folder, with the folder shown as
+      part of the name.
+- [ ] A folder three levels down is not listed. Two is the limit.
+- [ ] Two nights that each hold `light_0001.fits` both appear, and marking one
+      to keep does not mark the other.
+- [ ] Rename a frame that sits in a subfolder: it keeps its place in that
+      subfolder rather than moving to the top, and the list still shows it
+      under its night.
+- [ ] Zoom in, then step to the next frame with the arrow keys. The zoom and
+      the position stay where they were.
+- [ ] Step to a frame from a different camera, of a different size. That one is
+      fitted to the window instead, since the old view means nothing for it.
+
+## Neutral background
+
+- [ ] On a debayered one-shot colour frame with the stretch on, the sky is
+      green. That is right: it is what the sensor recorded.
+- [ ] Ticking **Neutral background** in the one-shot colour section turns the
+      sky grey, and the stars keep their colours.
+- [ ] Untick it and the green comes back.
+- [ ] On a mono frame the setting changes nothing at all.
+- [ ] With it on, the histogram no longer marks the black point and midtone,
+      because the three channels no longer share one.
+- [ ] It is still set the way you left it after quitting and reopening.

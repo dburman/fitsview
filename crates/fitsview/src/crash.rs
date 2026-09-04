@@ -88,6 +88,45 @@ pub fn write_log(report: &Report) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Reports a failure to open the window at all.
+///
+/// A panic is not the only way to get nowhere: if the graphics device cannot
+/// be created, the window never appears and the process ends with a terse line
+/// on a console that a desktop launch does not have. Nothing was written
+/// anywhere, so there was nothing to send on and nothing to read afterwards.
+///
+/// Almost every failure here is the graphics stack, so the message says so and
+/// says what to try, rather than only repeating the error.
+pub fn report_startup_failure(error: &str) {
+    let report = Report {
+        message: format!(
+            "The window could not be opened.\n\n{error}\n\n\
+             This is nearly always the graphics driver. Things worth trying, \
+             in order:\n\
+             \u{2022} Update the graphics driver.\n\
+             \u{2022} Run it with the environment variable WGPU_BACKEND set to \
+             vulkan, then dx12, then gl. One of them usually works, and which \
+             one is worth telling us.\n\
+             \u{2022} On a machine with two graphics adapters, make sure the \
+             application is using the real one rather than the basic display \
+             adapter."
+        ),
+        location: "starting up".to_string(),
+    };
+
+    log::error!("could not start: {error}");
+    let mut text = report.describe();
+    if let Some(path) = write_log(&report) {
+        text.push_str(&format!("\n\nDetails were written to:\n{}", path.display()));
+    }
+
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("fitsview could not start")
+        .set_description(&text)
+        .show();
+}
+
 /// Installs the panic hook.
 ///
 /// Logs the panic, appends it to the crash log, and shows a dialog. The
@@ -117,6 +156,26 @@ pub fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_startup_failure_names_the_graphics_stack_and_what_to_try() {
+        // The failure that leaves nothing behind: no window, no panic, and so
+        // no crash log either. Whatever is shown has to be enough to act on.
+        let report = Report {
+            message: format!(
+                "The window could not be opened.\n\n{}\n\nWGPU_BACKEND",
+                "NoAvailableAdapter"
+            ),
+            location: "starting up".to_string(),
+        };
+        let text = report.describe();
+        assert!(text.contains("could not be opened"), "{text}");
+        assert!(
+            text.contains("WGPU_BACKEND"),
+            "the one thing a user can actually try must be in it: {text}"
+        );
+        assert!(text.contains("NoAvailableAdapter"), "{text}");
+    }
 
     #[test]
     fn a_string_panic_is_described() {

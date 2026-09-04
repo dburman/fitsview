@@ -76,12 +76,21 @@ impl Mapping {
     pub fn stretched(image: &FitsImage, params: &StretchParams) -> Self {
         let stretches = stretch::compute_stretch(image, params);
         let luts = stretches.iter().map(stretch::build_lut).collect();
+        // With one stretch shared by every channel the first describes them
+        // all. Unlinked, the three differ, and there is no single curve to
+        // report: anything drawn from one of them would be wrong for the other
+        // two, so the histogram goes without its markers rather than showing
+        // markers that belong to the red channel alone.
+        let shared = stretches
+            .first()
+            .copied()
+            .filter(|first| stretches.iter().all(|s| s == first));
+
         Self {
             low: image.min,
             high: image.max,
             luts: Arc::new(luts),
-            // Every channel shares one stretch, so the first describes them all.
-            stretch: stretches.first().copied(),
+            stretch: shared,
         }
     }
 

@@ -37,6 +37,7 @@ use crate::texture::{self, DetailRegion, Mapping};
 const KEY_STRETCH_ENABLED: &str = "stretch_enabled";
 const KEY_STRETCH_SHADOWS: &str = "stretch_shadows_clip";
 const KEY_STRETCH_TARGET: &str = "stretch_target_bg";
+const KEY_STRETCH_LINKED: &str = "stretch_linked";
 const KEY_CONFIRM_EVERY_DELETE: &str = "confirm_every_delete";
 const KEY_LAST_FOLDER: &str = "last_folder";
 const KEY_SHOW_FILELIST: &str = "show_filelist";
@@ -113,6 +114,7 @@ impl FitsViewApp {
             shadows_clip: eframe::get_value(storage, KEY_STRETCH_SHADOWS)
                 .unwrap_or(defaults.shadows_clip),
             target_bg: eframe::get_value(storage, KEY_STRETCH_TARGET).unwrap_or(defaults.target_bg),
+            linked: eframe::get_value(storage, KEY_STRETCH_LINKED).unwrap_or(defaults.linked),
         };
         app.model.confirm_every_delete =
             eframe::get_value(storage, KEY_CONFIRM_EVERY_DELETE).unwrap_or(false);
@@ -318,6 +320,11 @@ impl eframe::App for FitsViewApp {
         );
         eframe::set_value(
             storage,
+            KEY_STRETCH_LINKED,
+            &self.model.stretch_params.linked,
+        );
+        eframe::set_value(
+            storage,
             KEY_CONFIRM_EVERY_DELETE,
             &self.model.confirm_every_delete,
         );
@@ -346,12 +353,6 @@ impl eframe::App for FitsViewApp {
         // continues either way; this never blocks.
         if self.model.poll() {
             ui.ctx().request_repaint();
-        }
-        // While any worker is outstanding, keep asking for frames so the result
-        // appears as soon as it lands rather than on the next input event.
-        if self.model.busy() {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(16));
         }
 
         for action in toolbar::show(ui, &self.model) {
@@ -395,6 +396,21 @@ impl eframe::App for FitsViewApp {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
+
+        // While any worker is outstanding, keep asking for frames so its result
+        // appears as soon as it lands rather than on the next input event.
+        //
+        // **After the actions, not before them.** Asking at the top of the
+        // frame only covers work that was already running when the frame
+        // began; work started by this frame's own actions — ticking the star
+        // box, stepping to the next file — would schedule nothing, and whether
+        // the answer ever appeared came down to whether egui happened to paint
+        // again for some other reason. On a machine that paints only when
+        // something moves, that means waiting for the mouse.
+        if self.model.busy() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
     }
 }
 
@@ -422,6 +438,24 @@ mod tests {
             self.values.remove(key);
         }
         fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn the_neutral_background_setting_survives_a_save_and_restore() {
+        let mut app = FitsViewApp::new(None);
+        app.model.handle(Action::SetStretchParams(StretchParams {
+            linked: false,
+            ..StretchParams::default()
+        }));
+
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+
+        let restored = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(
+            !restored.model.stretch_params.linked,
+            "an unlinked stretch must come back unlinked"
+        );
     }
 
     #[test]
@@ -466,6 +500,7 @@ mod tests {
         app.model.handle(Action::SetStretchParams(StretchParams {
             shadows_clip: -1.5,
             target_bg: 0.4,
+            ..StretchParams::default()
         }));
         app.model.handle(Action::ToggleConfirmEveryDelete);
 
