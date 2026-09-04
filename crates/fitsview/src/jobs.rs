@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use fits_core::calib::{self, MasterFlat, MasterFrame};
+use fits_core::stars::{self, DetectionParams};
 use fits_core::{quality, read_fits, write_fits, FitsImage, Quality};
+
+use crate::folder::StarMeasure;
 
 /// What a finished job produced.
 #[derive(Debug)]
@@ -23,7 +26,7 @@ pub enum Outcome {
     /// A master flat, already normalised into a gain map, was built.
     Flat(Box<MasterFlat>),
     /// Every file in the folder was measured.
-    Measured(Vec<(PathBuf, Quality)>),
+    Measured(Vec<(PathBuf, Quality, Option<StarMeasure>)>),
     /// Calibrated copies were written, and this many succeeded.
     Exported {
         /// Files written.
@@ -126,7 +129,7 @@ impl Job {
     /// Measurement is on the raw frame, before any calibration, so the numbers
     /// stay comparable however the display is configured.
     #[must_use]
-    pub fn measure(paths: Vec<PathBuf>) -> Self {
+    pub fn measure(paths: Vec<PathBuf>, stars: Option<DetectionParams>) -> Self {
         let (tx, updates) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -134,7 +137,7 @@ impl Job {
 
         std::thread::Builder::new()
             .name("fitsview-measure".into())
-            .spawn(move || measure_worker(&paths, &tx, &worker_cancel))
+            .spawn(move || measure_worker(&paths, stars.as_ref(), &tx, &worker_cancel))
             .ok();
 
         Self {
@@ -287,12 +290,41 @@ fn build_flat_worker(
     }
 }
 
+/// Finds and measures the stars of one frame.
+///
+/// Takes the colour path when the file says it is a mosaic, exactly as the
+/// viewer does, so that a folder's figures and the frame on screen agree.
+fn measure_stars(image: &fits_core::FitsImage, params: &DetectionParams) -> StarMeasure {
+    let pattern = image
+        .header
+        .get("BAYERPAT")
+        .and_then(|v| fits_core::BayerPattern::parse(v.trim().trim_matches('\'').trim()));
+
+    let field = match pattern {
+        Some(pattern) if image.channels == 1 => stars::detect_mosaic(image, pattern, params),
+        _ => stars::detect(image, params),
+    };
+
+    let scale = fits_core::header::plate_scale_arcsec(&image.header);
+    StarMeasure {
+        fwhm: field.fwhm,
+        fwhm_arcsec: field.fwhm.zip(scale).map(|(fwhm, scale)| fwhm * scale),
+        roundness: field.roundness,
+        count: field.count(),
+    }
+}
+
 /// Measures each file in turn.
 ///
 /// A file that cannot be read is skipped rather than failing the run: one
 /// corrupt frame in two hundred should not deny the user the other 199
 /// measurements.
-fn measure_worker(paths: &[PathBuf], tx: &mpsc::Sender<Update>, cancel: &AtomicBool) {
+fn measure_worker(
+    paths: &[PathBuf],
+    stars: Option<&DetectionParams>,
+    tx: &mpsc::Sender<Update>,
+    cancel: &AtomicBool,
+) {
     let mut measured = Vec::with_capacity(paths.len());
 
     for (index, path) in paths.iter().enumerate() {
@@ -308,7 +340,10 @@ fn measure_worker(paths: &[PathBuf], tx: &mpsc::Sender<Update>, cancel: &AtomicB
         });
 
         match read_fits(path) {
-            Ok(image) => measured.push((path.clone(), quality::measure(&image))),
+            Ok(image) => {
+                let found = stars.map(|params| measure_stars(&image, params));
+                measured.push((path.clone(), quality::measure(&image), found));
+            }
             Err(e) => log::warn!("could not measure {}: {e}", file_name_of(path)),
         }
     }
@@ -665,13 +700,13 @@ mod tests {
     #[test]
     fn measuring_reports_a_value_for_every_readable_file() {
         let (_dir, paths) = frames(3, 100.0);
-        let mut job = Job::measure(paths.clone());
+        let mut job = Job::measure(paths.clone(), None);
         let updates = run(&mut job);
 
         match updates.into_iter().next() {
             Some(Update::Finished(Outcome::Measured(measured))) => {
                 assert_eq!(measured.len(), 3);
-                for (path, quality) in measured {
+                for (path, quality, _) in measured {
                     assert!(paths.contains(&path));
                     assert!((quality.background - 100.0).abs() < 0.01);
                     assert!(quality.sharpness.is_finite());
@@ -688,7 +723,7 @@ mod tests {
         std::fs::write(&bad, b"SIMPLE but nonsense").unwrap();
         paths.push(bad);
 
-        let mut job = Job::measure(paths);
+        let mut job = Job::measure(paths, None);
         let updates = run(&mut job);
         match updates.into_iter().next() {
             Some(Update::Finished(Outcome::Measured(measured))) => {
@@ -703,7 +738,7 @@ mod tests {
         // Throwing the finished work away would make cancelling costly, and
         // there is no reason for it: partial measurements are still useful.
         let (_dir, paths) = frames(30, 10.0);
-        let mut job = Job::measure(paths);
+        let mut job = Job::measure(paths, None);
         job.cancel();
         let updates = run(&mut job);
 

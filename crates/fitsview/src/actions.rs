@@ -489,6 +489,7 @@ mod tests {
                     size: 100,
                     flagged: false,
                     quality: None,
+                    stars: None,
                 })
                 .collect(),
             selected: if names.is_empty() { None } else { Some(0) },

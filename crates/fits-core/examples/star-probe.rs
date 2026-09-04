@@ -64,8 +64,8 @@ fn main() {
         params.threshold, params.smoothing, params.limit
     );
     println!(
-        "{:<26} {:>12} {:>8} {:>7} {:>7} {:>6} {:>6} {:>7} {:>6}",
-        "frame", "filter", "back", "noise", "stars", "fwhm", "round", "path", "ms"
+        "{:<26} {:>12} {:>8} {:>7} {:>7} {:>6} {:>7} {:>6} {:>7} {:>6}",
+        "frame", "filter", "back", "noise", "stars", "fwhm", "arcsec", "round", "path", "ms"
     );
 
     let step = (paths.len() / wanted.max(1)).max(1);
@@ -99,19 +99,25 @@ fn main() {
         let detect_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let (background, noise) = level_and_noise(&image);
+        let scale = fits_core::header::plate_scale_arcsec(&image.header);
+        let arcsec = match (field.fwhm, scale) {
+            (Some(fwhm), Some(s)) => format!("{:.2}\"", fwhm * s),
+            _ => "—".to_string(),
+        };
         let route = if field.threshold_was_raised() {
             format!("{route} {:.0}x", field.threshold_scale)
         } else {
             route.to_string()
         };
         println!(
-            "{:<26} {:>12} {:>8.1} {:>7.2} {:>7} {:>6} {:>6} {:>7} {:>6.0}",
+            "{:<26} {:>12} {:>8.1} {:>7.2} {:>7} {:>6} {:>7} {:>6} {:>7} {:>6.0}",
             short(&name),
             filter_name,
             background,
             noise,
             field.count(),
             figure(field.fwhm),
+            arcsec,
             figure(field.roundness),
             route,
             detect_ms

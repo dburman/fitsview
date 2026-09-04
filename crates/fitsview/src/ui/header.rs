@@ -6,7 +6,7 @@
 //! are the questions calibration raises: whether this dark matches this light
 //! is a question about exposure and temperature, and the answer is here.
 
-use egui::{Grid, RichText, ScrollArea, TextEdit, Ui};
+use egui::{CollapsingHeader, Grid, RichText, ScrollArea, TextEdit, Ui};
 
 use crate::app::{Action, Model};
 
@@ -24,6 +24,78 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
         ui.label(RichText::new("No image").weak());
         return actions;
     };
+
+    // The header first. Which target, which filter, how long: the questions
+    // asked of a frame before anything measured about it.
+    let cards = matching_cards(&loaded.image.header, "");
+    if cards.pinned > 0 {
+        Grid::new("pinned-grid")
+            .num_columns(2)
+            .spacing([12.0, 2.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for (keyword, value) in cards.rows.iter().take(cards.pinned) {
+                    ui.label(RichText::new(*keyword).monospace().strong());
+                    ui.label(RichText::new(*value).monospace());
+                    ui.end_row();
+                }
+            });
+    }
+
+    // Everything else the file happens to carry, which is dozens of cards and
+    // rarely what anyone came for, so it stays shut until it is asked for.
+    let others = cards.rows.len() - cards.pinned;
+    CollapsingHeader::new(format!("Other header cards ({others})"))
+        .id_salt("other-cards")
+        .default_open(false)
+        .show(ui, |ui| {
+            let mut filter = model.header_filter.clone();
+            if ui
+                .add(
+                    TextEdit::singleline(&mut filter)
+                        .hint_text("Filter by keyword or value")
+                        .desired_width(f32::INFINITY),
+                )
+                .changed()
+            {
+                actions.push(Action::SetHeaderFilter(filter.clone()));
+            }
+
+            let shown = matching_cards(&loaded.image.header, &filter);
+            let rest: Vec<_> = shown.rows.iter().skip(shown.pinned).collect();
+            if !filter.trim().is_empty() {
+                ui.label(
+                    RichText::new(format!("{} of {others} cards", rest.len()))
+                        .weak()
+                        .small(),
+                );
+            }
+
+            if rest.is_empty() {
+                ui.label(RichText::new("Nothing matches").weak());
+                return;
+            }
+
+            ScrollArea::vertical()
+                .max_height(MAX_HEIGHT)
+                .auto_shrink([false, true])
+                .id_salt("header-cards")
+                .show(ui, |ui| {
+                    Grid::new("header-grid")
+                        .num_columns(2)
+                        .spacing([12.0, 2.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (keyword, value) in rest {
+                                ui.label(RichText::new(*keyword).monospace().strong());
+                                ui.label(RichText::new(*value).monospace());
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+
+    ui.separator();
 
     // The measurements first: they are about this frame rather than in it, and
     // they are what a decision to keep or discard actually rests on.
@@ -60,6 +132,7 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
     // The star measurements, when they have been asked for and found.
     if model.stars_enabled {
+        let scale = fits_core::header::plate_scale_arcsec(&loaded.image.header);
         Grid::new("stars-grid")
             .num_columns(2)
             .spacing([12.0, 2.0])
@@ -75,7 +148,19 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
                 ui.label(RichText::new("Width").strong());
                 ui.label(match field.and_then(|f| f.fwhm) {
-                    Some(fwhm) => format!("{fwhm:.2} px"),
+                    // In arcseconds as well when the header says what the
+                    // optics were. A width in pixels cannot be compared with
+                    // the seeing, or with another night through another
+                    // telescope, and a figure that is impossible does not look
+                    // impossible until it is in arcseconds.
+                    Some(fwhm) => match scale {
+                        // A plain quotation mark for arcseconds rather than the
+                        // typographic double prime: the font the interface
+                        // ships with has no glyph for that one, and it drew as
+                        // an empty box.
+                        Some(arcsec) => format!("{fwhm:.2} px  ({:.2}\")", fwhm * arcsec),
+                        None => format!("{fwhm:.2} px"),
+                    },
                     None => "—".to_string(),
                 });
                 ui.end_row();
@@ -106,7 +191,8 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
             RichText::new(
                 "Width is the full width at half maximum, in pixels; smaller is \
                  sharper. Roundness falls when stars are trailed. Saturated \
-                 stars are counted but not measured. A raised threshold means \
+                 stars are counted but not measured. Arcseconds need the focal \
+                 length and the pixel size in the header. A raised threshold means \
                  the frame was too bright to search at the setting asked for, \
                  so only its brighter stars are counted.",
             )
@@ -115,63 +201,6 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
         );
         ui.separator();
     }
-
-    let mut filter = model.header_filter.clone();
-    if ui
-        .add(
-            TextEdit::singleline(&mut filter)
-                .hint_text("Filter by keyword or value")
-                .desired_width(f32::INFINITY),
-        )
-        .changed()
-    {
-        actions.push(Action::SetHeaderFilter(filter.clone()));
-    }
-
-    let cards = matching_cards(&loaded.image.header, &filter);
-    ui.label(
-        RichText::new(if filter.trim().is_empty() {
-            format!("{} cards", cards.rows.len())
-        } else {
-            format!(
-                "{} of {} cards",
-                cards.rows.len(),
-                loaded.image.header.cards.len()
-            )
-        })
-        .weak()
-        .small(),
-    );
-
-    if cards.rows.is_empty() {
-        ui.label(RichText::new("Nothing matches").weak());
-        return actions;
-    }
-
-    ScrollArea::vertical()
-        .max_height(MAX_HEIGHT)
-        .auto_shrink([false, true])
-        .id_salt("header-cards")
-        .show(ui, |ui| {
-            Grid::new("header-grid")
-                .num_columns(2)
-                .spacing([12.0, 2.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    for (index, (keyword, value)) in cards.rows.iter().enumerate() {
-                        // A rule between the keywords worth seeing first and
-                        // everything else the file happens to carry.
-                        if index == cards.pinned && cards.pinned > 0 {
-                            ui.separator();
-                            ui.separator();
-                            ui.end_row();
-                        }
-                        ui.label(RichText::new(*keyword).monospace().strong());
-                        ui.label(RichText::new(*value).monospace());
-                        ui.end_row();
-                    }
-                });
-        });
 
     actions
 }
@@ -185,6 +214,10 @@ pub fn section(ui: &mut Ui, model: &Model) -> Vec<Action> {
 pub const PINNED: &[&str] = &[
     "OBJECT", "TELESCOP", "CAMERAID", "IMAGETYP", "FILTER", "EXPOSURE", "GAIN", "CCD_TEMP",
     "BAYERPAT", "DATE-OBS",
+    // The optics, because they are what turns a width in pixels into a width
+    // in arcseconds, and a reader who doubts the figure should be able to see
+    // what it was worked out from.
+    "FOCALLEN", "XPIXSZ",
 ];
 
 /// The header cards to show, in the order to show them.

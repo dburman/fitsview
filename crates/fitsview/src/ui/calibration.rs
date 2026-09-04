@@ -46,8 +46,12 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                             actions.extend(darks_section(ui, model));
                             ui.separator();
                             actions.extend(flats_section(ui, model));
-                            ui.separator();
-                            actions.extend(colour_section(ui, model));
+                            // Nothing to reconstruct on a frame from a mono
+                            // sensor, so the controls for it are not shown.
+                            if model.is_mosaic {
+                                ui.separator();
+                                actions.extend(colour_section(ui, model));
+                            }
 
                             if let Some(job) = &model.job {
                                 ui.separator();

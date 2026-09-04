@@ -22,6 +22,12 @@ pub struct FileEntry {
     /// Marked to keep. Phase 4 gives this meaning; the column exists now so the
     /// list layout does not change later.
     pub flagged: bool,
+    /// What its stars look like, once the folder has been measured.
+    ///
+    /// Separate from `quality` because it costs a hundred times as much to
+    /// find out: the sky background falls out of the samples the stretch
+    /// already takes, while this means searching the frame.
+    pub stars: Option<StarMeasure>,
     /// What the frame looks like, once it has been measured.
     ///
     /// `None` until the file has been opened or the folder measured, since
@@ -39,11 +45,21 @@ pub enum SortKey {
     Background,
     /// Structure relative to noise: blur and cloud reduce it.
     Sharpness,
+    /// How wide the stars are: the measure of focus, seeing and tracking.
+    Width,
+    /// How round the stars are, which falls when the mount slips.
+    Roundness,
 }
 
 impl SortKey {
     /// Every ordering, for offering a choice.
-    pub const ALL: [SortKey; 3] = [SortKey::Name, SortKey::Background, SortKey::Sharpness];
+    pub const ALL: [SortKey; 5] = [
+        SortKey::Name,
+        SortKey::Background,
+        SortKey::Sharpness,
+        SortKey::Width,
+        SortKey::Roundness,
+    ];
 
     /// What to call it in the interface.
     #[must_use]
@@ -52,19 +68,52 @@ impl SortKey {
             SortKey::Name => "Name",
             SortKey::Background => "Background",
             SortKey::Sharpness => "Sharpness",
+            SortKey::Width => "Width",
+            SortKey::Roundness => "Roundness",
         }
     }
 
     /// The measured value this key orders by.
     #[must_use]
     pub fn value_of(self, entry: &FileEntry) -> Option<f64> {
-        let quality = entry.quality?;
         match self {
             SortKey::Name => None,
-            SortKey::Background => Some(quality.background),
-            SortKey::Sharpness => Some(quality.sharpness),
+            SortKey::Background => Some(entry.quality?.background),
+            SortKey::Sharpness => Some(entry.quality?.sharpness),
+            // In arcseconds where the optics are known, so that a folder shot
+            // through two telescopes still sorts sensibly.
+            SortKey::Width => {
+                let stars = entry.stars?;
+                stars.fwhm_arcsec.or(stars.fwhm)
+            }
+            SortKey::Roundness => entry.stars?.roundness,
         }
     }
+
+    /// Whether this measure needs the stars to have been found.
+    ///
+    /// Those cost a hundred times what the others do, so the interface says
+    /// when a folder has not been measured for them yet.
+    #[must_use]
+    pub const fn needs_stars(self) -> bool {
+        matches!(self, SortKey::Width | SortKey::Roundness)
+    }
+}
+
+/// What a frame's stars say about it, kept with the file in the list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StarMeasure {
+    /// Median full width at half maximum, in pixels.
+    pub fwhm: Option<f64>,
+    /// The same in arcseconds, when the header said what the optics were.
+    ///
+    /// Worked out where the header is to hand rather than in the interface,
+    /// which has only the frame on screen and not the rest of the folder.
+    pub fwhm_arcsec: Option<f64>,
+    /// Median roundness: one for circles, falling as stars trail.
+    pub roundness: Option<f64>,
+    /// How many stars were found.
+    pub count: usize,
 }
 
 /// The range of a measure that counts as ordinary for a folder.
@@ -180,6 +229,7 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) -> s
             size,
             flagged: false,
             quality: None,
+            stars: None,
         });
     }
     Ok(())
@@ -274,6 +324,16 @@ impl Folder {
     ///
     /// Returns whether the file was found, since a folder can be rescanned
     /// while a measurement job is still running.
+    /// Records what a frame's stars look like.
+    pub fn set_stars(&mut self, path: &Path, stars: StarMeasure) -> bool {
+        if let Some(entry) = self.files.iter_mut().find(|e| e.path == path) {
+            entry.stars = Some(stars);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn set_quality(&mut self, path: &Path, quality: Quality) -> bool {
         if let Some(entry) = self.files.iter_mut().find(|e| e.path == path) {
             entry.quality = Some(quality);
@@ -281,6 +341,12 @@ impl Folder {
         } else {
             false
         }
+    }
+
+    /// How many files have had their stars found.
+    #[must_use]
+    pub fn measured_stars(&self) -> usize {
+        self.files.iter().filter(|e| e.stars.is_some()).count()
     }
 
     /// How many files have been measured.
@@ -695,6 +761,7 @@ mod tests {
                     size: 100,
                     flagged: false,
                     quality: None,
+                    stars: None,
                 })
                 .collect(),
             selected: if n == 0 { None } else { Some(0) },

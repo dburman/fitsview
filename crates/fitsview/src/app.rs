@@ -154,6 +154,9 @@ pub enum Action {
     ToggleBayerFlip,
     /// Measure every file in the folder, so bad frames can be sorted out.
     MeasureFolder,
+    /// Find the stars in every file in the folder, so width and roundness can
+    /// be compared across it. Far slower than [`Action::MeasureFolder`].
+    MeasureFolderStars,
     /// Order the file list by this measure.
     SortBy(SortKey),
     /// Write calibrated copies of every file in the folder into this folder.
@@ -538,6 +541,12 @@ pub struct Model {
     /// How files are deleted and renamed. Swapped in tests so that nothing
     /// reaches the real trash.
     ops: Box<dyn FileOps + Send>,
+    /// Whether the frame on screen is a colour mosaic.
+    ///
+    /// Worked out once when the frame arrives, because the colour controls are
+    /// only shown for a frame they apply to and asking every frame would mean
+    /// asking sixty times a second.
+    pub is_mosaic: bool,
     /// Whether the open folder is on a volume that cannot be written to.
     ///
     /// Probed once when the folder is opened rather than guessed from
@@ -591,6 +600,7 @@ impl Model {
             toast: None,
             loader: Loader::default(),
             ops: Box::new(RealFileOps),
+            is_mosaic: false,
             read_only: false,
         }
     }
@@ -766,7 +776,8 @@ impl Model {
                 self.refresh_after_calibration_change();
                 self.remember_calibration();
             }
-            Action::MeasureFolder => self.measure_folder(),
+            Action::MeasureFolder => self.measure_folder(false),
+            Action::MeasureFolderStars => self.measure_folder(true),
             Action::SortBy(key) => {
                 if self.sort_key != key {
                     self.sort_key = key;
@@ -1148,7 +1159,11 @@ impl Model {
     }
 
     /// Starts measuring every file in the folder.
-    fn measure_folder(&mut self) {
+    ///
+    /// `with_stars` asks for the stars as well, which means searching each
+    /// frame rather than sampling it: a hundred times the work, and its own
+    /// button because of it.
+    fn measure_folder(&mut self, with_stars: bool) {
         if self.job.is_some() {
             return;
         }
@@ -1159,7 +1174,11 @@ impl Model {
             return;
         }
         let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
-        self.job = Some(Job::measure(paths));
+        // The stars are found for the whole folder only when they are being
+        // looked at, because finding them costs a hundred times what the sky
+        // background does and most of the time nobody is asking.
+        let stars = with_stars.then_some(self.star_params);
+        self.job = Some(Job::measure(paths, stars));
     }
 
     /// Asks for the current frame's stars, if they are wanted and not already
@@ -1235,8 +1254,11 @@ impl Model {
                 jobs::Update::Finished(jobs::Outcome::Measured(measured)) => {
                     let count = measured.len();
                     if let Some(folder) = self.folder.as_mut() {
-                        for (path, quality) in measured {
+                        for (path, quality, stars) in measured {
                             folder.set_quality(&path, quality);
+                            if let Some(stars) = stars {
+                                folder.set_stars(&path, stars);
+                            }
                         }
                         // Keep whatever ordering is in force, now that more
                         // files have a value to order by.
@@ -1607,6 +1629,12 @@ impl Model {
         #[allow(clippy::cast_precision_loss)]
         let arriving = Vec2::new(shown.width as f32, shown.height as f32);
         let refit = self.loaded.as_ref().map(Loaded::size) != Some(arriving);
+
+        // A raw colour frame and a mono one both have a single plane, so the
+        // header is asked first and the pixels only when it says nothing.
+        self.is_mosaic = self.bayer.pattern.is_some()
+            || image.channels == 3
+            || fits_core::debayer::looks_like_mosaic(&image);
 
         self.loaded = Some(Loaded {
             path,
@@ -4295,6 +4323,66 @@ mod tests {
             m.generation, before,
             "the image on screen has to be built again"
         );
+    }
+
+    #[test]
+    fn measuring_a_folder_collects_star_figures_for_every_frame() {
+        // The point of the whole thing: comparing width and roundness across a
+        // folder, rather than one frame at a time.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.fits", "b.fits", "c.fits"] {
+            let (w, h) = (120usize, 120usize);
+            let mut pixels = fits_core::testutil::gaussian_background(w, h, 1000.0, 10.0, 71);
+            for (cx, cy) in [(30usize, 40usize), (70, 60), (90, 90), (40, 90)] {
+                for dy in 0..9 {
+                    for dx in 0..9 {
+                        let (x, y) = (cx + dx - 4, cy + dy - 4);
+                        let r = ((dx as f64 - 4.0).powi(2) + (dy as f64 - 4.0).powi(2)) / 4.5;
+                        pixels[y * w + x] += 9000.0 * (-r).exp();
+                    }
+                }
+            }
+            write_synthetic(dir.path(), name, &SyntheticSpec::new(w, h, -32), &pixels).unwrap();
+        }
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::SortBy(crate::folder::SortKey::Width));
+        m.handle(Action::MeasureFolderStars);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && m.job.is_some() {
+            m.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(m.job.is_none(), "measuring never finished");
+
+        let folder = m.folder.as_ref().unwrap();
+        assert_eq!(folder.measured_stars(), 3, "every frame needs figures");
+        for entry in &folder.files {
+            let stars = entry.stars.expect("stars for every frame");
+            assert!(stars.count >= 4, "found {} stars", stars.count);
+            assert!(stars.fwhm.is_some(), "and a width for them");
+            assert!(stars.roundness.is_some());
+        }
+    }
+
+    #[test]
+    fn measuring_without_the_star_columns_skips_the_expensive_pass() {
+        // Finding stars costs a hundred times what the background does, so it
+        // is not done unless something is asking for it.
+        let dir = folder_of(2, 40, 40);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::MeasureFolder);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && m.job.is_some() {
+            m.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let folder = m.folder.as_ref().unwrap();
+        assert_eq!(folder.measured(), 2, "the cheap measures are still taken");
+        assert_eq!(folder.measured_stars(), 0, "the expensive one is not");
     }
 
     #[test]

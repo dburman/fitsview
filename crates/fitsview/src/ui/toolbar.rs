@@ -186,8 +186,10 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                         };
                         if field.capped {
                             // "5,000 stars" on two frames that hold twelve and
-                            // twenty thousand would look like a match.
-                            text.insert(0, '\u{2265}');
+                            // twenty thousand would look like a match. Written
+                            // as a trailing plus rather than a greater-than-or-
+                            // equal sign, which the bundled font cannot draw.
+                            text.insert_str(0, "at least ");
                         }
                         if field.threshold_was_raised() {
                             // The count cannot be compared with a neighbouring
@@ -344,8 +346,8 @@ fn star_settings(ui: &mut Ui, model: &Model) -> Vec<Action> {
             ui.horizontal(|ui| {
                 ui.label("Most stars").on_hover_text(
                     "The brightest this many are kept. A count that reaches it \
-                     is shown with a ≥, because it can no longer be compared \
-                     with another frame's.",
+                     is shown as \"at least\", because it can no longer be \
+                     compared with another frame's.",
                 );
                 ui.add(
                     DragValue::new(&mut params.limit)

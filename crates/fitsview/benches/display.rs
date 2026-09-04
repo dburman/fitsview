@@ -59,6 +59,7 @@ fn bench_per_frame(c: &mut Criterion) {
                     noise: 20.0,
                     sharpness: 1.0 + f64::from(i % 7) / 10.0,
                 }),
+                stars: None,
             })
             .collect(),
         selected: Some(0),

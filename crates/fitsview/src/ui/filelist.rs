@@ -63,6 +63,7 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
                 let measured = folder.measured();
                 let all = folder.len();
+                let with_stars = folder.measured_stars();
                 if measured < all
                     && ui
                         .add_enabled(model.job.is_none(), egui::Button::new("Measure"))
@@ -77,6 +78,32 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 }
                 if measured > 0 && measured < all {
                     ui.label(RichText::new(format!("{measured}/{all}")).weak().small());
+                }
+
+                // Its own button, because it is a hundred times the work: a
+                // folder of full-frame captures takes seconds rather than
+                // milliseconds, and nobody should pay that without asking.
+                if with_stars < all
+                    && ui
+                        .add_enabled(model.job.is_none(), egui::Button::new("Measure stars"))
+                        .on_hover_text(
+                            "Find the stars in every frame, so their width and \
+                             roundness can be compared across the folder.\n\
+                             This reads and searches each frame: seconds for a folder \
+                             of full-frame captures, against milliseconds for the \
+                             measure beside it.\n\
+                             It also fills in the background and sharpness.",
+                        )
+                        .clicked()
+                {
+                    actions.push(Action::MeasureFolderStars);
+                }
+                if with_stars > 0 && with_stars < all {
+                    ui.label(
+                        RichText::new(format!("{with_stars}/{all} stars"))
+                            .weak()
+                            .small(),
+                    );
                 }
             });
             ui.separator();
@@ -121,7 +148,11 @@ pub struct RowResponse {
 
 /// Draws one row.
 fn row(ui: &mut Ui, entry: &FileEntry, selected: bool, key: SortKey, unusual: bool) -> RowResponse {
-    let response = ui
+    // Whether the name itself was clicked. A label claims the pointer where it
+    // sits, so the row's own click never fires over the text — which is
+    // precisely where anyone aims.
+    let mut name_clicked = false;
+    let scoped = ui
         .scope(|ui| {
             ui.horizontal(|ui| {
                 // The flag column is present from Phase 3 so that turning it on
@@ -131,7 +162,9 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool, key: SortKey, unusual: bo
 
                 let text = RichText::new(&entry.name);
                 let text = if selected { text.strong() } else { text };
-                ui.add(Label::new(text).truncate());
+                name_clicked = ui
+                    .add(Label::new(text).truncate().sense(Sense::click()))
+                    .clicked();
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // The measure being sorted by, where there is one, in place
@@ -157,8 +190,8 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool, key: SortKey, unusual: bo
                 });
             });
         })
-        .response
-        .interact(Sense::click());
+        .response;
+    let response = scoped.interact(Sense::click());
 
     if selected {
         ui.painter().rect_filled(
@@ -168,7 +201,7 @@ fn row(ui: &mut Ui, entry: &FileEntry, selected: bool, key: SortKey, unusual: bo
         );
     }
     RowResponse {
-        clicked: response.clicked(),
+        clicked: response.clicked() || name_clicked,
         rect: Some(response.rect),
     }
 }
@@ -184,6 +217,13 @@ pub fn measure_text(entry: &FileEntry, key: SortKey) -> Option<String> {
         SortKey::Name => return None,
         SortKey::Background => format!("{value:.0}"),
         SortKey::Sharpness => format!("{value:.2}"),
+        // Arcseconds where the optics were recorded, pixels otherwise, marked
+        // so the two are never read as the same number.
+        SortKey::Width => match entry.stars.and_then(|s| s.fwhm_arcsec) {
+            Some(arcsec) => format!("{arcsec:.1}\""),
+            None => format!("{value:.1} px"),
+        },
+        SortKey::Roundness => format!("{value:.2}"),
     })
 }
 
@@ -221,6 +261,7 @@ mod tests {
             size: 1024,
             flagged: false,
             quality,
+            stars: None,
         }
     }
 

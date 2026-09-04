@@ -17,9 +17,6 @@ use crate::background::BackgroundMap;
 use crate::filter;
 use crate::image::FitsImage;
 
-/// Turns a Gaussian's standard deviation into a full width at half maximum.
-const FWHM_PER_SIGMA: f64 = 2.354_820_045_030_949;
-
 /// How hard to look.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectionParams {
@@ -719,38 +716,38 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
         return None;
     }
 
-    // A window wide enough to hold the wings, from the region's own extent.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    let radius = ((pixels.len() as f64).sqrt().ceil() as usize).clamp(3, 16);
-    let (moment_xx, moment_yy, moment_xy, weight) = moments(image, cx, cy, radius, background);
-    if weight <= 0.0 {
+    // The pixels that reach half the star's own peak, which is what the words
+    // "full width at half maximum" describe.
+    let half = half_maximum_region(image, peak_at, background, peak);
+    if half.count < MINIMUM_HALF_MAXIMUM_PIXELS {
+        // One or two pixels above half of their own peak is a noise spike or a
+        // star too poorly sampled to measure. Either way there is no width to
+        // report.
         return None;
     }
 
-    let variance_x = moment_xx / weight;
-    let variance_y = moment_yy / weight;
-    let covariance = moment_xy / weight;
+    // A disc of area A has diameter 2*sqrt(A/pi), and for a Gaussian the pixels
+    // above half its peak form exactly the disc whose diameter is the full
+    // width at half maximum. This counts whole pixels, so it cannot see finer
+    // than the grid — but it measures the star and only the star, which is
+    // what the second moments over a window did not.
+    //
+    // Weighting by brightness over a small window was tried instead, to reach
+    // below the size of a pixel. It was worse: in a window that is mostly sky,
+    // the pixels above the background are the upward half of the noise, all of
+    // them far from the centre, and a second moment weights them by the square
+    // of that distance. Checked against the pixels of a real star read off by
+    // hand, this count agrees and that did not.
+    #[allow(clippy::cast_precision_loss)]
+    let fwhm = 2.0 * (half.count as f64 / std::f64::consts::PI).sqrt();
 
-    let mean_variance = (variance_x + variance_y) / 2.0;
-    if mean_variance <= 0.0 {
-        return None;
-    }
-    let fwhm = FWHM_PER_SIGMA * mean_variance.sqrt();
-
-    // The axes of the intensity distribution, from the eigenvalues of its
-    // covariance. Their ratio is how round the star is.
-    let difference = ((variance_x - variance_y).powi(2) + 4.0 * covariance * covariance).sqrt();
-    let major = (variance_x + variance_y + difference) / 2.0;
-    let minor = (variance_x + variance_y - difference) / 2.0;
-    let roundness = if major > 0.0 {
-        (minor.max(0.0) / major).sqrt()
-    } else {
-        0.0
-    };
+    // Roundness from the whole detected region rather than from the few pixels
+    // above half the peak. Shape needs area: the half-maximum region of a well
+    // sampled star is three or four pixels, and the shape of three pixels is
+    // the shape of the grid they sit on, which came out the same for every
+    // star on every frame. The detected region is ten times that and stretches
+    // with the star when the mount slips, which is the thing worth seeing.
+    let roundness = region_roundness(pixels, image.width);
 
     Some(Star {
         x: cx,
@@ -814,36 +811,129 @@ fn ring_fraction(image: &FitsImage, peak_at: usize, background: f64) -> f64 {
     (total / f64::from(count)) / centre
 }
 
-/// Second central moments of the background-subtracted signal about a centre.
-fn moments(
-    image: &FitsImage,
-    cx: f64,
-    cy: f64,
-    radius: usize,
-    background: f64,
-) -> (f64, f64, f64, f64) {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (ix, iy) = (cx.round() as usize, cy.round() as usize);
-    let x0 = ix.saturating_sub(radius);
-    let y0 = iy.saturating_sub(radius);
-    let x1 = (ix + radius + 1).min(image.width);
-    let y1 = (iy + radius + 1).min(image.height);
+/// Fewest pixels above half the peak for a width to mean anything.
+///
+/// Three pixels is a full width at half maximum of about two, which is the
+/// least a sensor can sample. Below that the number would describe the pixel
+/// grid rather than the sky.
+const MINIMUM_HALF_MAXIMUM_PIXELS: usize = 3;
 
-    let (mut xx, mut yy, mut xy, mut weight) = (0.0, 0.0, 0.0, 0.0);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let value = f64::from(image.data[y * image.width + x]) - background;
-            if !value.is_finite() || value <= 0.0 {
-                continue;
-            }
-            let (dx, dy) = (x as f64 - cx, y as f64 - cy);
-            xx += value * dx * dx;
-            yy += value * dy * dy;
-            xy += value * dx * dy;
-            weight += value;
+/// How far from the peak the search for that region may reach.
+///
+/// Wide enough for a badly defocused star at any sensible sampling, and
+/// bounded so that a gradient cannot walk it across the frame.
+const HALF_MAXIMUM_REACH: i64 = 40;
+
+/// The pixels reaching half a star's peak.
+struct HalfMaximum {
+    /// How many pixels are in it, which is the area the width comes from.
+    count: usize,
+}
+
+/// How round a region is: one for a circle, towards zero for a streak.
+///
+/// From the eigenvalues of its second moments, which are the squares of the two
+/// axes of the shape it makes.
+fn region_roundness(pixels: &[usize], width: usize) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let count = pixels.len() as f64;
+    if count < 2.0 {
+        return 0.0;
+    }
+
+    let (mut sum_x, mut sum_y) = (0.0f64, 0.0f64);
+    for index in pixels {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            sum_x += (index % width) as f64;
+            sum_y += (index / width) as f64;
         }
     }
-    (xx, yy, xy, weight)
+    let (cx, cy) = (sum_x / count, sum_y / count);
+
+    let (mut xx, mut yy, mut xy) = (0.0f64, 0.0f64, 0.0f64);
+    for index in pixels {
+        #[allow(clippy::cast_precision_loss)]
+        let (dx, dy) = ((index % width) as f64 - cx, (index / width) as f64 - cy);
+        xx += dx * dx;
+        yy += dy * dy;
+        xy += dx * dy;
+    }
+    let (xx, yy, xy) = (xx / count, yy / count, xy / count);
+
+    let difference = ((xx - yy).powi(2) + 4.0 * xy * xy).sqrt();
+    let major = (xx + yy + difference) / 2.0;
+    let minor = (xx + yy - difference) / 2.0;
+    if major > 0.0 {
+        (minor.max(0.0) / major).sqrt()
+    } else {
+        0.0
+    }
+}
+
+/// Grows the region of pixels that reach half the peak, outwards from the peak.
+///
+/// **This is measured on the star and nothing else.** The width used to come
+/// from second moments over a window sized to the detection — up to sixteen
+/// pixels' radius — and second moments weight a pixel by the square of its
+/// distance, so the far corners of that window dominated the answer. Whatever
+/// sat in them, noise or a neighbour or a scrap of nebulosity left after
+/// subtracting the sky, was measured instead of the star. On frames taken with
+/// the cover on, which hold no stars at all, it returned widths of eight
+/// pixels; on real frames it reported ten, which at the plate scale of the
+/// camera that took them is eighteen arcseconds, some six times the worst
+/// seeing anyone images through.
+///
+/// Growing outwards from the peak while pixels stay above half of it cannot do
+/// that: it stops at the star's own edge.
+fn half_maximum_region(
+    image: &FitsImage,
+    peak_at: usize,
+    background: f64,
+    peak: f64,
+) -> HalfMaximum {
+    let (width, height) = (image.width, image.height);
+    let level = background + peak / 2.0;
+    #[allow(clippy::cast_possible_wrap)]
+    let (px, py) = ((peak_at % width) as i64, (peak_at / width) as i64);
+
+    let mut seen: Vec<(i64, i64)> = Vec::new();
+    let mut queue: Vec<(i64, i64)> = vec![(px, py)];
+    let mut visited: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+    visited.insert((px, py));
+
+    while let Some((x, y)) = queue.pop() {
+        seen.push((x, y));
+        for (dx, dy) in [
+            (-1i64, 0i64),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+        ] {
+            let (nx, ny) = (x + dx, y + dy);
+            if (nx - px).abs() > HALF_MAXIMUM_REACH || (ny - py).abs() > HALF_MAXIMUM_REACH {
+                continue;
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
+                continue;
+            }
+            if !visited.insert((nx, ny)) {
+                continue;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let value = f64::from(image.data[ny as usize * width + nx as usize]);
+            if value.is_finite() && value >= level {
+                queue.push((nx, ny));
+            }
+        }
+    }
+
+    HalfMaximum { count: seen.len() }
 }
 
 /// Turns a list of stars into the summary a frame is judged by.
@@ -1131,7 +1221,9 @@ mod tests {
         }
 
         for (sigma, measured) in &widths {
-            let expected = FWHM_PER_SIGMA * sigma;
+            // A Gaussian's full width at half maximum is this multiple of its
+            // standard deviation.
+            let expected = 2.354_820_045_030_949 * sigma;
             assert!(
                 (measured - expected).abs() < expected * 0.25,
                 "sigma {sigma}: measured {measured:.2}, expected about {expected:.2}"

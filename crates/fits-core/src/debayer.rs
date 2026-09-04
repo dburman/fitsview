@@ -274,6 +274,94 @@ fn mean_of(values: [f32; 4], count: usize) -> f32 {
 ///
 /// Kept so the specialised interior can be held to agreeing with it, which is
 /// the only thing making the optimisation safe. Not used in normal operation.
+/// Whether a single-plane frame looks like an undebayered colour mosaic.
+///
+/// Every frame from a mono sensor has one plane, and so does every raw frame
+/// from a colour one, so the plane count cannot tell them apart. `BAYERPAT` in
+/// the header settles it when it is there — and it usually is — but not every
+/// capture program writes it, and a viewer that hides the colour controls
+/// whenever the keyword is missing would be unusable with those files.
+///
+/// What separates them is that a mosaic's four sites see different amounts of
+/// light. Split the frame into the four positions of the 2×2 grid, take the
+/// median of each, and compare their spread with the noise: on a mono frame the
+/// four are the same sky and land together, while on a mosaic red and green sit
+/// far apart. A frame of nothing at all — a bias, a covered exposure — has no
+/// spread either way and is reported as mono, which is the safe answer, since
+/// there is nothing there to reconstruct.
+#[must_use]
+pub fn looks_like_mosaic(image: &FitsImage) -> bool {
+    if image.channels != 1 || image.width < 8 || image.height < 8 {
+        return false;
+    }
+
+    // Enough of the frame for a stable median without reading all of it.
+    let wanted = 40_000usize;
+    let tiles = (image.width / 2) * (image.height / 2);
+    let step = (tiles / wanted).max(1);
+
+    let mut sites: [Vec<f32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut neighbours: Vec<f32> = Vec::new();
+    for tile in (0..tiles).step_by(step) {
+        let (tx, ty) = (tile % (image.width / 2), tile / (image.width / 2));
+        let (x, y) = (tx * 2, ty * 2);
+        let mut corners = [0.0f32; 4];
+        let mut all_finite = true;
+        for (index, (dx, dy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+            let value = image.data[(y + dy) * image.width + x + dx];
+            if value.is_finite() {
+                corners[index] = value;
+            } else {
+                all_finite = false;
+            }
+        }
+        if !all_finite {
+            continue;
+        }
+        for (slot, value) in sites.iter_mut().zip(corners) {
+            slot.push(value);
+        }
+        // Two pixels apart is the same site on a mosaic, so this measures the
+        // noise without the pattern in it.
+        if x + 2 < image.width {
+            let along = image.data[y * image.width + x + 2];
+            if along.is_finite() {
+                neighbours.push((along - corners[0]).abs());
+            }
+        }
+    }
+
+    if sites[0].len() < 64 || neighbours.len() < 64 {
+        return false;
+    }
+
+    let mut medians: Vec<f64> = sites.iter_mut().map(|s| f64::from(middle(s))).collect();
+    medians.sort_by(f64::total_cmp);
+    let spread = medians[3] - medians[0];
+
+    let noise = f64::from(middle(&mut neighbours)) * crate::stretch::MAD_TO_SIGMA
+        / std::f64::consts::SQRT_2;
+    if noise <= 0.0 {
+        // Nothing varies at all: a synthetic frame, or a flat field. Without a
+        // scale to compare against, the honest answer is that we cannot tell.
+        return spread > 0.0;
+    }
+
+    // Three deviations apart is far more than sky noise explains and far less
+    // than the gap between a red and a green site on any real sensor.
+    spread / noise > 3.0
+}
+
+/// Median of a slice, reordering it.
+fn middle(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let middle = values.len() / 2;
+    values.select_nth_unstable_by(middle, |a, b| a.total_cmp(b));
+    values[middle]
+}
+
 #[cfg(test)]
 fn debayer_generally(image: &FitsImage, pattern: BayerPattern) -> Vec<f32> {
     let plane = image.width * image.height;
@@ -832,5 +920,69 @@ mod tests {
         let image = read_fits_from_bytes(&synthetic_fits(&spec, &[100.0; 16]).unwrap()).unwrap();
         let out = debayer(&image, BayerPattern::Rggb).unwrap();
         assert_eq!(out.header.get("OBJECT"), Some("M42"));
+    }
+
+    #[test]
+    fn a_mono_frame_does_not_look_like_a_mosaic() {
+        // Sky plus noise, the same at every site.
+        let (w, h) = (64usize, 64usize);
+        let pixels = crate::testutil::gaussian_background(w, h, 1000.0, 12.0, 61);
+        let image = image_of(w, h, &pixels);
+        assert!(!looks_like_mosaic(&image));
+    }
+
+    #[test]
+    fn a_raw_colour_frame_looks_like_a_mosaic() {
+        // The levels measured on a real one-shot colour frame: green well
+        // above red, with sky noise on top.
+        let (w, h) = (64usize, 64usize);
+        let mut pixels = crate::testutil::gaussian_background(w, h, 0.0, 12.0, 62);
+        let levels = [1070.0, 1992.0, 1530.0];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] += levels[BayerPattern::Rggb.colour_at(x, y).plane()];
+            }
+        }
+        assert!(looks_like_mosaic(&image_of(w, h, &pixels)));
+    }
+
+    #[test]
+    fn a_faint_mosaic_is_still_recognised() {
+        // A narrowband frame is dim and its channels are closer together, but
+        // the sites still differ by far more than the noise.
+        let (w, h) = (64usize, 64usize);
+        let mut pixels = crate::testutil::gaussian_background(w, h, 0.0, 2.0, 63);
+        let levels = [23.0, 12.0, 7.0];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] += levels[BayerPattern::Rggb.colour_at(x, y).plane()];
+            }
+        }
+        assert!(looks_like_mosaic(&image_of(w, h, &pixels)));
+    }
+
+    #[test]
+    fn a_frame_of_nothing_is_not_called_a_mosaic() {
+        // A bias, or an exposure with the cover on: nothing to reconstruct, so
+        // the colour controls should stay out of the way.
+        let (w, h) = (64usize, 64usize);
+        let pixels = vec![500.0f64; w * h];
+        assert!(!looks_like_mosaic(&image_of(w, h, &pixels)));
+    }
+
+    #[test]
+    fn a_colour_image_is_not_a_mosaic() {
+        // Already reconstructed: three planes, nothing left to do.
+        let (w, h) = (16usize, 16usize);
+        let data = vec![100.0f64; w * h * 3];
+        let spec = SyntheticSpec::new(w, h, -32).with_channels(3);
+        let image = read_fits_from_bytes(&synthetic_fits(&spec, &data).unwrap()).unwrap();
+        assert!(!looks_like_mosaic(&image));
+    }
+
+    /// A single-plane image from raw values.
+    fn image_of(width: usize, height: usize, pixels: &[f64]) -> FitsImage {
+        let spec = SyntheticSpec::new(width, height, -32);
+        read_fits_from_bytes(&synthetic_fits(&spec, pixels).unwrap()).unwrap()
     }
 }

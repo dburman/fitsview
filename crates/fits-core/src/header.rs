@@ -277,6 +277,47 @@ fn parse_value(rest: &[u8]) -> String {
     }
 }
 
+/// Arcseconds of sky per pixel, from the optics the header describes.
+///
+/// A width in pixels means nothing on its own: the same star is four pixels
+/// across on one telescope and one on another. In arcseconds it can be compared
+/// with the seeing, with last week's session, and with what the sky was ever
+/// going to allow — and a number that is impossible is obvious at a glance,
+/// which a number in pixels is not.
+///
+/// From the small-angle approximation: a pixel of `p` micrometres at a focal
+/// length of `f` millimetres subtends `206.265 * p / f` arcseconds. Binning
+/// multiplies the pixel size, so it is taken into account when the header says
+/// what it was.
+///
+/// `None` unless the header carries both the focal length and the pixel size,
+/// which most capture programs write and a few do not.
+#[must_use]
+pub fn plate_scale_arcsec(header: &FitsHeader) -> Option<f64> {
+    /// Arcseconds in a radian, divided by the thousand that takes micrometres
+    /// to millimetres.
+    const ARCSEC_PER_RADIAN_OVER_1000: f64 = 206.264_806_247_096_36;
+
+    let focal_length_mm = header
+        .get_f64("FOCALLEN")
+        .filter(|f| f.is_finite() && *f > 0.0)?;
+    let pixel_um = ["XPIXSZ", "PIXSIZE1", "PIXSIZE"]
+        .iter()
+        .find_map(|k| header.get_f64(k))
+        .filter(|p| p.is_finite() && *p > 0.0)?;
+
+    // XPIXSZ is usually the sensor's own pixel, so binning has to be applied.
+    // Some programs write the binned size instead, in which case XBINNING is 1
+    // and this changes nothing.
+    let binning = ["XBINNING", "BINX"]
+        .iter()
+        .find_map(|k| header.get_f64(k))
+        .filter(|b| b.is_finite() && *b >= 1.0)
+        .unwrap_or(1.0);
+
+    Some(ARCSEC_PER_RADIAN_OVER_1000 * pixel_um * binning / focal_length_mm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +515,62 @@ mod tests {
         let (h, p) = parse_at(&bytes, first.len()).unwrap();
         assert_eq!(h.get("XTENSION"), Some("IMAGE"));
         assert_eq!(p.data_start, first.len() + BLOCK_SIZE);
+    }
+    #[test]
+    fn the_plate_scale_matches_the_rig_that_took_the_frame() {
+        // A ZWO ASI6200 behind a 432 mm refractor: 3.76 micrometre pixels at
+        // 432 mm is 1.795 arcseconds each, which is what the capture program
+        // and every plate solver report for it.
+        let header = FitsHeader {
+            cards: vec![
+                ("FOCALLEN".to_string(), "432.0".to_string()),
+                ("XPIXSZ".to_string(), "3.76".to_string()),
+            ],
+        };
+        let scale = plate_scale_arcsec(&header).expect("both keywords are there");
+        assert!((scale - 1.795).abs() < 0.005, "got {scale}");
+    }
+
+    #[test]
+    fn binning_doubles_the_scale() {
+        let header = FitsHeader {
+            cards: vec![
+                ("FOCALLEN".to_string(), "432.0".to_string()),
+                ("XPIXSZ".to_string(), "3.76".to_string()),
+                ("XBINNING".to_string(), "2".to_string()),
+            ],
+        };
+        let scale = plate_scale_arcsec(&header).expect("scale");
+        assert!((scale - 3.59).abs() < 0.01, "got {scale}");
+    }
+
+    #[test]
+    fn a_header_without_the_optics_gives_no_scale() {
+        // Better to show a width in pixels alone than to invent a scale.
+        let header = FitsHeader {
+            cards: vec![("OBJECT".to_string(), "M42".to_string())],
+        };
+        assert!(plate_scale_arcsec(&header).is_none());
+
+        let half = FitsHeader {
+            cards: vec![("FOCALLEN".to_string(), "432.0".to_string())],
+        };
+        assert!(plate_scale_arcsec(&half).is_none());
+    }
+
+    #[test]
+    fn nonsense_optics_give_no_scale() {
+        for (focal, pixel) in [("0", "3.76"), ("432", "0"), ("-1", "3.76"), ("abc", "3.76")] {
+            let header = FitsHeader {
+                cards: vec![
+                    ("FOCALLEN".to_string(), focal.to_string()),
+                    ("XPIXSZ".to_string(), pixel.to_string()),
+                ],
+            };
+            assert!(
+                plate_scale_arcsec(&header).is_none(),
+                "focal {focal}, pixel {pixel} should give nothing"
+            );
+        }
     }
 }

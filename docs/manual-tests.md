@@ -399,3 +399,46 @@ easiest: macOS mounts it read-only. `mount | grep -i <name>` should show
 - [ ] With it on, the histogram no longer marks the black point and midtone,
       because the three channels no longer share one.
 - [ ] It is still set the way you left it after quitting and reopening.
+
+## The right pane, and the file list
+
+- [ ] The FITS keywords that identify a frame — OBJECT, TELESCOP, FILTER,
+      EXPOSURE and the rest — are at the top of the right pane, above the
+      measurements.
+- [ ] **Other header cards** below them is shut when the application starts,
+      and its count matches what is inside once opened.
+- [ ] Opening it and typing in the filter searches those cards only; the ones
+      pinned above stay where they are.
+- [ ] On a mono frame the **One-shot colour** section is not shown at all.
+- [ ] On a raw colour frame it is, whether or not the file declares BAYERPAT.
+- [ ] Once a frame has been debayered the section is still shown, so colour can
+      be turned off again.
+- [ ] Clicking a file's **name** in the list selects it, not only the row
+      around the name.
+
+## Star width
+
+- [ ] With stars on, the width is shown in pixels and in arcseconds, and
+      FOCALLEN and XPIXSZ are among the keywords pinned at the top of the pane.
+- [ ] The arcsecond figure is believable for the sky you shot under: single
+      figures at worst, not tens.
+- [ ] A frame taken with the cover on reports a roundness near zero, since what
+      it finds are noise blobs rather than stars.
+- [ ] A frame from a camera whose header omits the focal length shows the width
+      in pixels alone, with no arcseconds and no invented scale.
+
+## Measuring a folder for stars
+
+- [ ] The ordering menu offers Width and Roundness after Background and
+      Sharpness.
+- [ ] **Measure stars** sits beside **Measure** and shows how far it has got.
+- [ ] Running it fills width and roundness for every frame, and the background
+      and sharpness with them.
+- [ ] Ordering by Width puts the sharpest frames at one end; the column shows
+      arcseconds where the header gives the optics, pixels where it does not.
+- [ ] Ordering by Roundness puts the trailed frames at one end.
+- [ ] A frame far from the rest of the folder is coloured as unusual, which is
+      the frame worth opening.
+- [ ] Plain **Measure** does not fill the star columns, and is still quick on a
+      folder of full-frame captures.
+- [ ] Stopping the job partway keeps the frames it had already measured.

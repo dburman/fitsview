@@ -30,9 +30,11 @@ always moves the file to the system trash, never destroys it, and a frame marked
 to keep always asks first. A folder on a volume that cannot be written to says
 so in the status line and greys out the buttons that would fail. Rename with `F2`. Keep marks are stored beside the
 images, so they survive restarting and travel with the folder if you copy it.
-The list can be ordered by sky background or by sharpness instead of by name,
-both measured as the folder loads, which brings the frames worth throwing out to
-one end.
+The list can be ordered by sky background, sharpness, star width or roundness
+instead of by name, which brings the frames worth throwing out to one end.
+Background and sharpness are measured as the folder loads; width and roundness
+come from **Measure stars**, a separate pass because finding stars in every
+frame is a hundred times the work of sampling one.
 
 **Seeing the image.** A raw frame is almost black; `S` applies the standard
 midtone stretch that puts the sky background at a sensible brightness and brings
@@ -59,7 +61,8 @@ stacking. It weakens real colour along with the cast, so it is a check rather
 than a way to view.
 
 **Judging a frame.** `Shift+S` finds the stars and measures them: how many, how
-wide (the full width at half maximum, in pixels) and how round. That is what
+wide (the full width at half maximum, in pixels and in arcseconds where the
+header gives the focal length and pixel size) and how round. That is what
 tells you whether a frame is in focus and whether the mount tracked, and it is
 the measurement to cull on. Each star is circled on the image, so a bad
 detection is obvious rather than hidden inside a number. It takes about 16 ms on
