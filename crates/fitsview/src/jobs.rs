@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use fits_core::calib::{self, MasterFlat, MasterFrame};
-use fits_core::stars::{self, DetectionParams};
+use fits_core::stack::{align, Alignment, PierSide, Stack};
+use fits_core::stars::{self, DetectionParams, StarField};
 use fits_core::{quality, read_fits, write_fits, FitsImage, Quality};
 
 use crate::folder::StarMeasure;
@@ -25,6 +26,15 @@ pub enum Outcome {
     Master(Box<MasterFrame>),
     /// A master flat, already normalised into a gain map, was built.
     Flat(Box<MasterFlat>),
+    /// A stack was written for each filter that had frames.
+    Stacked {
+        /// What was written, and how many frames went into each.
+        stacks: Vec<(PathBuf, usize)>,
+        /// Frames that could not be lined up with the rest of their filter.
+        unaligned: usize,
+        /// Samples left out as outliers, across every stack.
+        rejected: usize,
+    },
     /// Every file in the folder was measured.
     Measured(Vec<(PathBuf, Quality, Option<StarMeasure>)>),
     /// Calibrated copies were written, and this many succeeded.
@@ -129,6 +139,47 @@ impl Job {
     /// Measurement is on the raw frame, before any calibration, so the numbers
     /// stay comparable however the display is configured.
     #[must_use]
+    /// Stacks every file in `paths`, one output per filter.
+    pub fn stack(
+        paths: Vec<PathBuf>,
+        dark: Option<Arc<MasterFrame>>,
+        flat: Option<Arc<MasterFlat>>,
+        pattern: Option<fits_core::BayerPattern>,
+        params: DetectionParams,
+        reject: bool,
+        weighted: bool,
+    ) -> Self {
+        let (tx, updates) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let total = paths.len();
+
+        std::thread::Builder::new()
+            .name("fitsview-stack".into())
+            .spawn(move || {
+                let recipe = StackRecipe {
+                    dark,
+                    flat,
+                    pattern,
+                    params,
+                    reject,
+                    weighted,
+                };
+                stack_worker(&paths, &recipe, &tx, &worker_cancel);
+            })
+            .ok();
+
+        Self {
+            label: "Stacking".into(),
+            updates,
+            cancel,
+            done: 0,
+            total,
+            item: String::new(),
+            finished: false,
+        }
+    }
+
     pub fn measure(paths: Vec<PathBuf>, stars: Option<DetectionParams>) -> Self {
         let (tx, updates) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -311,6 +362,263 @@ fn measure_stars(image: &fits_core::FitsImage, params: &DetectionParams) -> Star
         fwhm_arcsec: field.fwhm.zip(scale).map(|(fwhm, scale)| fwhm * scale),
         roundness: field.roundness,
         count: field.count(),
+    }
+}
+
+/// What a stack's own output is called, and what marks it as not a frame.
+pub const STACK_PREFIX: &str = "stack_";
+
+/// What a frame counts for, or one when frames are not being weighted.
+fn frame_weight(weighted: bool, noise: f64, fwhm: Option<f64>) -> f64 {
+    if !weighted {
+        return 1.0;
+    }
+    fits_core::stack::weight_of(noise, fwhm).unwrap_or(1.0)
+}
+
+/// Everything a stack needs beyond the files themselves.
+struct StackRecipe {
+    dark: Option<Arc<MasterFrame>>,
+    flat: Option<Arc<MasterFlat>>,
+    pattern: Option<fits_core::BayerPattern>,
+    params: DetectionParams,
+    reject: bool,
+    weighted: bool,
+}
+
+/// Stacks a folder, one file per filter.
+///
+/// Frames are grouped by their `FILTER` keyword, since combining filters
+/// averages away the thing the filters were for. Within a group the first
+/// readable frame is the reference and the rest are lined up with it by their
+/// stars, turning any that were taken on the other side of the pier.
+///
+/// Only one frame is held at a time beyond the running totals, because a
+/// night of full-frame captures does not fit in memory otherwise.
+#[allow(clippy::too_many_lines)]
+fn stack_worker(
+    paths: &[PathBuf],
+    recipe: &StackRecipe,
+    tx: &mpsc::Sender<Update>,
+    cancel: &AtomicBool,
+) {
+    let StackRecipe {
+        dark,
+        flat,
+        pattern,
+        params,
+        reject,
+        weighted,
+    } = recipe;
+    let (dark, flat) = (dark.as_deref(), flat.as_deref());
+    let (pattern, reject, weighted) = (*pattern, *reject, *weighted);
+    // Which filter each frame belongs to, read from the header alone so that
+    // grouping costs one small read rather than a decode.
+    let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for path in paths {
+        // A stack this job wrote earlier is not a frame. Without this, running
+        // it a second time folds the first result back into the new one.
+        if file_name_of(path).starts_with(STACK_PREFIX) {
+            continue;
+        }
+        let filter = match read_fits(path) {
+            Ok(image) => filter_of(&image),
+            Err(_) => continue,
+        };
+        match groups.iter_mut().find(|(name, _)| *name == filter) {
+            Some((_, list)) => list.push(path.clone()),
+            None => groups.push((filter, vec![path.clone()])),
+        }
+    }
+
+    let mut stacks = Vec::new();
+    let mut unaligned = 0usize;
+    let mut rejected = 0usize;
+    let mut done = 0usize;
+    // Rejecting means reading every frame a second time, to measure it against
+    // what the first pass found ordinary.
+    let steps = if reject { paths.len() * 2 } else { paths.len() };
+
+    for (filter, group) in &groups {
+        let mut stack: Option<Stack> = None;
+        let mut reference: Option<(StarField, PierSide, (usize, usize))> = None;
+        let mut header = None;
+        let mut sky: Option<f64> = None;
+        // Where each frame ended up, so that a second pass does not have to
+        // find its stars all over again. That is most of what makes rejection
+        // cheaper the second time round.
+        let mut placed: Vec<(PathBuf, Alignment)> = Vec::new();
+
+        for path in group {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(Update::Cancelled);
+                return;
+            }
+            let _ = tx.send(Update::Progress {
+                done,
+                total: steps,
+                item: file_name_of(path),
+            });
+            done += 1;
+
+            let Ok(light) = read_fits(path) else { continue };
+            let side = PierSide::from_header(&light.header);
+            let Ok(prepared) = calib::calibrate_and_debayer(&light, dark, flat, pattern) else {
+                continue;
+            };
+
+            // What this frame is worth against the others: quiet and sharp
+            // counts for more than noisy and soft.
+            let measured = quality::measure(&light);
+            let size = (prepared.width, prepared.height);
+            let found = match pattern {
+                // Detection wants the mosaic, not the reconstruction.
+                Some(p) if light.channels == 1 => stars::detect_mosaic(&light, p, params),
+                _ => stars::detect(&prepared, params),
+            };
+
+            match &reference {
+                None => {
+                    // The first readable frame of the group sets the frame of
+                    // reference for the rest of it, its sky included.
+                    let mut fresh = if reject {
+                        Stack::rejecting(size.0, size.1, prepared.channels)
+                    } else {
+                        Stack::new(size.0, size.1, prepared.channels)
+                    };
+                    let placing = Alignment {
+                        weight: frame_weight(weighted, measured.noise, found.fwhm),
+                        ..Alignment::still()
+                    };
+                    fresh.add(&prepared, placing);
+                    placed.push((path.clone(), placing));
+                    header = Some(light.header.clone());
+                    sky = Some(fits_core::stack::sky_level(&prepared));
+                    reference = Some((found, side, size));
+                    stack = Some(fresh);
+                }
+                Some((anchor, anchor_side, anchor_size)) => {
+                    let turned = side.needs_turning(*anchor_side);
+                    match align(anchor, &found, *anchor_size, turned) {
+                        Some(mut alignment) => {
+                            // Brought to the reference's sky before it is
+                            // added: a frame taken under a brighter sky lifts
+                            // the result otherwise, and rejection then treats
+                            // it as the outlier at every pixel and discards
+                            // the whole of it.
+                            if let Some(sky) = sky {
+                                alignment.offset = fits_core::stack::levelling(&prepared, sky);
+                            }
+                            alignment.weight = frame_weight(weighted, measured.noise, found.fwhm);
+                            if let Some(stack) = stack.as_mut() {
+                                if stack.add(&prepared, alignment) {
+                                    placed.push((path.clone(), alignment));
+                                } else {
+                                    unaligned += 1;
+                                }
+                            }
+                        }
+                        None => {
+                            log::warn!("could not line up {}", file_name_of(path));
+                            unaligned += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let (Some(stack), Some(header)) = (stack, header) else {
+            continue;
+        };
+        if stack.frames() == 0 {
+            continue;
+        }
+
+        // The second pass, when it is wanted and there are enough frames for a
+        // spread to mean anything.
+        let mut second = if reject {
+            stack.clone().into_rejecting(fits_core::stack::DEFAULT_CLIP)
+        } else {
+            None
+        };
+        if let Some(second) = second.as_mut() {
+            for (path, alignment) in &placed {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(Update::Cancelled);
+                    return;
+                }
+                let _ = tx.send(Update::Progress {
+                    done,
+                    total: steps,
+                    item: file_name_of(path),
+                });
+                done += 1;
+
+                let Ok(light) = read_fits(path) else { continue };
+                let Ok(prepared) = calib::calibrate_and_debayer(&light, dark, flat, pattern) else {
+                    continue;
+                };
+                second.add(&prepared, *alignment);
+            }
+            rejected += second.rejected();
+        }
+
+        let Some(directory) = group.first().and_then(|p| p.parent()) else {
+            continue;
+        };
+        let out = directory.join(format!("{STACK_PREFIX}{}.fits", safe_name(filter)));
+        let history = vec![match &second {
+            Some(second) => format!(
+                "Stacked {} frames of filter {filter}, {} samples rejected",
+                second.frames(),
+                second.rejected()
+            ),
+            None => format!("Stacked {} frames of filter {filter}", stack.frames()),
+        }];
+        let result = match &second {
+            Some(second) => second.finish(header),
+            None => stack.finish(header),
+        };
+        if let Err(e) = write_fits(&out, &result, &history) {
+            let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(&out))));
+            return;
+        }
+        stacks.push((out, stack.frames()));
+    }
+
+    let _ = tx.send(Update::Progress {
+        done: steps,
+        total: steps,
+        item: String::new(),
+    });
+    let _ = tx.send(Update::Finished(Outcome::Stacked {
+        stacks,
+        unaligned,
+        rejected,
+    }));
+}
+
+/// The filter a frame was taken through, or a stand-in when it does not say.
+fn filter_of(image: &FitsImage) -> String {
+    image
+        .header
+        .get("FILTER")
+        .map(|v| v.trim().trim_matches('\'').trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unfiltered".to_string())
+}
+
+/// A filter name reduced to something safe to put in a file name.
+fn safe_name(filter: &str) -> String {
+    let cleaned: String = filter
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "unfiltered".to_string()
+    } else {
+        trimmed
     }
 }
 

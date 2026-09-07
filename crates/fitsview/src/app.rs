@@ -157,6 +157,12 @@ pub enum Action {
     /// Find the stars in every file in the folder, so width and roundness can
     /// be compared across it. Far slower than [`Action::MeasureFolder`].
     MeasureFolderStars,
+    /// Combine the folder into one image per filter.
+    StackFolder,
+    /// Leave outlying samples out of a stack, or stop doing so.
+    ToggleRejectOutliers,
+    /// Count the better frames for more in a stack, or count them all alike.
+    ToggleWeightFrames,
     /// Order the file list by this measure.
     SortBy(SortKey),
     /// Write calibrated copies of every file in the folder into this folder.
@@ -551,6 +557,17 @@ pub struct Model {
     ///
     /// Probed once when the folder is opened rather than guessed from
     /// permission bits, which lie about read-only mounts.
+    /// Whether stacking leaves out samples that disagree with the rest.
+    ///
+    /// Costs a second read of every frame, and removes the satellite trails
+    /// and cosmic rays a plain average keeps.
+    pub reject_outliers: bool,
+    /// Whether stacking counts a quiet, sharp frame for more than a noisy,
+    /// soft one.
+    ///
+    /// On a night whose sky brightened fivefold this is worth some forty per
+    /// cent of the noise in the result, so it is on unless turned off.
+    pub weight_frames: bool,
     pub read_only: bool,
 }
 
@@ -601,6 +618,8 @@ impl Model {
             loader: Loader::default(),
             ops: Box::new(RealFileOps),
             is_mosaic: false,
+            reject_outliers: true,
+            weight_frames: true,
             read_only: false,
         }
     }
@@ -778,6 +797,13 @@ impl Model {
             }
             Action::MeasureFolder => self.measure_folder(false),
             Action::MeasureFolderStars => self.measure_folder(true),
+            Action::StackFolder => self.stack_folder(),
+            Action::ToggleRejectOutliers => {
+                self.reject_outliers = !self.reject_outliers;
+            }
+            Action::ToggleWeightFrames => {
+                self.weight_frames = !self.weight_frames;
+            }
             Action::SortBy(key) => {
                 if self.sort_key != key {
                     self.sort_key = key;
@@ -1158,6 +1184,34 @@ impl Model {
         ));
     }
 
+    /// Starts stacking the folder, one image per filter.
+    ///
+    /// The calibration in force is applied on the way in, since a stack of
+    /// uncalibrated frames keeps every one of the sensor's blemishes and
+    /// multiplies the effort of removing them later.
+    fn stack_folder(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        if folder.is_empty() {
+            return;
+        }
+
+        let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
+        self.job = Some(Job::stack(
+            paths,
+            self.calibration.dark.clone(),
+            self.calibration.flat.clone(),
+            self.bayer.active(),
+            self.star_params,
+            self.reject_outliers,
+            self.weight_frames,
+        ));
+    }
+
     /// Starts measuring every file in the folder.
     ///
     /// `with_stars` asks for the stars as well, which means searching each
@@ -1265,6 +1319,34 @@ impl Model {
                         folder.sort_by(self.sort_key);
                     }
                     self.toast = Some(Toast::new(format!("Measured {count} frames")));
+                }
+                jobs::Update::Finished(jobs::Outcome::Stacked {
+                    stacks,
+                    unaligned,
+                    rejected,
+                }) => {
+                    let _ = rejected;
+                    self.toast = Some(Toast::new(match stacks.len() {
+                        0 => "Nothing could be stacked".to_string(),
+                        _ => {
+                            let frames: usize = stacks.iter().map(|(_, n)| n).sum();
+                            let mut skipped = String::new();
+                            if unaligned > 0 {
+                                skipped.push_str(&format!(", {unaligned} could not be lined up"));
+                            }
+                            if rejected > 0 {
+                                skipped.push_str(&format!(", {rejected} samples rejected"));
+                            }
+                            format!(
+                                "Stacked {frames} frames into {} file{}{skipped}",
+                                stacks.len(),
+                                if stacks.len() == 1 { "" } else { "s" }
+                            )
+                        }
+                    }));
+                    // The stacks are written beside the frames, so they are
+                    // part of the folder now.
+                    self.rescan();
                 }
                 jobs::Update::Finished(jobs::Outcome::Exported { written, directory }) => {
                     self.toast = Some(Toast::new(format!(
@@ -4322,6 +4404,201 @@ mod tests {
         assert_ne!(
             m.generation, before,
             "the image on screen has to be built again"
+        );
+    }
+
+    /// A folder of star fields, each shifted, tagged with a filter.
+    fn stackable_folder(shifts: &[(f64, f64)], filters: &[&str]) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (160usize, 160usize);
+        let places = [
+            (40.0, 50.0),
+            (110.0, 60.0),
+            (70.0, 120.0),
+            (130.0, 120.0),
+            (50.0, 95.0),
+            (95.0, 40.0),
+        ];
+
+        for (index, ((dx, dy), filter)) in shifts.iter().zip(filters).enumerate() {
+            let mut pixels =
+                fits_core::testutil::gaussian_background(w, h, 1000.0, 10.0, 80 + index as u64);
+            for (px, py) in places {
+                let (cx, cy) = (px + dx, py + dy);
+                for sy in -6i64..=6 {
+                    for sx in -6i64..=6 {
+                        let (x, y) = (cx as i64 + sx, cy as i64 + sy);
+                        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                            continue;
+                        }
+                        let r = ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)) / 4.0;
+                        pixels[y as usize * w + x as usize] += 12_000.0 * (-r).exp();
+                    }
+                }
+            }
+            let spec = SyntheticSpec::new(w, h, -32)
+                .with_card("FILTER", &format!("'{filter}'"))
+                .with_card("PIERSIDE", "'East'");
+            write_synthetic(dir.path(), &format!("f{index}.fits"), &spec, &pixels).unwrap();
+        }
+        dir
+    }
+
+    /// Pumps until whatever job is running has finished.
+    fn wait_for_job(model: &mut Model) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && model.job.is_some() {
+            model.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(model.job.is_none(), "the job never finished");
+    }
+
+    #[test]
+    fn stacking_writes_one_file_for_each_filter() {
+        // Combining filters would average away the thing the filters were for.
+        let dir = stackable_folder(
+            &[(0.0, 0.0), (5.0, -3.0), (0.0, 0.0), (-4.0, 6.0)],
+            &["Ha", "Ha", "OIII", "OIII"],
+        );
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        let mut written: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("stack_"))
+            .collect();
+        written.sort();
+        assert_eq!(written, vec!["stack_Ha.fits", "stack_OIII.fits"]);
+    }
+
+    #[test]
+    fn a_stack_lines_the_frames_up_before_adding_them() {
+        // Added where they lie, four shifted frames scatter each star into
+        // four; lined up, the stack holds exactly what one frame holds.
+        let dir = stackable_folder(
+            &[(0.0, 0.0), (7.0, -4.0), (-5.0, 6.0), (3.0, 8.0)],
+            &["L", "L", "L", "L"],
+        );
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        let stacked = fits_core::read_fits(&dir.path().join("stack_L.fits")).unwrap();
+        let field =
+            fits_core::stars::detect(&stacked, &fits_core::stars::DetectionParams::default());
+        assert_eq!(field.count(), 6, "six stars in, six stars out");
+        assert!(
+            field.roundness.is_some_and(|r| r > 0.6),
+            "smeared stars would show here: {:?}",
+            field.roundness
+        );
+    }
+
+    #[test]
+    fn a_stack_is_not_folded_back_into_the_next_one() {
+        // The result is written beside the frames, so the folder holds it the
+        // next time round. Stacking a stack would count the whole night twice
+        // over and call it one frame.
+        let dir = stackable_folder(&[(0.0, 0.0), (3.0, -2.0)], &["L", "L"]);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        let first = std::fs::metadata(dir.path().join("stack_L.fits"))
+            .expect("a stack")
+            .len();
+
+        // Now that the folder holds it, do it again. The stack itself is a
+        // three-plane image and opening it is beside the point here, so the
+        // model is only pumped, not waited on.
+        m.handle(Action::Rescan);
+        for _ in 0..50 {
+            m.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            m.folder.as_ref().unwrap().files.len() > 2,
+            "the rescan should have found the stack"
+        );
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        let again = std::fs::metadata(dir.path().join("stack_L.fits"))
+            .expect("a stack")
+            .len();
+        assert_eq!(first, again, "the second stack should be the same shape");
+        let stacks = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("stack_"))
+            .count();
+        assert_eq!(stacks, 1, "and there should still be one of it");
+    }
+
+    #[test]
+    fn stacking_leaves_out_a_satellite_that_crossed_one_frame() {
+        // End to end, through the job: six frames, one of them crossed.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (140usize, 140usize);
+        let places = [
+            (40.0, 50.0),
+            (110.0, 60.0),
+            (70.0, 120.0),
+            (120.0, 110.0),
+            (50.0, 95.0),
+            (95.0, 40.0),
+        ];
+        for index in 0..6usize {
+            let mut pixels =
+                fits_core::testutil::gaussian_background(w, h, 1000.0, 12.0, 200 + index as u64);
+            for (px, py) in places {
+                for sy in -6i64..=6 {
+                    for sx in -6i64..=6 {
+                        let (x, y) = (px as i64 + sx, py as i64 + sy);
+                        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                            continue;
+                        }
+                        let r = ((x as f64 - px).powi(2) + (y as f64 - py).powi(2)) / 4.0;
+                        pixels[y as usize * w + x as usize] += 12_000.0 * (-r).exp();
+                    }
+                }
+            }
+            if index == 2 {
+                // The satellite: one frame, straight across.
+                for x in 10..130 {
+                    pixels[75 * w + x] += 20_000.0;
+                }
+            }
+            let spec = SyntheticSpec::new(w, h, -32).with_card("FILTER", "'L'");
+            write_synthetic(dir.path(), &format!("f{index}.fits"), &spec, &pixels).unwrap();
+        }
+
+        let (mut m, _spy) = model_over(dir.path());
+        assert!(m.reject_outliers, "rejection is the default");
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        let stacked = fits_core::read_fits(&dir.path().join("stack_L.fits")).unwrap();
+        let on_trail = f64::from(stacked.data[75 * w + 70]) - 1000.0;
+        assert!(
+            on_trail < 400.0,
+            "the trail should not survive the stack: {on_trail:.0} counts above the sky"
+        );
+
+        // And without rejection it plainly does, which is what the option is
+        // for.
+        m.handle(Action::ToggleRejectOutliers);
+        assert!(!m.reject_outliers);
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let plain = fits_core::read_fits(&dir.path().join("stack_L.fits")).unwrap();
+        assert!(
+            f64::from(plain.data[75 * w + 70]) - 1000.0 > 2000.0,
+            "a plain average keeps it"
         );
     }
 

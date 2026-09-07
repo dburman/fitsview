@@ -41,6 +41,7 @@ been run on Linux or Windows. See section 10.
 | 14 — Readouts | Done |
 | 15 — Star detection | Done |
 | 16 — Faster star detection | Done |
+| 17 — Stacking | In progress |
 
 Keep this table current. Phase 0 is project bootstrap; phases 1 through 9
 deliver the requirements below, and phases 10 onwards improve on them.
@@ -2673,6 +2674,288 @@ but the loader measures the **raw** frame while detection may run on a
 calibrated one, whose background is not the same number. Passing the wrong
 background would shift every threshold. It needs the measurement to be tracked
 per calibration state, which is more bookkeeping than the saving justifies.
+
+---
+
+## Phase 17 — Stacking
+
+Culling a night leaves a pile of good frames. Stacking is what turns them into
+one image: the signal adds with the number of frames while the noise adds with
+its root, so a hundred frames of the same field are ten times cleaner than one.
+Everything the application already does — reading, calibrating, debayering,
+finding stars — is the input to it.
+
+### What it has to do
+
+1. **One stack per filter.** A night through a filter wheel holds several
+   filters interleaved, and combining them would average away the thing the
+   filters were for. Frames are grouped by `FILTER` and each group produces its
+   own file.
+2. **Survive a meridian flip.** A German equatorial mount tracking past the
+   meridian swings to the other side of the pier, and the field arrives rotated
+   by 180 degrees. Stacked without noticing, the second half of the night
+   cancels the first into a blur. The header says which side the telescope was
+   on — `PIERSIDE`, `East` or `West`, which both cameras tested here write — and
+   frames from the other side are turned before they are added.
+3. **Align before adding.** Mounts drift, guiding corrects, and the field walks
+   across the sensor over an hour. Adding frames as they lie smears every star
+   into a line. Alignment is what makes stacking worth doing at all.
+4. **Stay within memory.** Forty-seven 61-megapixel frames are eleven gigabytes
+   as floats. Nothing may hold them all: frames are read one at a time and added
+   into a running total.
+
+### Concepts
+
+**Registration from the stars.** The application already finds stars to a
+fraction of a pixel, which is exactly what alignment needs. Two frames of the
+same field give two lists of positions differing by a shift; the shift is found
+by taking every pairing of a bright star in one with a bright star in the other,
+and looking for the offset that many pairs agree on. Wrong pairings scatter,
+right ones pile up, and the pile is the answer. A hundred stars from each frame
+is ten thousand pairings, which is nothing, and no pairing has to be correct for
+the vote to work — only more of them have to agree than disagree.
+
+Rotation is handled first and separately, because the only rotation that occurs
+in practice is the half turn of a meridian flip, and the header names it. A
+frame from the other side of the pier has its star positions turned about the
+centre of the sensor before the vote, which reduces the problem to a shift
+again.
+
+**Normalisation.** The sky brightens and dims through a night. Frames are
+brought to a common background before they are added, or a frame taken as the
+moon rose lifts the whole stack.
+
+**Adding a frame.** A row at a time, in parallel, with the arithmetic that
+decides which pixels are covered done once for the row rather than once for each
+of its pixels; what is left inside is a walk along two slices, which vectorises.
+Written the obvious way, a pixel at a time with its bounds worked out
+individually, it took 28 ms for a 24-megapixel frame against 3.8 ms this way.
+
+**Combination.** The average of N frames is the simplest estimator. A median
+rejects satellites and cosmic rays but costs every frame in memory at once,
+which is not affordable at this size; clipping against the spread gets most of
+the benefit from a running sum and a running sum of squares.
+
+**And the thing that catches out a first attempt at clipping.** A satellite
+twenty thousand counts above the sky, in one frame of six, widens that pixel's
+spread enough to make itself acceptable — the outlier sets the standard it is
+then judged against, and survives. Excluding each pixel's single brightest
+sample from the statistics removes exactly that case, which is also exactly the
+case rejection exists for: a bright mark in one frame that is in no other. It
+costs four bytes a pixel to remember. Below five frames nothing is clipped at
+all, because the spread of four samples is too uncertain to judge anything
+against.
+
+**Where colour fits.** A one-shot colour frame is stacked after reconstruction,
+not before: alignment moves frames by fractions of a pixel and by odd numbers of
+pixels, either of which scrambles a filter mosaic. That costs three times the
+memory of a mono stack and is the honest price of the alignment being correct.
+
+### Delivery
+
+- **17a — the arithmetic**, in `fits-core/src/stack.rs`: pier side from the
+  header, the registration vote, and an accumulator that adds shifted frames
+  into a running total and hands back the average. Tested on synthetic frames
+  with known shifts, a known half turn, and known noise.
+- **17b — the button** (done), on the right-hand panel above Export: group the
+  folder by filter, run the stack on a worker thread with the progress and Stop
+  the other jobs have, and write one file per filter beside the frames.
+- **17c — rejection** (done): each sample measured against what the other
+  frames found ordinary, so satellite trails and cosmic rays are left out.
+  Costs a second read of every frame; the alignments are already known by then,
+  so no stars have to be found again.
+- **17d — levelling and honesty about what will not line up** (done): frames
+  brought to a common sky before they are added, and alignments that only a
+  handful of stars agree on refused rather than believed.
+- **Sub-pixel resampling: measured, and not worth doing.** On a real night the
+  offsets miss the pixel grid by 0.26 of a pixel on average and 0.56 at worst.
+  Against stars five and a half pixels wide that is a blur of under one per
+  cent, and bilinear resampling — the usual way of fixing it — softens a frame
+  by more than that. It would make these stacks slightly worse. It becomes
+  worth revisiting only if the stars ever get near two pixels wide.
+- **17e — rotation** (done): a turn fitted alongside the shift, which recovers
+  the frames a meridian flip leaves behind. Drizzle wants undersampled and
+  dithered data, which this is not.
+
+### Acceptance criteria
+
+- [x] Unit test: the pier side is read from the header, and an absent or
+      unrecognised keyword is reported as unknown rather than guessed.
+- [x] Unit test: a synthetic frame shifted by a known number of pixels has that
+      shift recovered exactly.
+- [x] Unit test: a frame turned through half a circle, as a meridian flip turns
+      it, is recovered when the header says the pier side changed.
+- [x] Unit test: frames that share no stars report no offset rather than an
+      arbitrary one.
+- [x] Unit test: stacking N frames of the same field reduces the noise by about
+      the root of N, which is the entire claim of the feature.
+- [x] Unit test: stacking aligns before adding, shown by a stack of shifted
+      frames holding stars as sharp as one frame's rather than smeared.
+- [x] Unit test: frames of different filters never enter the same stack.
+- [x] Memory: a stack of forty frames never holds more than two of them at once
+      beyond its accumulators.
+- [x] Measured on real frames. Eight 61-megapixel frames of Sh2 131 stack in
+      **3.3 seconds**, all eight aligned, which puts a 47-frame night at about
+      twenty. Per frame: **read 170 ms**, find the stars 80 ms, work out the
+      alignment 1 ms, add to the stack 10 ms. Reading the file is two thirds of
+      it, so the stacking itself is not what anyone waits for.
+- [ ] The interface stays responsive throughout, and Stop works. Not yet
+      watched on a real folder.
+- [x] A satellite crossing one frame of six is left out of the stack, and the
+      stars are not.
+- [x] Rejection costs a second read and nothing measurable in the arithmetic:
+      adding a frame is unchanged at 3.7 ms whether the spread is being kept or
+      not.
+
+### What a night that crossed the meridian showed
+
+A folder was found that does: 49 frames through one filter, 37 on the west side
+of the pier and 12 on the east, plus 60 through another.
+
+**The flip is recognised and the frames are turned, and it is not enough.** A
+turned frame lines up with the reference on seven stars where a frame from the
+same side agrees on fifty to ninety. Seven is the middle of the sensor: a flip
+is a half turn about the optical axis and the mount does not come back to
+exactly half a turn, so half a degree of residual displaces a star five thousand
+pixels out by forty. The centre matches and the rest does not.
+
+A translation fitted to those seven would smear everything outside the middle,
+so an alignment that only a tenth of the stars offered agree on is now refused,
+and the frame is reported as one that could not be lined up. That is honest and
+it loses a quarter of the night.
+
+**17e was therefore rotation**, and it works. A shift alone matches the middle
+of the frame; those few matches are enough to estimate the turn; with the turn
+known the rest of the frame matches, which gives a better estimate again. Three
+passes of that take it from seven stars to forty.
+
+On the night in question the residual turn measures between **0.139 and 0.187
+degrees** — a fifth of a degree, exactly the "the mount did not come back to
+exactly half a turn" that the seven-star agreement implied. The frames it
+recovers went from 36 of 49 to **48 of 49**.
+
+A turned frame has to be resampled to be added, since its pixels no longer fall
+on the stack's grid, and that softens it very slightly. Worth it here and not
+worth it for a frame that only needs shifting, so frames that need no turn take
+the old path untouched.
+
+The synthetic test passed all along because a synthetic flip is exactly half a
+turn. Only real frames have a mount in them.
+
+### 17f — counting the better frames for more
+
+Weighting each frame by the inverse square of its noise is what makes a stack
+as clean as it can be, and it is the part of PixInsight's weighted
+preprocessing worth having here. Measured on the night above, where the sky
+brightened fivefold between the first frame and the last:
+
+| Filter | Frames | Noise, low to high | Equal weights | Weighted | Gain |
+|--------|--------|--------------------|---------------|----------|------|
+| L-Ultimate | 49 | 11.9 to 65.2 | 5.41 | 3.76 | 44% |
+| L-Pro | 60 | 222 to 1226 | 64.6 | 45.2 | 43% |
+
+The late frames carry a quarter of what the early ones do, and counting them
+alike throws most of that away. Dividing by the square of the star width as
+well favours the frames that hold detail over the ones that are merely quiet.
+
+**What that broke, and why it is worth knowing.** Rejection sets each pixel's
+brightest sample aside before working out what is ordinary, and it did so at
+the average weight, since which frame the sample came from was not recorded.
+That is exact when every frame counts the same. With weights it is not, and the
+error grows with the square of the sample being removed — which is precisely
+the satellite the whole mechanism exists to catch. On a trail it made the
+measured spread come out as **zero**, and a spread of zero rejects everything:
+the trail's pixels came back undefined rather than clean. The weight of the
+brightest sample is now recorded beside it, four bytes a pixel.
+
+**A stack is no longer folded back into the next one.** The result is written
+beside the frames, so the folder holds it the second time round; without a
+guard it joined its own filter's group and was stacked again.
+
+### The star widths a colour sensor reports
+
+They were wrong, by about half again, and it took reading a frame's own pixels
+off by hand to see it.
+
+A colour sensor records a star on half its pixels, so detection searches a
+half-size image built from the green ones. Doubling the width found there is
+arithmetically right and practically wrong: a star three pixels across on the
+sensor is one and a half on that image, which is below what a grid can
+describe. Its half-maximum region comes to one or two pixels, fewer than a
+width is measured from, so those stars are dropped and the median is taken from
+the broad ones that survive.
+
+Widths are now measured again on the sensor's own green pixels, which lie in a
+chequer and so sample the sky at the full spacing along the diagonals. No
+interpolation, and no filter pattern in the way.
+
+Counting pixels was not enough either. A region of twelve pixels says the
+radius is 1.95 whether it is 1.6 or 2.2, and a well focused star covers few
+enough pixels for that to be the largest error left. Interpolating where the
+profile crosses half its height — which is what a person does reading the
+numbers off — agrees with them.
+
+| Measured how | On a real frame |
+|--------------|-----------------|
+| Half-size green, doubled | 5.05 px, 9.06 arcseconds |
+| Full spacing, counting pixels | 3.91 px, 7.02 arcseconds |
+| Full spacing, interpolated | **3.22 px, 5.78 arcseconds** |
+| The frame's own pixels, by hand | 3.0 to 3.5 px |
+
+On synthetic stars of known width the error is now 3 to 7 per cent, against 60
+before.
+
+**What this did not fix.** A star narrower than about four pixels is not found
+at all on a colour sensor: the half-size image samples it at two, and a perfect
+Gaussian that narrow looks like a hot pixel to the filter that rejects hot
+pixels. Real stars of that width are found, being less sharply peaked, but it
+is close to the edge. Detecting on the green chequer at full spacing rather
+than on a half-size image would settle it, and is a larger change.
+
+**Why a stack read narrower than its own frames.** Not the noise estimate: a
+stack of thirty-six has a noise of 1.4 against a frame's 8.4, which is exactly
+root thirty-six, and differencing pixels two apart underreads it by only 15 per
+cent on interpolated data. The twenty thousand stars it finds are mostly real —
+a deep stack does find that many.
+
+It is the width of a faint star that is wrong. The measurement looks for where
+the profile falls to half its height, and for a star ten times the noise that
+half-height is five times the noise, a level the noise itself crosses often
+enough to stop the walk early. Every faint star therefore measures narrow, and
+in a deep stack the faint ones carry the median on their own.
+
+Widths are now taken only from stars whose peak stands a hundred deviations
+above the sky. The figure was checked against how much it moves as that cut
+rises: a single frame does not move at all between twenty and four hundred,
+while the stack climbed from 2.31 to 3.25 and then stopped. A hundred is where
+both are settled.
+
+| | Before | Now |
+|---|--------|-----|
+| A narrowband frame | 5.05 px, 9.06 arcsec | 3.85 px, 6.91 arcsec |
+| Its stack of 36 | 2.26 px, 4.05 arcsec | 3.25 px, 5.83 arcsec |
+| A broadband stack | 4.65 px | 3.72 px |
+| A frame with the cover on | 7.6 px | **no width at all** |
+
+**And it costs nothing.** Measuring at the sensor's own spacing meant filling
+the gaps between the green pixels, which was first done across the whole frame:
+seventy per cent added to the time detection takes on a 61-megapixel image, to
+compute sixty-one million values of which a few hundred thousand were ever
+read. The gaps are now filled where the measurement looks. Detection on a real
+frame takes 50 to 70 ms, the same as before any of this.
+
+That last row is the one to keep in mind. A frame with the cover on has no
+stars, and it now says so rather than reporting a width that looks like a
+measurement.
+
+### Also learnt from that night
+
+- The sky ran from 2321 counts down to under 1500 through one session. Without
+  levelling, rejection treats the brightest frame as the outlier at every pixel
+  and discards the whole of it — measured, on six frames, as exactly one sixth
+  of every sample rejected.
+- Between 2 and 7 per cent of samples are rejected as outliers, which is more
+  than noise alone explains and worth understanding before this is relied on.
 
 ---
 

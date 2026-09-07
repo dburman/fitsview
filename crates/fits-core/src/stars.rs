@@ -121,6 +121,12 @@ pub struct Star {
     pub roundness: f64,
     /// Whether the peak is flat, meaning the star ran out of range.
     pub saturated: bool,
+    /// How far the brightest pixel stood above the sky.
+    ///
+    /// What decides whether a width measured from this star means anything. A
+    /// star barely above the noise has its half-maximum contour sitting in the
+    /// noise, so the region stops early and the width comes out too small.
+    pub peak: f64,
 }
 
 /// What a frame's stars say about it.
@@ -186,6 +192,23 @@ impl StarField {
         self.stars.is_empty()
     }
 }
+
+/// How far above the noise a star must stand for its width to be believed.
+///
+/// The width comes from where the profile falls to half its height, and for a
+/// star ten times the noise that half-height is five times the noise — a level
+/// the noise itself crosses often enough to stop the measurement early and
+/// report the star as narrower than it is. A deep stack finds tens of
+/// thousands of such stars, and taking a median over all of them said the
+/// stack was sharper than any frame that went into it, which cannot be.
+///
+/// A hundred puts the half-height fifty deviations up, where noise does not
+/// reach at all. It was set at twenty first, which is enough for a single
+/// frame — the answer there does not move between twenty and four hundred —
+/// but not for a stack of three dozen, where the measured width was still
+/// climbing at a hundred: a deep stack finds so many faint stars that they
+/// carry the median on their own.
+const MINIMUM_PEAK_FOR_WIDTH: f64 = 100.0;
 
 /// Fewer stars than this and a median says more about luck than the frame.
 const MINIMUM_FOR_A_MEDIAN: usize = 3;
@@ -307,7 +330,7 @@ pub fn detect(image: &FitsImage, params: &DetectionParams) -> StarField {
         stars.truncate(params.limit);
     }
 
-    summarise(stars, scale, capped)
+    summarise(stars, noise, scale, capped)
 }
 
 /// Finds and measures the stars in a one-shot colour mosaic.
@@ -337,13 +360,168 @@ pub fn detect_mosaic(
     for star in &mut field.stars {
         star.x = star.x * 2.0 + 0.5;
         star.y = star.y * 2.0 + 0.5;
-        star.fwhm *= 2.0;
     }
-    field.fwhm = field.fwhm.map(|w| w * 2.0);
+
+    // The widths are measured again at full resolution, where the sensor
+    // actually recorded them.
+    //
+    // Doubling the width found on the half-size green image is arithmetically
+    // right and practically wrong. A star three pixels across on the sensor is
+    // barely one and a half on that image, which is below what a grid can
+    // describe: its half-maximum region comes to one or two pixels, fewer than
+    // a width is measured from, so those stars are dropped and only the broad
+    // ones are left to take a median of. Measured that way a real frame read
+    // 5.05 pixels where its own pixels, read off by hand, say 3.5.
+    // The sky the widths are measured against comes from the green image that
+    // found the stars, not from the mosaic as a whole: green pixels sit above
+    // red and blue ones, and a level taken across all three would be too low.
+    let (background, noise) = crate::quality::background_and_noise(&green);
+    remeasure_widths(&mut field, image, pattern, background, noise);
     field
 }
 
-/// One plane holding the brightness of a three-plane colour image.
+/// The middle value of a list, or nothing when there are too few to mean
+/// anything.
+fn middle_value(values: &mut [f64]) -> Option<f64> {
+    if values.len() < MINIMUM_FOR_A_MEDIAN {
+        return None;
+    }
+    let middle = values.len() / 2;
+    values.select_nth_unstable_by(middle, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Some(values[middle])
+}
+
+/// Measures each star's width again, on the sensor's own green pixels.
+///
+/// Half the pixels of a colour sensor are green, in a chequer, so they sample
+/// the sky at the sensor's full spacing along the diagonals. Growing the
+/// half-maximum region over those pixels alone measures the star where it was
+/// actually recorded: no interpolation, and no filter pattern in the way.
+/// Each green pixel stands for two of the sensor's, which is how the count
+/// becomes an area.
+fn remeasure_widths(
+    field: &mut StarField,
+    image: &FitsImage,
+    pattern: crate::debayer::BayerPattern,
+    background: f64,
+    noise: f64,
+) {
+    // A green pixel is read as it stands; anything else takes the mean of its
+    // green neighbours. Worked out where it is asked for rather than across
+    // the frame, since only a few hundred places around each star are.
+    let green = |x: usize, y: usize| green_value(image, pattern, x, y);
+    let size = (image.width, image.height);
+    let widths: Vec<f64> = field
+        .stars
+        .par_iter_mut()
+        .filter_map(|star| {
+            let fwhm = width_near(&green, size, star.x, star.y, background)?;
+            star.fwhm = fwhm;
+            // The same rule as everywhere else: a star too near the noise has
+            // its half-height in the noise, and its width is not evidence.
+            let solid = star.peak >= MINIMUM_PEAK_FOR_WIDTH * noise;
+            (solid && !star.saturated).then_some(fwhm)
+        })
+        .collect();
+
+    let mut widths = widths;
+    field.fwhm = middle_value(&mut widths);
+}
+
+/// A green pixel as it stands, or the mean of the green pixels around it.
+///
+/// Half a colour sensor's pixels are green, in a chequer; the rest take the
+/// mean of their four green neighbours. That samples the sky at the sensor's
+/// own spacing with no filter pattern left in it, which is what a width has to
+/// be measured on: reading the green pixels alone means stepping along the
+/// diagonals at one and a half pixels a time, and a star three pixels across
+/// is then measured too coarsely to be measured well. Read that way a real
+/// star came to 3.5 pixels where every-pixel sampling of the same star said
+/// 3.05.
+fn green_value(
+    image: &FitsImage,
+    pattern: crate::debayer::BayerPattern,
+    x: usize,
+    y: usize,
+) -> Option<f64> {
+    use crate::debayer::Colour;
+    if x >= image.width || y >= image.height {
+        return None;
+    }
+    if pattern.colour_at(x, y) == Colour::Green {
+        let value = f64::from(image.data[y * image.width + x]);
+        return value.is_finite().then_some(value);
+    }
+
+    let mut total = 0.0f64;
+    let mut count = 0u8;
+    for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+        let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+        if nx < 0 || ny < 0 {
+            continue;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let (nx, ny) = (nx as usize, ny as usize);
+        if nx >= image.width || ny >= image.height {
+            continue;
+        }
+        let value = f64::from(image.data[ny * image.width + nx]);
+        if value.is_finite() {
+            total += value;
+            count += 1;
+        }
+    }
+    (count > 0).then(|| total / f64::from(count))
+}
+
+/// The width of the star near `(x, y)`, measured from its own peak.
+///
+/// The values come from a sampler rather than an array, so that a colour
+/// sensor's green pixels can have their gaps filled where the walk actually
+/// looks — a few hundred places around each star — instead of across the
+/// whole frame. Filling the frame cost seventy per cent of the time detection
+/// takes on a 61-megapixel image, for values that were never read.
+fn width_near(
+    value: &impl Fn(usize, usize) -> Option<f64>,
+    size: (usize, usize),
+    x: f64,
+    y: f64,
+    background: f64,
+) -> Option<f64> {
+    let (width, height) = size;
+    if x < 0.0 || y < 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (cx, cy) = (x.round() as usize, y.round() as usize);
+    if cx + 4 >= width || cy + 4 >= height || cx < 4 || cy < 4 {
+        return None;
+    }
+
+    // The brightest pixel near where the star was found, not the pixel its
+    // centroid happens to land on: the width is measured against half the
+    // height, so starting anywhere dimmer sets the mark too low.
+    let (mut peak, mut peak_at) = (f64::NEG_INFINITY, (cx, cy));
+    for ny in cy - 3..=cy + 3 {
+        for nx in cx - 3..=cx + 3 {
+            if let Some(found) = value(nx, ny) {
+                if found > peak {
+                    peak = found;
+                    peak_at = (nx, ny);
+                }
+            }
+        }
+    }
+    let height_above_sky = peak - background;
+    if !height_above_sky.is_finite() || height_above_sky <= 0.0 {
+        return None;
+    }
+    crossing_width(value, size, peak_at, background, height_above_sky)
+}
+
+/// One plane holding the brightness of a three-plane colour image./// One plane holding the brightness of a three-plane colour image.
 ///
 /// The plain mean of the three, not a weighted luminance: the weights that
 /// suit human vision are wrong for a telescope, where a red star's photons
@@ -716,30 +894,33 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
         return None;
     }
 
-    // The pixels that reach half the star's own peak, which is what the words
-    // "full width at half maximum" describe.
-    let half = half_maximum_region(image, peak_at, background, peak);
-    if half.count < MINIMUM_HALF_MAXIMUM_PIXELS {
-        // One or two pixels above half of their own peak is a noise spike or a
-        // star too poorly sampled to measure. Either way there is no width to
-        // report.
-        return None;
-    }
-
-    // A disc of area A has diameter 2*sqrt(A/pi), and for a Gaussian the pixels
-    // above half its peak form exactly the disc whose diameter is the full
-    // width at half maximum. This counts whole pixels, so it cannot see finer
-    // than the grid — but it measures the star and only the star, which is
-    // what the second moments over a window did not.
+    // Outwards from the peak to where the profile falls through half its
+    // height, interpolating between pixels.
     //
-    // Weighting by brightness over a small window was tried instead, to reach
-    // below the size of a pixel. It was worse: in a window that is mostly sky,
-    // the pixels above the background are the upward half of the noise, all of
-    // them far from the centre, and a second moment weights them by the square
-    // of that distance. Checked against the pixels of a real star read off by
-    // hand, this count agrees and that did not.
-    #[allow(clippy::cast_precision_loss)]
-    let fwhm = 2.0 * (half.count as f64 / std::f64::consts::PI).sqrt();
+    // Counting the pixels above half instead was tried, and cannot see finer
+    // than the grid: a region of twelve pixels says the radius is 1.95 whether
+    // it is 1.6 or 2.2, and a well focused star covers few enough pixels for
+    // that to be the largest error in the answer. Interpolating is what a
+    // person does reading the numbers off a frame, and it agrees with them
+    // where counting did not.
+    //
+    // Second moments over a window were tried before either, and were worse
+    // again: they measured the window rather than the star.
+    // A star whose edge cannot be found — because it runs off the frame, or
+    // into a neighbour — is still a star. It is counted and left unmeasured,
+    // as a saturated one is, rather than being made to disappear.
+    let plain = |x: usize, y: usize| {
+        let value = f64::from(image.data[y * image.width + x]);
+        value.is_finite().then_some(value)
+    };
+    let fwhm = crossing_width(
+        &plain,
+        (image.width, image.height),
+        (peak_at % image.width, peak_at / image.width),
+        background,
+        peak,
+    )
+    .unwrap_or(f64::NAN);
 
     // Roundness from the whole detected region rather than from the few pixels
     // above half the peak. Shape needs area: the half-maximum region of a well
@@ -756,6 +937,7 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
         fwhm,
         roundness,
         saturated,
+        peak,
     })
 }
 
@@ -811,29 +993,73 @@ fn ring_fraction(image: &FitsImage, peak_at: usize, background: f64) -> f64 {
     (total / f64::from(count)) / centre
 }
 
-/// Fewest pixels above half the peak for a width to mean anything.
+/// The width of a star, from where its profile falls to half its height.
 ///
-/// Three pixels is a full width at half maximum of about two, which is the
-/// least a sensor can sample. Below that the number would describe the pixel
-/// grid rather than the sky.
-const MINIMUM_HALF_MAXIMUM_PIXELS: usize = 3;
-
-/// How far from the peak the search for that region may reach.
+/// Walks out from the brightest pixel along the four directions of the grid,
+/// finds where each crosses half the height above the sky by straight-line
+/// interpolation between the two pixels either side, and takes twice the mean
+/// of those four distances.
 ///
-/// Wide enough for a badly defocused star at any sensible sampling, and
-/// bounded so that a gradient cannot walk it across the frame.
-const HALF_MAXIMUM_REACH: i64 = 40;
+/// `None` when fewer than three of the four find an edge, which means the star
+/// runs off the frame or into a neighbour and its width would be a guess.
+fn crossing_width(
+    value: &impl Fn(usize, usize) -> Option<f64>,
+    (width, height): (usize, usize),
+    peak_at: (usize, usize),
+    background: f64,
+    peak: f64,
+) -> Option<f64> {
+    let (px, py) = peak_at;
+    let level = background + peak / 2.0;
 
-/// The pixels reaching half a star's peak.
-struct HalfMaximum {
-    /// How many pixels are in it, which is the area the width comes from.
-    count: usize,
+    let mut radii = Vec::with_capacity(4);
+    for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
+        let mut previous = background + peak;
+        let mut crossing = None;
+        for step in 1..=CROSSING_STEPS {
+            #[allow(clippy::cast_possible_wrap)]
+            let (nx, ny) = (px as i64 + dx * step as i64, py as i64 + dy * step as i64);
+            if nx < 0 || ny < 0 {
+                break;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let (nx, ny) = (nx as usize, ny as usize);
+            if nx >= width || ny >= height {
+                break;
+            }
+            let Some(value) = value(nx, ny) else { break };
+
+            if value < level {
+                let span = previous - value;
+                let fraction = if span > 0.0 {
+                    (previous - level) / span
+                } else {
+                    0.5
+                };
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    crossing = Some((step - 1) as f64 + fraction);
+                }
+                break;
+            }
+            previous = value;
+        }
+        if let Some(radius) = crossing {
+            radii.push(radius);
+        }
+    }
+
+    if radii.len() < 3 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mean = radii.iter().sum::<f64>() / radii.len() as f64;
+    (mean > 0.0).then_some(mean * 2.0)
 }
 
-/// How round a region is: one for a circle, towards zero for a streak.
-///
-/// From the eigenvalues of its second moments, which are the squares of the two
-/// axes of the shape it makes.
+/// How far from a peak a star's edge is looked for, in pixels.
+const CROSSING_STEPS: usize = 30;
+
 fn region_roundness(pixels: &[usize], width: usize) -> f64 {
     #[allow(clippy::cast_precision_loss)]
     let count = pixels.len() as f64;
@@ -871,82 +1097,24 @@ fn region_roundness(pixels: &[usize], width: usize) -> f64 {
     }
 }
 
-/// Grows the region of pixels that reach half the peak, outwards from the peak.
-///
-/// **This is measured on the star and nothing else.** The width used to come
-/// from second moments over a window sized to the detection — up to sixteen
-/// pixels' radius — and second moments weight a pixel by the square of its
-/// distance, so the far corners of that window dominated the answer. Whatever
-/// sat in them, noise or a neighbour or a scrap of nebulosity left after
-/// subtracting the sky, was measured instead of the star. On frames taken with
-/// the cover on, which hold no stars at all, it returned widths of eight
-/// pixels; on real frames it reported ten, which at the plate scale of the
-/// camera that took them is eighteen arcseconds, some six times the worst
-/// seeing anyone images through.
-///
-/// Growing outwards from the peak while pixels stay above half of it cannot do
-/// that: it stops at the star's own edge.
-fn half_maximum_region(
-    image: &FitsImage,
-    peak_at: usize,
-    background: f64,
-    peak: f64,
-) -> HalfMaximum {
-    let (width, height) = (image.width, image.height);
-    let level = background + peak / 2.0;
-    #[allow(clippy::cast_possible_wrap)]
-    let (px, py) = ((peak_at % width) as i64, (peak_at / width) as i64);
-
-    let mut seen: Vec<(i64, i64)> = Vec::new();
-    let mut queue: Vec<(i64, i64)> = vec![(px, py)];
-    let mut visited: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
-    visited.insert((px, py));
-
-    while let Some((x, y)) = queue.pop() {
-        seen.push((x, y));
-        for (dx, dy) in [
-            (-1i64, 0i64),
-            (1, 0),
-            (0, -1),
-            (0, 1),
-            (-1, -1),
-            (1, -1),
-            (-1, 1),
-            (1, 1),
-        ] {
-            let (nx, ny) = (x + dx, y + dy);
-            if (nx - px).abs() > HALF_MAXIMUM_REACH || (ny - py).abs() > HALF_MAXIMUM_REACH {
-                continue;
-            }
-            #[allow(clippy::cast_possible_wrap)]
-            if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
-                continue;
-            }
-            if !visited.insert((nx, ny)) {
-                continue;
-            }
-            #[allow(clippy::cast_sign_loss)]
-            let value = f64::from(image.data[ny as usize * width + nx as usize]);
-            if value.is_finite() && value >= level {
-                queue.push((nx, ny));
-            }
-        }
-    }
-
-    HalfMaximum { count: seen.len() }
-}
-
 /// Turns a list of stars into the summary a frame is judged by.
-fn summarise(stars: Vec<Star>, threshold_scale: f64, capped: bool) -> StarField {
+fn summarise(stars: Vec<Star>, noise: f64, threshold_scale: f64, capped: bool) -> StarField {
     let saturated = stars.iter().filter(|s| s.saturated).count();
+
+    // Only stars with signal enough for a width to mean anything. See
+    // `MINIMUM_PEAK_FOR_WIDTH`: without this a deep stack reports itself
+    // sharper than the frames it was made from.
+    let solid = |s: &&Star| s.peak >= MINIMUM_PEAK_FOR_WIDTH * noise;
 
     let mut widths: Vec<f64> = stars
         .iter()
+        .filter(solid)
         .filter(|s| !s.saturated && s.fwhm.is_finite())
         .map(|s| s.fwhm)
         .collect();
     let mut roundnesses: Vec<f64> = stars
         .iter()
+        .filter(solid)
         .filter(|s| !s.saturated && s.roundness.is_finite())
         .map(|s| s.roundness)
         .collect();
@@ -1738,6 +1906,76 @@ mod tests {
         let field = detect(&image(w, h, &pixels), &DetectionParams::default());
         assert_eq!(field.count(), 1);
         assert_eq!(field.fwhm, None, "one star is not a median");
+    }
+
+    #[test]
+    fn a_mosaic_reports_the_width_the_sensor_actually_recorded() {
+        use crate::debayer::{BayerPattern, Colour};
+        // A colour sensor records a star on half its pixels. Measuring on a
+        // half-size image built from those and doubling the answer is
+        // arithmetically right and practically wrong: a star three pixels
+        // across is one and a half there, too few for a grid to describe, so
+        // the narrow ones are dropped and the median comes from the broad
+        // ones. On a real frame that read 5.05 pixels where the frame's own
+        // pixels, read off by hand, said 3.5.
+        let (w, h) = (300usize, 300usize);
+        let pattern = BayerPattern::Rggb;
+
+        // From four pixels across upwards. Narrower than that and the stars
+        // are not found at all on a colour sensor, for the reason given in
+        // `detect_mosaic`: the half-size image it searches samples a three
+        // pixel star at one and a half, and a perfect Gaussian that narrow
+        // looks like a hot pixel to the filter that rejects hot pixels. Real
+        // stars of that width are found, being less sharply peaked than a
+        // Gaussian, but it is close to the edge of what this can do.
+        for sigma in [1.8f64, 2.6, 3.4] {
+            let mut scene = gaussian_background(w, h, 1000.0, 12.0, 55);
+            for (cx, cy) in [
+                (70usize, 80usize),
+                (150, 90),
+                (100, 190),
+                (200, 200),
+                (60, 160),
+            ] {
+                for dy in -9i64..=9 {
+                    for dx in -9i64..=9 {
+                        let (x, y) = (cx as i64 + dx, cy as i64 + dy);
+                        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                            continue;
+                        }
+                        #[allow(clippy::cast_precision_loss)]
+                        let r = ((dx * dx + dy * dy) as f64) / (2.0 * sigma * sigma);
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            scene[y as usize * w + x as usize] += 30_000.0 * (-r).exp();
+                        }
+                    }
+                }
+            }
+
+            let mosaic: Vec<f64> = (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    match pattern.colour_at(x, y) {
+                        Colour::Green => scene[i],
+                        _ => scene[i] * 0.6,
+                    }
+                })
+                .collect();
+
+            let field = detect_mosaic(&image(w, h, &mosaic), pattern, &DetectionParams::default());
+            let truth = 2.354_820_045_030_949 * sigma;
+            let measured = field.fwhm.unwrap_or_else(|| {
+                panic!(
+                    "no width for a star {truth:.2} pixels across, of which {} were found",
+                    field.count()
+                )
+            });
+            assert!(
+                (measured - truth).abs() < truth * 0.2,
+                "sigma {sigma}: measured {measured:.2} px against a true {truth:.2}"
+            );
+        }
     }
 
     #[test]

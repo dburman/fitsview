@@ -376,6 +376,69 @@ fn export_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
     let count = model.folder.as_ref().map_or(0, crate::folder::Folder::len);
 
     ui.add_space(4.0);
+    ui.label(RichText::new("Stack").strong());
+    ui.label(
+        RichText::new(
+            "Combines the folder into one image per filter, lining the frames \
+             up by their stars.",
+        )
+        .weak()
+        .small(),
+    );
+    let mut weight = model.weight_frames;
+    if ui
+        .checkbox(&mut weight, "Count the better frames for more")
+        .on_hover_text(
+            "A frame taken under a bright sky, or in poor seeing, carries less \
+             than a quiet sharp one, and counting them alike throws that \
+             advantage away.\n\
+             Each frame counts by its noise and the width of its stars. On a \
+             night whose sky brightened fivefold this is worth about forty per \
+             cent of the noise in the result.",
+        )
+        .changed()
+    {
+        actions.push(Action::ToggleWeightFrames);
+    }
+
+    let mut reject = model.reject_outliers;
+    if ui
+        .checkbox(&mut reject, "Leave out satellites and cosmic rays")
+        .on_hover_text(
+            "A plain average keeps everything: a satellite crossing one frame \
+             leaves its streak across the result.\n\
+             This measures every sample against what the rest of the frames \
+             found ordinary and drops the ones that disagree.\n\
+             It reads each frame a second time, so the stack takes about half \
+             as long again. Needs five frames or more.",
+        )
+        .changed()
+    {
+        actions.push(Action::ToggleRejectOutliers);
+    }
+
+    if ui
+        .add_enabled(!busy && count > 1, Button::new("Stack folder"))
+        .on_hover_text(
+            "One stack for each filter, written beside the frames.\n\
+             Frames are lined up by their stars, and a frame taken on the other \
+             side of the pier is turned to match.\n\
+             The calibration and colour settings above are applied on the way in.\n\
+             Reads every frame: expect a second or two per frame of a full-frame \
+             camera.",
+        )
+        .on_disabled_hover_text(if busy {
+            "Something else is running"
+        } else {
+            "Stacking needs more than one frame"
+        })
+        .clicked()
+    {
+        actions.push(Action::StackFolder);
+    }
+
+    ui.add_space(4.0);
+    ui.separator();
     ui.label(RichText::new("Export").strong());
     ui.label(
         RichText::new(format!(

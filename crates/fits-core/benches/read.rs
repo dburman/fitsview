@@ -179,6 +179,44 @@ fn bench_stars(c: &mut Criterion) {
     group.finish();
 }
 
+/// Adding a frame into a stack, and taking the average out again.
+///
+/// The stack is the one place a whole extra frame's worth of memory is spent,
+/// so both the time and that cost are worth watching.
+fn bench_stack(c: &mut Criterion) {
+    use fits_core::header::FitsHeader;
+    use fits_core::stack::{Alignment, Stack};
+
+    let (w, h) = (6000usize, 4000usize);
+    let pixels = fits_core::testutil::gaussian_background(w, h, 1000.0, 20.0, 9);
+    let spec = SyntheticSpec::new(w, h, -32);
+    let image =
+        read_fits_from_bytes(&synthetic_fits(&spec, &pixels).expect("build")).expect("decode");
+
+    // Shifted, since an aligned frame is the exception rather than the rule.
+    let alignment = Alignment {
+        dx: 7.0,
+        dy: -3.0,
+        ..Alignment::still()
+    };
+
+    let mut group = c.benchmark_group("stack");
+    group.sample_size(10);
+    group.bench_function("add a 24 MP frame", |b| {
+        b.iter_batched_ref(
+            || Stack::new(w, h, 1),
+            |stack| stack.add(black_box(&image), alignment),
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("average 24 MP out", |b| {
+        let mut stack = Stack::new(w, h, 1);
+        stack.add(&image, alignment);
+        b.iter(|| black_box(stack.finish(FitsHeader { cards: Vec::new() })));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_read,
@@ -187,6 +225,7 @@ criterion_group!(
     bench_calibration,
     bench_debayer,
     bench_quality,
-    bench_stars
+    bench_stars,
+    bench_stack
 );
 criterion_main!(benches);

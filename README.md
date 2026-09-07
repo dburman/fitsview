@@ -68,6 +68,45 @@ the measurement to cull on. Each star is circled on the image, so a bad
 detection is obvious rather than hidden inside a number. It takes about 16 ms on
 a 24-megapixel frame, runs in the background, and is off until asked for.
 
+**Stacking.** **Stack folder** combines a night into one image per filter,
+lining the frames up by their stars, so the signal adds while the noise adds
+only with its root. Frames taken on the other side of a meridian flip are turned
+to match — including the fraction of a degree the mount does not come back by,
+which would otherwise leave the middle of the frame lining up and the edges
+smeared. Frames are brought to a common sky before they are added, so a frame
+taken as the moon rose does not lift the result.
+
+Each frame counts for what it is worth rather than for one: a quiet, sharp frame
+counts for more than a noisy, soft one, which on a night whose sky brightens
+fivefold is worth about forty per cent of the noise in the result. Satellite
+trails and cosmic rays are left out, each sample being measured against what the
+other frames found ordinary. Both can be turned off.
+
+The calibration and colour settings in force are applied on the way in, and the
+stacks are written beside the frames. Eight 61-megapixel frames take about three
+seconds, or half as long again with rejection, most of it spent reading them.
+
+**Judging a frame.** `Shift+S` finds the stars and measures them: how many, how
+wide (the full width at half maximum, in pixels and in arcseconds where the
+header gives the focal length and pixel size) and how round. That is what
+tells you whether a frame is in focus and whether the mount tracked, and it is
+the measurement to cull on. Each star is circled on the image, so a bad
+detection is obvious rather than hidden inside a number. It takes about 16 ms on
+a 24-megapixel frame, runs in the background, and is off until asked for.
+
+**Stacking.** **Stack folder** combines a night into one image per filter,
+lining the frames up by their stars, so the signal adds while the noise adds
+only with its root. Frames taken on the other side of a meridian flip are turned
+to match rather than blurred into the rest. The calibration and colour settings
+in force are applied on the way in, and the stacks are written beside the frames.
+Frames from the other side of a meridian flip are turned to match, including
+the fraction of a degree the mount does not come back by, which would otherwise
+leave the middle of the frame lining up and the edges smeared. Satellite trails
+and cosmic rays are left out: each sample is measured against what the other
+frames found ordinary, and the ones that disagree are dropped.
+Eight 61-megapixel frames take about three seconds without that, half as long
+again with it, most of it spent reading them.
+
 **Knowing what you are looking at.** The metadata panel shows the FITS header,
 with the keywords that identify a frame pinned to the top and a filter for
 finding the rest, along with the sky background, the noise, and the star
