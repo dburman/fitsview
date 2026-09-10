@@ -2799,8 +2799,15 @@ memory of a mono stack and is the honest price of the alignment being correct.
       twenty. Per frame: **read 170 ms**, find the stars 80 ms, work out the
       alignment 1 ms, add to the stack 10 ms. Reading the file is two thirds of
       it, so the stacking itself is not what anyone waits for.
-- [ ] The interface stays responsive throughout, and Stop works. Not yet
-      watched on a real folder.
+- [x] The interface stays responsive throughout, and Stop works. Watched on
+      real folders.
+- [x] Every frame of the night that crossed the meridian lines up. The one that
+      would not was the last of the session, taken as the sky brightened
+      ninefold: it held fewer than half the stars of the reference and broader
+      ones, so the brightest hundred of each barely overlapped, and with the
+      flip on top there was nothing to start from. Considering the brightest two
+      hundred instead settles it, for two milliseconds a frame against the fifty
+      a search costs.
 - [x] A satellite crossing one frame of six is left out of the stack, and the
       stars are not.
 - [x] Rejection costs a second read and nothing measurable in the arithmetic:
@@ -2905,12 +2912,33 @@ numbers off — agrees with them.
 On synthetic stars of known width the error is now 3 to 7 per cent, against 60
 before.
 
-**What this did not fix.** A star narrower than about four pixels is not found
-at all on a colour sensor: the half-size image samples it at two, and a perfect
-Gaussian that narrow looks like a hot pixel to the filter that rejects hot
-pixels. Real stars of that width are found, being less sharply peaked, but it
-is close to the edge. Detecting on the green chequer at full spacing rather
-than on a half-size image would settle it, and is a larger change.
+**And it was worse than that.** Real stars of that width were *not* being
+found: they were thrown out as hot pixels. The test that rejects a defect asks
+how much of a peak the ring around it carries, and on the half-size image a
+well focused star is a pixel and a half across, so its neighbours have already
+fallen away. Three stars read off a real frame — ten, eighteen and twenty-seven
+thousand counts, plainly stars — came to ring fractions of 0.27, 0.27 and 0.18,
+all under the mark. The sharpest stars on every frame, thrown away for being
+sharp, which also means a night of good seeing loses more of them than a night
+of bad.
+
+The test now runs where the star is sampled properly, at the sensor's own
+spacing, where a hot pixel still has nothing beside it — one bright green pixel
+reaches its four neighbours at a quarter strength and no further — and a real
+star reaches them all. On that frame: 2,615 stars became **4,246**, and the
+median width 3.86 pixels became **2.70**, which is 4.85 arcseconds rather than
+6.93.
+
+Reading the frame's own pixels again, more carefully than the first time,
+confirms it: along the peak row the star crosses half its height at −0.67 and
++0.69 green pixels, which is 2.7 of the sensor's. The earlier hand figure of
+3.5 was the sloppy one — measured along a row that did not pass through the
+peak.
+
+Shape is now reported only for stars whose width could be measured. A frame
+with the cover on holds a few bright defects that survive everything else, and
+they are compact, so reporting their shape said such a frame was full of
+beautifully round stars.
 
 **Why a stack read narrower than its own frames.** Not the noise estimate: a
 stack of thirty-six has a noise of 1.4 against a frame's 8.4, which is exactly

@@ -171,10 +171,18 @@ const MINIMUM_SHARE: usize = 10;
 
 /// Brightest stars used from each frame.
 ///
-/// The vote is every pairing of one list with the other, so this squares. A
-/// hundred is ten thousand pairings, which costs nothing, and the brightest
-/// hundred of a frame are the ones most likely to appear in both.
-const STARS_CONSIDERED: usize = 100;
+/// The vote is every pairing of one list with the other, so this squares. Two
+/// hundred is forty thousand pairings, a few milliseconds against the fifty a
+/// frame takes to search, and the brightest of a frame are the ones most
+/// likely to appear in both.
+///
+/// A hundred was not enough for the last frame of one night, taken as the sky
+/// brightened ninefold: it held fewer than half the stars of the reference and
+/// broader ones, so the brightest hundred of each barely overlapped. Add the
+/// meridian flip, where only the middle of the frame matches until the turn is
+/// known, and there was nothing left to start from. At two hundred every frame
+/// of that night lines up.
+const STARS_CONSIDERED: usize = 200;
 
 /// How close two offsets must be to count as the same one, in pixels.
 ///

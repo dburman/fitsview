@@ -220,6 +220,22 @@ const MINIMUM_FOR_A_MEDIAN: usize = 3;
 /// would otherwise be found four times, once per filter site.
 #[must_use]
 pub fn detect(image: &FitsImage, params: &DetectionParams) -> StarField {
+    search(image, params, true)
+}
+
+/// The search itself.
+///
+/// `reject_defects` says whether a peak standing too far above its neighbours
+/// is thrown out here. It is right to do that on a frame that samples its stars
+/// properly, and wrong on the half-size image a colour sensor's green pixels
+/// make: a well focused star is only a pixel and a half across there, so its
+/// neighbours have already fallen away and it looks exactly like the hot pixel
+/// the test is for. Measured on a real frame, three stars of ten, eighteen and
+/// twenty-seven thousand counts came to ring fractions of 0.27, 0.27 and 0.18,
+/// all below the mark — the sharpest stars on the frame, thrown away for being
+/// sharp. The colour path leaves the test until the width is measured, which
+/// happens at the sensor's own spacing.
+fn search(image: &FitsImage, params: &DetectionParams, reject_defects: bool) -> StarField {
     if image.width < 3 || image.height < 3 {
         return StarField::default();
     }
@@ -317,7 +333,7 @@ pub fn detect(image: &FitsImage, params: &DetectionParams) -> StarField {
             // worth.
             let first = pixels[0];
             let (local, _) = sky.at(first % image.width, first / image.width);
-            measure_star(image, pixels, f64::from(local))
+            measure_star(image, pixels, f64::from(local), reject_defects)
         })
         .collect();
 
@@ -356,7 +372,10 @@ pub fn detect_mosaic(
         ..*params
     };
 
-    let mut field = detect(&green, &scaled);
+    // Without the defect test, which cannot be applied to this half-size
+    // image without throwing away the best stars on the frame. It is applied
+    // below instead, where the star is sampled properly.
+    let mut field = search(&green, &scaled, false);
     for star in &mut field.stars {
         star.x = star.x * 2.0 + 0.5;
         star.y = star.y * 2.0 + 0.5;
@@ -413,6 +432,16 @@ fn remeasure_widths(
     // the frame, since only a few hundred places around each star are.
     let green = |x: usize, y: usize| green_value(image, pattern, x, y);
     let size = (image.width, image.height);
+
+    // A hot pixel, at this spacing, still has nothing beside it: one bright
+    // green pixel reaches its four neighbours at a quarter strength and no
+    // further, which is well under the mark. A real star reaches them all.
+    field.stars.retain(|star| {
+        star.saturated
+            || sampled_ring_fraction(&green, size, star.x, star.y, background)
+                >= MINIMUM_RING_FRACTION
+    });
+
     let widths: Vec<f64> = field
         .stars
         .par_iter_mut()
@@ -428,6 +457,21 @@ fn remeasure_widths(
 
     let mut widths = widths;
     field.fwhm = middle_value(&mut widths);
+
+    // And the shape, over the same stars: those measured, unsaturated, and
+    // standing well clear of the noise.
+    let mut shapes: Vec<f64> = field
+        .stars
+        .iter()
+        .filter(|s| {
+            !s.saturated
+                && s.fwhm.is_finite()
+                && s.roundness.is_finite()
+                && s.peak >= MINIMUM_PEAK_FOR_WIDTH * noise
+        })
+        .map(|s| s.roundness)
+        .collect();
+    field.roundness = middle_value(&mut shapes);
 }
 
 /// A green pixel as it stands, or the mean of the green pixels around it.
@@ -474,6 +518,66 @@ fn green_value(
         }
     }
     (count > 0).then(|| total / f64::from(count))
+}
+
+/// How much of a star's peak the ring around it carries, from a sampler.
+///
+/// The same test as [`ring_fraction`], applied where the values have to be
+/// worked out rather than read from an array.
+fn sampled_ring_fraction(
+    value: &impl Fn(usize, usize) -> Option<f64>,
+    (width, height): (usize, usize),
+    x: f64,
+    y: f64,
+    background: f64,
+) -> f64 {
+    if x < 1.0 || y < 1.0 {
+        return 1.0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (cx, cy) = (x.round() as usize, y.round() as usize);
+    if cx + 4 >= width || cy + 4 >= height || cx < 4 || cy < 4 {
+        return 1.0;
+    }
+
+    // The brightest pixel nearby, since the centroid is not always on it.
+    let (mut peak, mut peak_at) = (f64::NEG_INFINITY, (cx, cy));
+    for ny in cy - 3..=cy + 3 {
+        for nx in cx - 3..=cx + 3 {
+            if let Some(found) = value(nx, ny) {
+                if found > peak {
+                    peak = found;
+                    peak_at = (nx, ny);
+                }
+            }
+        }
+    }
+    let centre = peak - background;
+    if !centre.is_finite() || centre <= 0.0 {
+        return 0.0;
+    }
+
+    let (mut total, mut count) = (0.0f64, 0u32);
+    for dy in -1i64..=1 {
+        for dx in -1i64..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            let (nx, ny) = (
+                (peak_at.0 as i64 + dx) as usize,
+                (peak_at.1 as i64 + dy) as usize,
+            );
+            if let Some(found) = value(nx, ny) {
+                total += found - background;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return 1.0;
+    }
+    (total / f64::from(count)) / centre
 }
 
 /// The width of the star near `(x, y)`, measured from its own peak.
@@ -842,7 +946,12 @@ fn touches_edge(pixels: &[usize], width: usize, height: usize) -> bool {
 /// is. The width comes from a window around it, including pixels **below** the
 /// threshold: measuring only what crosses the threshold would clip the wings of
 /// every star and report them all as narrower than they are.
-fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<Star> {
+fn measure_star(
+    image: &FitsImage,
+    pixels: &[usize],
+    background: f64,
+    reject_defects: bool,
+) -> Option<Star> {
     let width = image.width;
 
     let mut flux = 0.0f64;
@@ -890,7 +999,10 @@ fn measure_star(image: &FitsImage, pixels: &[usize], background: f64) -> Option<
     // on area alone. On a frame taken with the cover on, that turned tens of
     // thousands of hot pixels into reported stars. This is measured on the
     // frame as it came, where a spike is still a spike.
-    if !saturated && ring_fraction(image, peak_at, background) < MINIMUM_RING_FRACTION {
+    if reject_defects
+        && !saturated
+        && ring_fraction(image, peak_at, background) < MINIMUM_RING_FRACTION
+    {
         return None;
     }
 
@@ -1112,10 +1224,14 @@ fn summarise(stars: Vec<Star>, noise: f64, threshold_scale: f64, capped: bool) -
         .filter(|s| !s.saturated && s.fwhm.is_finite())
         .map(|s| s.fwhm)
         .collect();
+    // Shape is reported only for stars whose width could be measured. A frame
+    // with the cover on holds a few bright defects that survive everything
+    // else, and they are compact, so reporting their shape said such a frame
+    // was full of beautifully round stars.
     let mut roundnesses: Vec<f64> = stars
         .iter()
         .filter(solid)
-        .filter(|s| !s.saturated && s.roundness.is_finite())
+        .filter(|s| !s.saturated && s.roundness.is_finite() && s.fwhm.is_finite())
         .map(|s| s.roundness)
         .collect();
 
@@ -1906,6 +2022,116 @@ mod tests {
         let field = detect(&image(w, h, &pixels), &DetectionParams::default());
         assert_eq!(field.count(), 1);
         assert_eq!(field.fwhm, None, "one star is not a median");
+    }
+
+    #[test]
+    fn a_colour_frame_with_the_cover_on_still_finds_almost_nothing() {
+        // The defect test moved, so what it was holding back has to be checked
+        // again: a frame with no sky and no stars, which is what an exposure
+        // taken with the cover on looks like. It found tens of thousands of
+        // "stars" before that test existed.
+        use crate::debayer::{BayerPattern, Colour};
+        let (w, h) = (300usize, 300usize);
+        let pattern = BayerPattern::Rggb;
+
+        let scene = gaussian_background(w, h, 9.0, 6.0, 59);
+        let mosaic: Vec<f64> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                match pattern.colour_at(x, y) {
+                    Colour::Green => scene[i],
+                    _ => scene[i] * 0.6,
+                }
+            })
+            .collect();
+
+        let field = detect_mosaic(&image(w, h, &mosaic), pattern, &DetectionParams::default());
+        assert!(
+            field.count() < 60,
+            "a covered frame should find next to nothing, found {}",
+            field.count()
+        );
+        assert!(
+            field.fwhm.is_none(),
+            "and no width at all: {:?}",
+            field.fwhm
+        );
+        assert!(
+            field.roundness.is_none(),
+            "nor a shape: a few bright defects survive everything else, and they \
+             are compact, so reporting their shape said a covered frame was full \
+             of beautifully round stars"
+        );
+    }
+
+    #[test]
+    fn a_sharp_star_on_a_colour_sensor_is_not_taken_for_a_hot_pixel() {
+        // The test that throws out hot pixels asks how much of a peak the ring
+        // around it carries. On the half-size image a colour sensor's green
+        // pixels make, a well focused star is a pixel and a half across, its
+        // neighbours have already fallen away, and it looks exactly like the
+        // defect the test is for. Three real stars of ten, eighteen and
+        // twenty-seven thousand counts were being thrown away for being sharp,
+        // which took the best stars off every frame and left the median width
+        // to the blurred ones.
+        use crate::debayer::{BayerPattern, Colour};
+        let (w, h) = (200usize, 200usize);
+        let pattern = BayerPattern::Rggb;
+
+        let mut scene = gaussian_background(w, h, 1000.0, 10.0, 57);
+        // Sharp, but real: a star a shade under three pixels across.
+        let places = [
+            (60usize, 70usize),
+            (130, 80),
+            (90, 140),
+            (150, 150),
+            (50, 120),
+        ];
+        for (cx, cy) in places {
+            for dy in -6i64..=6 {
+                for dx in -6i64..=6 {
+                    let (x, y) = (cx as i64 + dx, cy as i64 + dy);
+                    #[allow(clippy::cast_precision_loss)]
+                    let r = ((dx * dx + dy * dy) as f64) / (2.0 * 1.2 * 1.2);
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        scene[y as usize * w + x as usize] += 25_000.0 * (-r).exp();
+                    }
+                }
+            }
+        }
+        // And one genuine hot pixel, as bright as the stars.
+        scene[100 * w + 100] += 25_000.0;
+
+        let mosaic: Vec<f64> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                match pattern.colour_at(x, y) {
+                    Colour::Green => scene[i],
+                    _ => scene[i] * 0.6,
+                }
+            })
+            .collect();
+
+        let field = detect_mosaic(&image(w, h, &mosaic), pattern, &DetectionParams::default());
+        let near = |x: f64, y: f64| {
+            field
+                .stars
+                .iter()
+                .any(|s| (s.x - x).abs() < 3.0 && (s.y - y).abs() < 3.0)
+        };
+        for (cx, cy) in places {
+            #[allow(clippy::cast_precision_loss)]
+            let (fx, fy) = (cx as f64, cy as f64);
+            assert!(
+                near(fx, fy),
+                "the star at ({cx}, {cy}) is sharp, not a defect"
+            );
+        }
+        assert!(
+            !near(100.0, 100.0),
+            "but a single hot pixel is still a defect"
+        );
     }
 
     #[test]
