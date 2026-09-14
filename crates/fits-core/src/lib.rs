@@ -34,7 +34,7 @@ pub use header::FitsHeader;
 pub use histogram::Histogram;
 pub use image::{convert_pixels, finite_min_max, FitsImage, Geometry};
 pub use quality::{measure, Quality};
-pub use reader::{is_fits_path, read_fits, read_fits_from_bytes, write_fits};
+pub use reader::{is_fits_path, read_fits, read_fits_from_bytes, read_fits_header, write_fits};
 pub use stars::{DetectionParams, Star, StarField};
 pub use stretch::{build_lut, compute_stretch, Stretch, StretchParams};
 

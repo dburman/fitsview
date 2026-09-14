@@ -53,6 +53,7 @@ fn bench_per_frame(c: &mut Criterion) {
                 path: PathBuf::from(format!("/session/light_{i}.fits")),
                 name: format!("light_{i}.fits"),
                 size: 1024,
+                stamp: None,
                 flagged: false,
                 quality: Some(fits_core::Quality {
                     background: 1000.0 + f64::from(i % 17),

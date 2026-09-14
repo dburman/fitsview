@@ -253,7 +253,7 @@ it silently pick old releases rather than reporting a conflict. Raise
 | `rayon` | 1.10 | both | Data-parallel pixel loops, parallel reduce for min/max. | Audited unsafe internally; API is safe. | `std::thread::scope` (more code, same result). |
 | `rfd` | 0.17 | fitsview | Native open-file / open-folder / message dialogs on all three OSes. | Wraps OS APIs. | `native-dialog` (fewer features). |
 | `trash` | 5 | fitsview | Move files to OS trash / recycle bin; restore where supported. | Wraps OS APIs. | `std::fs::remove_file` — rejected: permanent deletion. |
-| `serde` + `serde_json` | 1 | fitsview | Read/write `.fitsview.json` sidecar (flags, calibration paths). | `forbid(unsafe_code)` in serde_json. | Hand-rolled JSON — rejected. |
+| `serde` + `serde_json` | 1 | fitsview | Read/write `.fitsview.json` sidecar (flags, calibration paths) and `.fitsview-measurements.json` (Phase 18; `float_roundtrip` on, so figures read back exactly). | `forbid(unsafe_code)` in serde_json. | Hand-rolled JSON — rejected. |
 | `natord` | 1.0 | fitsview | Natural sort (`light_2` before `light_10`). Tiny, no deps. | Pure safe Rust. | Hand-written comparator (fine too). |
 | `thiserror` | 2 | fits-core | Typed error enums. | Proc-macro, safe. | — |
 | `anyhow` | 1 | fitsview | Error propagation in the app. | Safe. | — |
@@ -2984,6 +2984,357 @@ measurement.
   of every sample rejected.
 - Between 2 and 7 per cent of samples are rejected as outliers, which is more
   than noise alone explains and worth understanding before this is relied on.
+  Ten frames of the Barnard's Loop night, stacked in colour, rejected 11.5 per
+  cent (212 million of 1.84 billion). Phase 20 found out why, and answers it:
+  almost all of it was ordinary noise from the noisiest frames.
+
+---
+
+## Phase 18 — Remembering Measurements
+
+Measuring a night for its stars takes seconds — 9.4 s for the 85 frames of the
+Barnard's Loop session — and every figure was lost the moment the folder was
+closed. The frames had not changed; the numbers could not have either.
+
+### What it has to do
+
+- A frame measured once is not measured again unless the file changes.
+- Opening a target, a night or a filter finds the same figures, whichever of
+  them was open when the measuring was done.
+- Figures from another release are never shown as current. 0.1.7 changed every
+  star width on a colour sensor; a folder measured by 0.1.6 must not quietly
+  show 0.1.6's numbers.
+- Star figures found at one detection threshold are not taken for those found
+  at another.
+- Nothing about it may cost the user a frame, a flag, or an error message.
+
+### Where the figures live
+
+In a hidden `.fitsview-measurements.json` **in the folder that holds the
+frames**, keyed by file name — not in `.fitsview.json` beside the keep flags,
+which is written to whichever folder was opened. Keep flags are named relative
+to the opened folder, so a flag set from the target is not seen when the night
+is opened alone. That is tolerable for a handful of flags and would be absurd
+for measurements, which are worth the most exactly when a target is revisited
+from a different level. Keeping them apart also means the settings file stays
+short enough to read, and that the measurements file can be deleted freely:
+nothing in it cannot be worked out again.
+
+Each entry carries the file's size and modification time as they were when it
+was listed. An entry is used only while both still match, and is written only
+if they still match at the moment of writing — a frame changed between listing
+and measuring may have been measured as it used to be. Star figures carry a
+hash of the detection settings, and the whole file carries the version that
+wrote it; a file from any other version is ignored.
+
+### What it measured
+
+| Barnard's Loop, 85 frames | Time |
+|---------------------------|------|
+| Measure stars, from nothing | 9.4 s |
+| Recording the figures | 0.5 ms |
+| Opening the folder again, figures included | 0.6 ms |
+
+The folder opens as fast as it did when it had nothing to remember.
+
+### Found on the way
+
+- **The figures came back one bit out.** `serde_json` parses floating point
+  quickly rather than exactly unless its `float_roundtrip` feature is on;
+  13.343419966550417 came back as …416. Harmless on screen, but a remembered
+  figure should be the figure. The feature is on, and a test holds that value.
+- **The README described two sections twice**, left behind by an earlier edit,
+  and said background and sharpness were measured as a folder loads. They are
+  measured as each frame is viewed, or by **Measure**.
+
+### Acceptance criteria
+
+- [x] A folder measured for stars and opened again shows every figure without
+      reading a frame, and offers no measuring to do.
+- [x] Opening a night finds figures measured by opening its target.
+- [x] A frame rewritten in place is blank on reopening; the rest are not.
+- [x] A frame changed after listing is not recorded.
+- [x] Figures written by another version are ignored.
+- [x] New detection settings make **Measure stars** available again, and
+      running it measures under the new settings.
+- [x] A rename carries the figures to the new name; deleted frames are dropped
+      from the record.
+- [x] A value JSON cannot hold — infinity, not-a-number — loses that figure,
+      not the file.
+- [x] Measuring the same figures again does not rewrite the file.
+- [x] A read-only volume is measured as before, and nothing is written.
+
+### Not done
+
+- **The frame being viewed is not recorded.** Its background and sharpness are
+  taken as it loads, at no cost, but writing a file on every arrow key would
+  churn the folder and anything syncing it. They are recorded with the next
+  **Measure**.
+- **A folder copied without its times** — `cp` without `-p`, some sync tools —
+  is measured again, because every frame looks changed. The safe mistake.
+
+---
+
+## Phase 19 — Watching a Session
+
+The viewer was built for the morning after: open a night, go through it, keep
+the good frames. The same judgement is worth more while the night is still
+going, when a slipped focus or a bank of cloud can still be done something
+about. This phase makes an open folder keep up with the camera, and does the
+three smaller things that needed doing first.
+
+### Tests on Linux
+
+With continuous integration unavailable, the 700-odd tests had been run on the
+Mac they were written on and nowhere else, though a good many of them are
+about exactly what differs between systems: the trash, renaming, file times,
+read-only volumes. `scripts/test-linux.sh` runs the whole suite in a Linux
+container, and `check.sh` runs it whenever Docker is up. The container is
+arm64, matching the Mac, rather than the x86-64 the Linux release is built
+for: it is the system that differs, and emulating another processor turns
+three minutes into thirty. A warm run takes about thirty seconds.
+
+### Frames still being written
+
+A file cut short used to be reported as damaged, and during a session the
+newest frame is cut short for as long as it takes to write. Now a file that
+ended early **and** was written to within the last minute is taken to be
+arriving: the status line says so, the viewer looks again every 750 ms, and the
+frame opens when it is finished. After a minute untouched it is damaged, and
+reported as before.
+
+An empty file, and one holding only the first letters of `SIMPLE`, now read as
+cut short rather than as not FITS, since that is what a file is for an instant
+after it is created. A test cuts a valid file off at every length it passes
+through while being written and requires each to read as either finished or
+truncated, never as anything else.
+
+The price is that a short, freshly written file of nonsense that happens to
+begin with `SIMPLE` is waited on for a minute before being called damaged.
+Nothing in the bytes tells the two apart.
+
+### Measuring a frame ahead
+
+| Per frame, Barnard's Loop (61 MP) | ms |
+|-----------------------------------|----|
+| Reading the file | 24 |
+| Decoding it | 8 |
+| Background and sharpness | 13 |
+| Finding the stars | 64 |
+
+All four ran one after another. Now a second thread reads and decodes the next
+frame while this one is measured, and the background is taken at the same time
+as the star search. The reader holds one frame and no more, since a 61-megapixel
+frame is a quarter of a gigabyte decoded.
+
+| 85 frames, warm disk cache | Before | After |
+|----------------------------|--------|-------|
+| Measure stars | 8.9 s | 6.2 s |
+| Measure | 3.4 s | 2.3 s |
+
+Both measured with the files already in memory, which flatters the reading; on
+an external disk the reading is a larger share, and hiding it is worth more.
+The star search is now nearly all that is left.
+
+**Stacking read every frame one time too many.** It decoded each in full just to
+read its `FILTER` card before grouping them — under a comment saying it read
+the header alone — then again to stack it. `read_fits_header` now reads a
+block at a time as far as the `END` card and returns exactly the header
+`read_fits` would, extension layout included. Grouping 83 frames went from
+2.56 s to 3 ms, and ten frames stacked to a byte-identical result either way.
+On a warm disk cache the saving is lost in the noise of a whole stack; it is
+worth its keep on a slow disk, where each frame is 120 MB to fetch. A frame
+whose header reads and whose pixels do not now reaches the stacking pass, and
+is passed over there, as a frame that will not line up is.
+
+### Watching the folder
+
+A thread lists the folder every two seconds and hands over a new listing when
+anything has changed. A listing rather than change notifications, because
+notifications are not delivered for network shares everywhere and a camera
+controller saving over the network is the case that matters most. A listing
+costs a millisecond for a night; one that takes longer is followed by a wait
+ten times as long, so watching a large archive over a slow share never becomes
+the main thing the disk does.
+
+A file joins the list only once its size and modification time are the same on
+two looks running, so a frame being written does not flicker into the list and
+is not measured half there. Merging a listing keeps everything known about a
+file that has not changed; a changed file keeps its flag, which is the user's,
+and loses its measurements, which described what it used to be.
+
+New frames are measured on arrival, stars included when the rest of the folder
+has star figures. A new frame outside the usual range of any measure is named
+in a message; an ordinary one arrives without a word. Someone sitting on the
+last frame in name order is following the session and moves on to each new one;
+anyone who has stepped back is left where they are. Stacks this program writes
+into the folder are neither followed nor measured.
+
+The run that mattered was the real application with nobody touching it: a
+frame copied into the open folder was listed and measured two seconds later,
+and a frame written slowly in six pieces over four seconds was read exactly
+once, two seconds after it finished.
+
+### Found on the way
+
+- **Rescanning threw every decoded image away**, and left the list in name order
+  under a menu that said it was sorted by something else. It now lets go of
+  only what changed and keeps the ordering.
+- **The reader does have random-input tests**, in `tests/properties.rs`; a search
+  of `src/` alone had said otherwise.
+
+### Acceptance criteria
+
+- [x] The whole suite passes in a Linux container, and `check.sh` runs it.
+- [x] Every prefix of a valid file reads as finished or truncated.
+- [x] A frame still being written opens once finished, without an error.
+- [x] A file cut short long ago is reported as damaged.
+- [x] Stepping away from a frame being written stops waiting for it.
+- [x] Measuring reads one frame ahead, keeps the order asked for, and a cancel
+      with a frame waiting to be handed over still finishes.
+- [x] A frame written into the open folder joins the list and is measured.
+- [x] Sitting on the newest frame follows the session; elsewhere, nothing moves.
+- [x] A new frame unlike the rest is pointed out; an ordinary one is not.
+- [x] A frame rewritten on disk is shown as it is now.
+- [x] A frame deleted elsewhere leaves the list.
+- [x] A stack written into the folder is neither followed nor measured.
+
+### Not done
+
+- **The message is a passing one.** A frame that stands out is named for a few
+  seconds; after that it is only coloured, and only under the ordering in force.
+- **Nothing is flagged or deleted because it stands out.** As everywhere else
+  here, the tool points and the user decides.
+
+---
+
+## Phase 20 — Rejection That Judges Each Frame By Itself
+
+Stacking ten frames of the Barnard's Loop night with rejection on left out 212
+million samples of 1.84 billion: 11.5 per cent, and 43 per cent of the noisiest
+frame. Almost none of it was satellites or cosmic rays. The stack came out
+**twenty per cent noisier than no rejection at all**, and its brightest stars
+0.6 per cent too bright.
+
+### What was wrong
+
+Each pixel's allowance came from its own samples, and three things made that
+allowance wrong:
+
+1. **It was weighted.** The quiet frames counted up to twenty times what the
+   noisy ones did, so the spread was essentially the quiet frames' noise.
+   A frame three times noisier failed against it wholesale.
+2. **Setting the brightest sample aside made it too narrow.** That step stopped
+   a satellite excusing itself, and cost the spread its upper tail: on ten
+   frames of pure noise it rejected 1.4 per cent where chance says 0.27.
+3. **One allowance served every frame.** Even unweighted, a frame three times
+   noisier than its neighbours lost up to 17 per cent of a colour.
+
+A fourth was found while fixing them: **the second pass placed frames
+differently from the first.** A fitted alignment holds a turn of a
+hundred-thousandth of a radian, which sent the first pass down the resampling
+path and left the second placing the frame to the nearest whole pixel. Each
+sample was then judged against figures it had never contributed to.
+
+### What it does now
+
+Each sample is judged against **the other frames at that position, with itself
+left out**, in units of **its own frame's noise**:
+
+- Leaving the sample out of its own test is what stops a satellite excusing
+  itself, without narrowing the spread for everything else.
+- The brightest of the others is set aside as well, so that two outliers in one
+  pixel — a satellite and a cosmic ray — cannot excuse each other. That is the
+  one place the old rule was right.
+- The scatter of the others, measured in units of their own noise, is about one
+  per sample on sky and much more across a star, where the light moves with the
+  seeing. The allowance widens where the sky itself varies.
+- The threshold is Student's t for the number of frames, not a flat three
+  deviations, so pure noise loses the same 0.27 per cent whether there are six
+  frames or sixty.
+
+Noise is measured **per colour, on the frame as it is stacked**, from second
+differences along a row, which cancel a level and a slope and so are blind to
+vignetting and nebulosity. The single figure from the raw frame said the last
+frame of that night was three times as noisy as the first; in each colour it
+was between two and two and a half.
+
+A resampled frame is quieter than the frame it came from, by a factor the
+resampling itself works out, and is judged by the noise it has once placed.
+Without that, the reference frame — the one never resampled — is the odd one
+out and is rejected wherever it differs from the rest.
+
+### What it measures
+
+Ten 61-megapixel frames of that night:
+
+| | Old rule | New rule | No rejection |
+|---|---|---|---|
+| Samples rejected | 211,822,495 (11.5%) | 10,877,147 (0.59%) | — |
+| Noise, frame centre (R) | 9.31 | 7.86 | 7.75 |
+| Noise, a corner (R) | 2.65 | 2.45 | 2.42 |
+| Brightest stars (R) | +0.60% | +0.02% | — |
+| Time | 7.5–8.2 s | 10.8–11.2 s | 3.9 s |
+| Peak memory | 14.0 GB | 11.7 GB | — |
+
+On pure noise, in simulation and in the tests: 0.27 per cent rejected with the
+sample left out, 0.43 with the brightest of the others out too, whatever the
+mix of frame noises. The old rule: 8.3 per cent on that night's mix.
+
+Every outlier the old rule caught is still caught — a satellite, a satellite
+with a cosmic ray in the same pixel, a faint trail eight deviations above a
+quiet frame — except a cosmic ray only five deviations above the noisiest
+frame's noise, which the old rule "caught" only because it was throwing that
+frame away regardless.
+
+### The cost, and where it went
+
+The second pass reads every recorded figure for every sample of every frame:
+1.84 billion times here. Two things were done about it, and one thing was left:
+
+- **Tested squared, and multiplied through by quantities known to be positive**,
+  which is the same decision without three divisions and a square root.
+  4.02 s → 3.63 s.
+- **One record a sample rather than six arrays**, and the brightest set aside
+  once at the turn into the second pass rather than once per sample judged.
+  3.63 s → 3.14 s. Four pixels of 183 million changed by the rewrite, by
+  rounding.
+- **The job no longer copies the first pass** to keep a fallback: 0.6 s and
+  several gigabytes.
+
+What remains is that nearly every frame is resampled, in both passes now that
+they agree. Resampling costs about 2.4 s of the 10.7 here.
+
+### Not done
+
+- **Nearly every frame is resampled.** A fitted alignment carries a turn of
+  about 10⁻⁵ radians, which moves a pixel by a thousandth of one, and the code
+  resamples for any turn at all — its own comment says "almost no frame needs
+  this". Resampling only for a turn that moves a corner by more than half a
+  pixel takes the stack from 10.7 s to 7.7 s, and changes the image: frames go
+  down to whole-pixel placement, which is sharper but leaves up to 0.7 of a
+  pixel of misregistration. Rejection then finds 19.1 million samples rather
+  than 10.9, most of it real disagreement at the stars. A decision about the
+  picture, not about speed, and so left to the user.
+- **Frame weights still come from the raw frame's single noise figure**, which
+  overstates how much the colour channels' noise grows. Weighting decides what
+  a frame counts for, not whether a sample is ordinary, so this no longer
+  affects rejection.
+- **Noise is measured over the whole frame.** A frame whose sky gradient is
+  steep has more noise where it is brighter, and one figure covers both.
+
+### Acceptance criteria
+
+- [x] Pure noise loses what chance says, whatever the mix of frame noises.
+- [x] What is rejected does not change when frames are weighted differently.
+- [x] A satellite, and a satellite with a cosmic ray in the same pixel, are
+      both left out.
+- [x] A faint trail eight deviations above a quiet frame is left out.
+- [x] A resampled frame is judged by the noise it has once resampled.
+- [x] A turned frame is judged where it was placed.
+- [x] A channel's noise is measured through gradients and stars.
+- [x] The chances match published tables of the normal and t distributions.
+- [x] Too few frames hands the first pass back rather than copying it.
 
 ---
 

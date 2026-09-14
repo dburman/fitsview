@@ -25,6 +25,14 @@ matter of holding an arrow key. Step through with
 the arrow keys, Space, or Page Up and Down. The file list collapses to the edge
 when you want the image to fill the screen.
 
+**During a session.** Leave the folder open while the camera works and each new
+frame joins the list a few seconds after it is saved, is measured as it
+arrives, and is pointed out if it stands out from the rest — the sky brightening
+as cloud comes over, the stars swelling as focus slips. Sitting on the newest
+frame follows the session, moving on to each one as it lands. A frame caught
+halfway through being written says so and opens when it is finished, rather
+than being reported as damaged.
+
 **Culling.** Mark a frame to keep with `K`, delete one with `Delete`. Deleting
 always moves the file to the system trash, never destroys it, and a frame marked
 to keep always asks first. A folder on a volume that cannot be written to says
@@ -32,9 +40,12 @@ so in the status line and greys out the buttons that would fail. Rename with `F2
 images, so they survive restarting and travel with the folder if you copy it.
 The list can be ordered by sky background, sharpness, star width or roundness
 instead of by name, which brings the frames worth throwing out to one end.
-Background and sharpness are measured as the folder loads; width and roundness
-come from **Measure stars**, a separate pass because finding stars in every
-frame is a hundred times the work of sampling one.
+Background and sharpness are taken as each frame is viewed, or for the whole
+folder with **Measure**; width and roundness come from **Measure stars**, a
+separate pass because finding stars in every frame is a hundred times the work
+of sampling one. Every figure is remembered beside the frames, so a night is
+measured once: opening it again, or opening the target it belongs to, brings
+the figures straight back, and only a frame changed since is measured again.
 
 **Seeing the image.** A raw frame is almost black; `S` applies the standard
 midtone stretch that puts the sky background at a sensible brightness and brings
@@ -79,33 +90,16 @@ taken as the moon rose does not lift the result.
 Each frame counts for what it is worth rather than for one: a quiet, sharp frame
 counts for more than a noisy, soft one, which on a night whose sky brightens
 fivefold is worth about forty per cent of the noise in the result. Satellite
-trails and cosmic rays are left out, each sample being measured against what the
-other frames found ordinary. Both can be turned off.
+trails and cosmic rays are left out. Each sample is judged against the other
+frames with itself set aside, in terms of its own frame's noise, so a frame
+taken under a brighter sky loses no more of its ordinary samples than a quiet
+one does — on pure noise, the 0.3 per cent that chance says. Both can be turned
+off.
 
 The calibration and colour settings in force are applied on the way in, and the
-stacks are written beside the frames. Eight 61-megapixel frames take about three
-seconds, or half as long again with rejection, most of it spent reading them.
-
-**Judging a frame.** `Shift+S` finds the stars and measures them: how many, how
-wide (the full width at half maximum, in pixels and in arcseconds where the
-header gives the focal length and pixel size) and how round. That is what
-tells you whether a frame is in focus and whether the mount tracked, and it is
-the measurement to cull on. Each star is circled on the image, so a bad
-detection is obvious rather than hidden inside a number. It takes about 16 ms on
-a 24-megapixel frame, runs in the background, and is off until asked for.
-
-**Stacking.** **Stack folder** combines a night into one image per filter,
-lining the frames up by their stars, so the signal adds while the noise adds
-only with its root. Frames taken on the other side of a meridian flip are turned
-to match rather than blurred into the rest. The calibration and colour settings
-in force are applied on the way in, and the stacks are written beside the frames.
-Frames from the other side of a meridian flip are turned to match, including
-the fraction of a degree the mount does not come back by, which would otherwise
-leave the middle of the frame lining up and the edges smeared. Satellite trails
-and cosmic rays are left out: each sample is measured against what the other
-frames found ordinary, and the ones that disagree are dropped.
-Eight 61-megapixel frames take about three seconds without that, half as long
-again with it, most of it spent reading them.
+stacks are written beside the frames. Ten 61-megapixel frames take about four
+seconds, or eleven with outliers rejected, which reads every frame a second time
+and judges every sample of it against the others.
 
 **Knowing what you are looking at.** The metadata panel shows the FITS header,
 with the keywords that identify a frame pinned to the top and a filter for
@@ -114,7 +108,8 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 610 automated tests that run on all three operating systems.
+by 759 automated tests, run on macOS and on Linux before every release; the
+Windows build is compiled on every check and tested by hand.
 
 ---
 
@@ -384,7 +379,15 @@ not cost a round trip. See "Continuous integration" in
 
 That covers formatting, lints, the tests, the unsafe guard, and, when the
 toolchain and target for them are installed, a build at the minimum supported
-Rust version and a compile for Windows.
+Rust version and a compile for Windows. With Docker running it also runs the
+whole suite again on Linux, in a container, which on its own is:
+
+```bash
+./scripts/test-linux.sh
+```
+
+The first run downloads a Rust image and builds from nothing, about three
+minutes; later ones take about thirty seconds.
 
 **Use the script rather than assembling the commands by hand.** Summarising
 `cargo test` by adding up the "N passed" numbers looks like it works and
@@ -403,7 +406,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in seventeen phases, each with its own acceptance criteria
+`fitsview` was built in twenty phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in

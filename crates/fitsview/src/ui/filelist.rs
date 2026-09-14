@@ -63,7 +63,8 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
 
                 let measured = folder.measured();
                 let all = folder.len();
-                let with_stars = folder.measured_stars();
+                let with_stars =
+                    folder.measured_stars(crate::measurements::settings_of(&model.star_params));
                 if measured < all
                     && ui
                         .add_enabled(model.job.is_none(), egui::Button::new("Measure"))
@@ -259,6 +260,7 @@ mod tests {
             path: PathBuf::from("/x/a.fits"),
             name: "a.fits".into(),
             size: 1024,
+            stamp: None,
             flagged: false,
             quality,
             stars: None,

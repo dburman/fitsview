@@ -53,7 +53,9 @@ pub fn show(
                     draw_stars(ui, model, loaded.image.height);
                 }
                 _ => {
-                    let message = if model.loading {
+                    let message = if model.arriving.is_some() {
+                        "Still being written…"
+                    } else if model.loading {
                         "Loading…"
                     } else {
                         "Drop a FITS file or folder here, or use Open File…"

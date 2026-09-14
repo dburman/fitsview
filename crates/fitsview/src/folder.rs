@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use fits_core::{is_fits_path, Quality};
 
+use crate::measurements::{self, Stamp};
 use crate::natsort;
 use crate::sidecar;
 
@@ -19,6 +20,9 @@ pub struct FileEntry {
     pub name: String,
     /// Size in bytes, shown in the list.
     pub size: u64,
+    /// Size and age on disk when listed, which says whether measurements
+    /// remembered from an earlier visit still describe it.
+    pub stamp: Option<Stamp>,
     /// Marked to keep. Phase 4 gives this meaning; the column exists now so the
     /// list layout does not change later.
     pub flagged: bool,
@@ -114,6 +118,10 @@ pub struct StarMeasure {
     pub roundness: Option<f64>,
     /// How many stars were found.
     pub count: usize,
+    /// The detection settings they were found with, from
+    /// [`measurements::settings_of`], so that figures found at another
+    /// threshold are known not to be these.
+    pub settings: u64,
 }
 
 /// The range of a measure that counts as ordinary for a folder.
@@ -167,10 +175,7 @@ pub const MAX_DEPTH: usize = 2;
 /// Returns the underlying error if the folder itself cannot be listed. A
 /// subfolder that cannot be listed is passed over.
 pub fn scan_folder(dir: &Path) -> std::io::Result<Folder> {
-    let mut files = Vec::new();
-    collect(dir, dir, 0, &mut files)?;
-
-    files.sort_by(|a, b| natsort::natural_cmp(&a.name, &b.name));
+    let mut files = list_files(dir)?;
 
     // Keep flags live beside the images, so they survive a restart and travel
     // with the folder if it is copied elsewhere.
@@ -180,11 +185,50 @@ pub fn scan_folder(dir: &Path) -> std::io::Result<Folder> {
     }
 
     let selected = if files.is_empty() { None } else { Some(0) };
-    Ok(Folder {
+    let mut folder = Folder {
         dir: dir.to_path_buf(),
         files,
         selected,
-    })
+    };
+    // What was measured last time, so a night measured once is not read again
+    // every time it is opened.
+    measurements::recall(&mut folder);
+    Ok(folder)
+}
+
+/// Lists the FITS files in a folder and its subfolders, in natural name order,
+/// without reading anything beside them.
+///
+/// What [`scan_folder`] starts from, and what watching a folder compares
+/// against what it already has.
+///
+/// # Errors
+///
+/// As [`scan_folder`].
+pub fn list_files(dir: &Path) -> std::io::Result<Vec<FileEntry>> {
+    let mut files = Vec::new();
+    collect(dir, dir, 0, &mut files)?;
+    files.sort_by(|a, b| natsort::natural_cmp(&a.name, &b.name));
+    Ok(files)
+}
+
+/// What merging a fresh listing into a folder found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// Files that were not there before.
+    pub added: Vec<PathBuf>,
+    /// Files still there whose size or modification time is different.
+    pub changed: Vec<PathBuf>,
+    /// Files that have gone.
+    pub removed: Vec<PathBuf>,
+}
+
+impl Changes {
+    /// Whether nothing at all changed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
 }
 
 /// Adds the FITS files in `dir` to `out`, descending while there is depth left.
@@ -222,11 +266,12 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) -> s
             continue;
         }
 
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let metadata = entry.metadata().ok();
         out.push(FileEntry {
             name: relative_name(root, &path),
             path,
-            size,
+            size: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+            stamp: metadata.as_ref().and_then(Stamp::of),
             flagged: false,
             quality: None,
             stars: None,
@@ -343,10 +388,17 @@ impl Folder {
         }
     }
 
-    /// How many files have had their stars found.
+    /// How many files have had their stars found with the settings `settings`,
+    /// from [`measurements::settings_of`].
+    ///
+    /// Figures found under other settings are still shown, since they are
+    /// better than nothing, but they are not counted as done.
     #[must_use]
-    pub fn measured_stars(&self) -> usize {
-        self.files.iter().filter(|e| e.stars.is_some()).count()
+    pub fn measured_stars(&self, settings: u64) -> usize {
+        self.files
+            .iter()
+            .filter(|e| e.stars.is_some_and(|s| s.settings == settings))
+            .count()
     }
 
     /// How many files have been measured.
@@ -523,11 +575,60 @@ impl Folder {
     /// # Errors
     ///
     /// Returns the underlying error if the folder cannot be listed.
-    pub fn rescan(&mut self) -> std::io::Result<()> {
+    pub fn rescan(&mut self) -> std::io::Result<Changes> {
+        let listing = list_files(&self.dir)?;
+        Ok(self.merge(listing))
+    }
+
+    /// Brings the list in line with a fresh listing of the folder.
+    ///
+    /// A file whose size and modification time are unchanged keeps everything
+    /// known about it — its flag, its measurements — since it is the same file.
+    /// One that has changed keeps its flag, which is the user's, and loses its
+    /// measurements, which described what it used to be. A new file takes its
+    /// flag from the folder's keep list and its measurements from those
+    /// remembered beside it, as on opening.
+    ///
+    /// The list comes back in name order, and the caller re-applies any other.
+    /// The selection stays on the same file where it can, and at the same
+    /// position where the file has gone, which is what a user expects after
+    /// deleting one.
+    pub fn merge(&mut self, listing: Vec<FileEntry>) -> Changes {
         let previous = self.selected_path().map(Path::to_path_buf);
         let index = self.selected.unwrap_or(0);
-        let fresh = scan_folder(&self.dir)?;
-        self.files = fresh.files;
+
+        let mut known: std::collections::HashMap<PathBuf, FileEntry> =
+            self.files.drain(..).map(|e| (e.path.clone(), e)).collect();
+        let mut changes = Changes::default();
+        let mut flags: Option<sidecar::Sidecar> = None;
+
+        for fresh in listing {
+            let entry = match known.remove(&fresh.path) {
+                Some(old) if old.stamp == fresh.stamp => old,
+                Some(old) => {
+                    changes.changed.push(fresh.path.clone());
+                    FileEntry {
+                        flagged: old.flagged,
+                        ..fresh
+                    }
+                }
+                None => {
+                    changes.added.push(fresh.path.clone());
+                    let flags = flags.get_or_insert_with(|| sidecar::load(&self.dir));
+                    FileEntry {
+                        flagged: flags.is_flagged(&fresh.name),
+                        ..fresh
+                    }
+                }
+            };
+            self.files.push(entry);
+        }
+        changes.removed = known.into_keys().collect();
+        changes.removed.sort();
+
+        if !(changes.added.is_empty() && changes.changed.is_empty()) {
+            measurements::recall(self);
+        }
 
         self.selected = if self.files.is_empty() {
             None
@@ -539,7 +640,7 @@ impl Folder {
         } else {
             Some(0)
         };
-        Ok(())
+        changes
     }
 }
 
@@ -738,6 +839,87 @@ mod tests {
     }
 
     #[test]
+    fn merging_keeps_what_is_known_about_files_that_have_not_changed() {
+        let dir = folder_with(&["a.fits", "b.fits", "c.fits"]);
+        let mut f = scan_folder(dir.path()).unwrap();
+        let q = Quality {
+            background: 5.0,
+            noise: 1.0,
+            sharpness: 2.0,
+        };
+        for entry in &mut f.files {
+            entry.quality = Some(q);
+            entry.flagged = true;
+        }
+        f.selected = Some(1);
+
+        // b is rewritten, c removed, d added and already flagged on disk.
+        let spec = SyntheticSpec::new(3, 3, 16);
+        write_synthetic(dir.path(), "b.fits", &spec, &[9.0; 9]).unwrap();
+        std::fs::remove_file(dir.path().join("c.fits")).unwrap();
+        write_synthetic(dir.path(), "d.fits", &spec, &[1.0; 9]).unwrap();
+        let mut keep = sidecar::load(dir.path());
+        keep.set_flagged(vec!["d.fits".into()]);
+        sidecar::save(dir.path(), &keep).unwrap();
+
+        let changes = f.merge(list_files(dir.path()).unwrap());
+        let path = |n: &str| dir.path().join(n);
+        assert_eq!(changes.added, [path("d.fits")]);
+        assert_eq!(changes.changed, [path("b.fits")]);
+        assert_eq!(changes.removed, [path("c.fits")]);
+
+        let by = |n: &str| f.files.iter().find(|e| e.name == n).unwrap();
+        assert_eq!(
+            by("a.fits").quality,
+            Some(q),
+            "unchanged, so still measured"
+        );
+        assert!(by("a.fits").flagged);
+        assert!(
+            by("b.fits").quality.is_none(),
+            "its figures were of the old file"
+        );
+        assert!(by("b.fits").flagged, "the flag is the user's, and stays");
+        assert!(
+            by("d.fits").flagged,
+            "a new file takes its flag from the folder"
+        );
+        assert_eq!(f.selected_entry().unwrap().name, "b.fits");
+    }
+
+    #[test]
+    fn merging_the_same_listing_changes_nothing() {
+        let dir = folder_with(&["a.fits", "b.fits"]);
+        let mut f = scan_folder(dir.path()).unwrap();
+        let before = f.clone();
+        assert!(f.merge(list_files(dir.path()).unwrap()).is_empty());
+        assert_eq!(f, before);
+    }
+
+    #[test]
+    fn a_frame_measured_before_brings_its_figures_when_it_reappears() {
+        // Moved out of the folder and back, or a drive unplugged and
+        // replugged: the remembered figures still describe it.
+        let dir = folder_with(&["a.fits"]);
+        let mut f = scan_folder(dir.path()).unwrap();
+        let q = Quality {
+            background: 5.0,
+            noise: 1.0,
+            sharpness: 2.0,
+        };
+        f.files[0].quality = Some(q);
+        measurements::remember(&f);
+
+        let mut empty = Folder {
+            dir: dir.path().to_path_buf(),
+            ..Folder::default()
+        };
+        let changes = empty.merge(list_files(dir.path()).unwrap());
+        assert_eq!(changes.added.len(), 1);
+        assert_eq!(empty.files[0].quality, Some(q));
+    }
+
+    #[test]
     fn a_missing_folder_is_an_error_not_a_panic() {
         assert!(scan_folder(Path::new("/definitely/not/here")).is_err());
     }
@@ -759,6 +941,7 @@ mod tests {
                     path: PathBuf::from(format!("/tmp/x/f{i}.fits")),
                     name: format!("f{i}.fits"),
                     size: 100,
+                    stamp: None,
                     flagged: false,
                     quality: None,
                     stars: None,

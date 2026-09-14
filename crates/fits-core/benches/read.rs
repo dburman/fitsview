@@ -209,6 +209,37 @@ fn bench_stack(c: &mut Criterion) {
             criterion::BatchSize::LargeInput,
         );
     });
+    // Rejection keeps running sums beside the totals in the first pass, and
+    // judges every sample against them in the second.
+    group.bench_function("add a 24 MP frame, recording for rejection", |b| {
+        b.iter_batched_ref(
+            || Stack::rejecting(w, h, 1),
+            |stack| stack.add(black_box(&image), alignment),
+            criterion::BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("judge a 24 MP frame against the others", |b| {
+        let others: Vec<_> = (0..5u64)
+            .map(|seed| {
+                let pixels =
+                    fits_core::testutil::gaussian_background(w, h, 1000.0, 20.0, 20 + seed);
+                read_fits_from_bytes(&synthetic_fits(&spec, &pixels).expect("build"))
+                    .expect("decode")
+            })
+            .collect();
+        let mut first = Stack::rejecting(w, h, 1);
+        for frame in &others {
+            first.add(frame, alignment);
+        }
+        let second = first
+            .into_rejecting(fits_core::stack::DEFAULT_CLIP)
+            .expect("five frames");
+        b.iter_batched_ref(
+            || second.clone(),
+            |second| second.add(black_box(&others[0]), alignment),
+            criterion::BatchSize::LargeInput,
+        );
+    });
     group.bench_function("average 24 MP out", |b| {
         let mut stack = Stack::new(w, h, 1);
         stack.add(&image, alignment);

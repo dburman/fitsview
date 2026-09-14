@@ -19,7 +19,35 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
-use fits_core::{quality, read_fits, FitsImage, Quality};
+use fits_core::{quality, read_fits, FitsError, FitsImage, Quality};
+
+/// How recently a file cut short must have been written to for it to count as
+/// still arriving rather than damaged.
+///
+/// Capture software writes a frame in well under a second once the exposure
+/// ends, but a camera controller saving over a network share can take tens of
+/// seconds. A minute covers that, and a file still cut short after a minute
+/// untouched is not going to be finished.
+pub const STILL_ARRIVING: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a file that failed to read is most likely still being written.
+///
+/// It must have ended early — anything else wrong with it will not be fixed by
+/// waiting — and have been written to within [`STILL_ARRIVING`]. A time in
+/// the future, which a network share with its clock out can report, counts as
+/// recent.
+#[must_use]
+pub fn still_being_written(path: &Path, error: &FitsError) -> bool {
+    if !error.is_truncated() {
+        return false;
+    }
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .map_or(true, |age| age < STILL_ARRIVING)
+}
 
 /// Default number of decoded images held in memory.
 pub const DEFAULT_MAX_ENTRIES: usize = 8;
@@ -163,6 +191,7 @@ struct Response {
     result: Result<Arc<FitsImage>, String>,
     millis: f64,
     quality: Option<Quality>,
+    arriving: bool,
 }
 
 /// The worker's queue, replaced wholesale whenever the UI's wishes change.
@@ -194,6 +223,9 @@ pub struct Arrival {
     /// doing it here keeps a step through a folder free of the statistics work
     /// that would otherwise drop frames.
     pub quality: Option<Quality>,
+    /// The read failed because the file is still being written, so it is worth
+    /// asking for again shortly rather than reporting as damaged.
+    pub arriving: bool,
 }
 
 /// Loads images on a worker thread and caches the results.
@@ -334,6 +366,7 @@ impl Loader {
                 result: response.result,
                 millis: response.millis,
                 quality: response.quality,
+                arriving: response.arriving,
             });
         }
         out
@@ -406,6 +439,10 @@ fn worker_loop(queue: &Arc<(Mutex<Queue>, Condvar)>, tx: &mpsc::Sender<Response>
 
         // Measured here, on the worker, while the samples are to hand.
         let quality = decoded.as_ref().ok().map(quality::measure);
+        let arriving = decoded
+            .as_ref()
+            .err()
+            .is_some_and(|e| still_being_written(&request.path, e));
         let result = decoded.map(Arc::new).map_err(|e| e.to_string());
 
         if let Ok(mut guard) = lock.lock() {
@@ -419,6 +456,7 @@ fn worker_loop(queue: &Arc<(Mutex<Queue>, Condvar)>, tx: &mpsc::Sender<Response>
                 result,
                 millis,
                 quality,
+                arriving,
             })
             .is_err()
         {
@@ -737,5 +775,46 @@ mod tests {
         // this test would hang rather than fail, which is still a signal.
         let loader = Loader::default();
         drop(loader);
+    }
+
+    #[test]
+    fn a_file_cut_short_just_now_is_still_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.fits");
+        let spec = SyntheticSpec::new(20, 20, 16);
+        let full = synthetic_fits(&spec, &[1.0; 400]).unwrap();
+        std::fs::write(&path, &full[..full.len() / 2]).unwrap();
+
+        let err = read_fits(&path).unwrap_err();
+        assert!(still_being_written(&path, &err), "{err:?}");
+
+        // A minute later with nothing more written, it is not going to be.
+        let old = std::time::SystemTime::now() - STILL_ARRIVING - Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!still_being_written(&path, &err));
+    }
+
+    #[test]
+    fn a_new_file_that_is_not_fits_is_not_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.fits");
+        std::fs::write(&path, b"this is a text file").unwrap();
+        let err = read_fits(&path).unwrap_err();
+        assert!(!still_being_written(&path, &err));
+    }
+
+    #[test]
+    fn an_empty_new_file_is_still_being_written() {
+        // What capture software leaves for an instant after creating the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.fits");
+        std::fs::write(&path, b"").unwrap();
+        let err = read_fits(&path).unwrap_err();
+        assert!(still_being_written(&path, &err));
     }
 }

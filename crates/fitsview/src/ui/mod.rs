@@ -411,6 +411,9 @@ impl eframe::App for FitsViewApp {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(16));
         }
+        if let Some(wait) = self.model.next_wake() {
+            ui.ctx().request_repaint_after(wait);
+        }
     }
 }
 

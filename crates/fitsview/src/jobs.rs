@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc};
 use fits_core::calib::{self, MasterFlat, MasterFrame};
 use fits_core::stack::{align, Alignment, PierSide, Stack};
 use fits_core::stars::{self, DetectionParams, StarField};
-use fits_core::{quality, read_fits, write_fits, FitsImage, Quality};
+use fits_core::{quality, read_fits, read_fits_header, write_fits, FitsHeader, FitsImage, Quality};
 
 use crate::folder::StarMeasure;
 
@@ -362,6 +362,7 @@ fn measure_stars(image: &fits_core::FitsImage, params: &DetectionParams) -> Star
         fwhm_arcsec: field.fwhm.zip(scale).map(|(fwhm, scale)| fwhm * scale),
         roundness: field.roundness,
         count: field.count(),
+        settings: crate::measurements::settings_of(params),
     }
 }
 
@@ -413,7 +414,9 @@ fn stack_worker(
     let (dark, flat) = (dark.as_deref(), flat.as_deref());
     let (pattern, reject, weighted) = (*pattern, *reject, *weighted);
     // Which filter each frame belongs to, read from the header alone so that
-    // grouping costs one small read rather than a decode.
+    // grouping costs a few kilobytes a frame rather than a decode. A frame
+    // whose pixels turn out to be unreadable is passed over when it is
+    // stacked, as one that will not line up is.
     let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
     for path in paths {
         // A stack this job wrote earlier is not a frame. Without this, running
@@ -421,8 +424,8 @@ fn stack_worker(
         if file_name_of(path).starts_with(STACK_PREFIX) {
             continue;
         }
-        let filter = match read_fits(path) {
-            Ok(image) => filter_of(&image),
+        let filter = match read_fits_header(path) {
+            Ok(header) => filter_of(&header),
             Err(_) => continue,
         };
         match groups.iter_mut().find(|(name, _)| *name == filter) {
@@ -534,56 +537,59 @@ fn stack_worker(
             continue;
         }
 
-        // The second pass, when it is wanted and there are enough frames for a
-        // spread to mean anything.
-        let mut second = if reject {
-            stack.clone().into_rejecting(fits_core::stack::DEFAULT_CLIP)
-        } else {
-            None
-        };
-        if let Some(second) = second.as_mut() {
-            for (path, alignment) in &placed {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(Update::Cancelled);
-                    return;
-                }
-                let _ = tx.send(Update::Progress {
-                    done,
-                    total: steps,
-                    item: file_name_of(path),
-                });
-                done += 1;
-
-                let Ok(light) = read_fits(path) else { continue };
-                let Ok(prepared) = calib::calibrate_and_debayer(&light, dark, flat, pattern) else {
-                    continue;
-                };
-                second.add(&prepared, *alignment);
-            }
-            rejected += second.rejected();
-        }
-
+        let frames = stack.frames();
         let Some(directory) = group.first().and_then(|p| p.parent()) else {
             continue;
         };
         let out = directory.join(format!("{STACK_PREFIX}{}.fits", safe_name(filter)));
-        let history = vec![match &second {
-            Some(second) => format!(
-                "Stacked {} frames of filter {filter}, {} samples rejected",
-                second.frames(),
-                second.rejected()
-            ),
-            None => format!("Stacked {} frames of filter {filter}", stack.frames()),
-        }];
-        let result = match &second {
-            Some(second) => second.finish(header),
-            None => stack.finish(header),
+
+        // The second pass, when it is wanted and there are enough frames for
+        // it. The first pass is handed over rather than copied, which on full
+        // frames was several gigabytes held for nothing.
+        let first = if reject {
+            stack.into_rejecting(fits_core::stack::DEFAULT_CLIP)
+        } else {
+            Err(Box::new(stack))
         };
-        if let Err(e) = write_fits(&out, &result, &history) {
+        let (result, history) = match first {
+            Ok(mut second) => {
+                for (path, alignment) in &placed {
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = tx.send(Update::Cancelled);
+                        return;
+                    }
+                    let _ = tx.send(Update::Progress {
+                        done,
+                        total: steps,
+                        item: file_name_of(path),
+                    });
+                    done += 1;
+
+                    let Ok(light) = read_fits(path) else { continue };
+                    let Ok(prepared) = calib::calibrate_and_debayer(&light, dark, flat, pattern)
+                    else {
+                        continue;
+                    };
+                    second.add(&prepared, *alignment);
+                }
+                rejected += second.rejected();
+                let history = format!(
+                    "Stacked {} frames of filter {filter}, {} samples rejected",
+                    second.frames(),
+                    second.rejected()
+                );
+                (second.finish(header), history)
+            }
+            Err(stack) => {
+                let history = format!("Stacked {} frames of filter {filter}", stack.frames());
+                (stack.finish(header), history)
+            }
+        };
+        if let Err(e) = write_fits(&out, &result, &[history]) {
             let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(&out))));
             return;
         }
-        stacks.push((out, stack.frames()));
+        stacks.push((out, frames));
     }
 
     let _ = tx.send(Update::Progress {
@@ -599,9 +605,8 @@ fn stack_worker(
 }
 
 /// The filter a frame was taken through, or a stand-in when it does not say.
-fn filter_of(image: &FitsImage) -> String {
-    image
-        .header
+fn filter_of(header: &FitsHeader) -> String {
+    header
         .get("FILTER")
         .map(|v| v.trim().trim_matches('\'').trim().to_string())
         .filter(|v| !v.is_empty())
@@ -627,6 +632,13 @@ fn safe_name(filter: &str) -> String {
 /// A file that cannot be read is skipped rather than failing the run: one
 /// corrupt frame in two hundred should not deny the user the other 199
 /// measurements.
+///
+/// The next frame is read while this one is measured. Reading and decoding
+/// are a third of the time on an internal disk and most of it on a slow
+/// external one, and the disk would otherwise sit idle while the stars are
+/// found. One frame ahead, and no more: a 61-megapixel frame is a quarter of a
+/// gigabyte decoded, so the reader waits for each to be taken before starting
+/// the next.
 fn measure_worker(
     paths: &[PathBuf],
     stars: Option<&DetectionParams>,
@@ -635,32 +647,62 @@ fn measure_worker(
 ) {
     let mut measured = Vec::with_capacity(paths.len());
 
-    for (index, path) in paths.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            // Report what was measured before stopping; the work is not wasted.
-            let _ = tx.send(Update::Finished(Outcome::Measured(measured)));
-            return;
-        }
-        let _ = tx.send(Update::Progress {
-            done: index,
-            total: paths.len(),
-            item: file_name_of(path),
+    std::thread::scope(|scope| {
+        // No buffer: the reader holds the one frame it has read until it is
+        // taken, so there is never more than one waiting.
+        let (frames_tx, frames) = mpsc::sync_channel(0);
+        scope.spawn(move || {
+            for path in paths {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Fails once measuring has stopped taking frames.
+                if frames_tx.send((path, read_fits(path))).is_err() {
+                    break;
+                }
+            }
         });
 
-        match read_fits(path) {
-            Ok(image) => {
-                let found = stars.map(|params| measure_stars(&image, params));
-                measured.push((path.clone(), quality::measure(&image), found));
+        for (index, (path, decoded)) in frames.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                // Report what was measured before stopping; the work is not
+                // wasted.
+                break;
             }
-            Err(e) => log::warn!("could not measure {}: {e}", file_name_of(path)),
-        }
-    }
+            let _ = tx.send(Update::Progress {
+                done: index,
+                total: paths.len(),
+                item: file_name_of(path),
+            });
 
-    let _ = tx.send(Update::Progress {
-        done: paths.len(),
-        total: paths.len(),
-        item: String::new(),
+            match decoded {
+                Ok(image) => {
+                    // Both only read the frame, and the background is taken
+                    // on one thread while the star search leaves others idle
+                    // between its parallel stages.
+                    let (quality, found) = rayon::join(
+                        || quality::measure(&image),
+                        || stars.map(|params| measure_stars(&image, params)),
+                    );
+                    measured.push((path.clone(), quality, found));
+                }
+                Err(e) => log::warn!("could not measure {}: {e}", file_name_of(path)),
+            }
+        }
+        // Closing the channel is what releases a reader waiting to hand over
+        // a frame nobody will take. It would close at the end of this closure
+        // anyway, before the scope waits for the reader; this says so, so that
+        // moving the channel outside the scope is seen to be a deadlock.
+        drop(frames);
     });
+
+    if !cancel.load(Ordering::Relaxed) {
+        let _ = tx.send(Update::Progress {
+            done: paths.len(),
+            total: paths.len(),
+            item: String::new(),
+        });
+    }
     let _ = tx.send(Update::Finished(Outcome::Measured(measured)));
 }
 
@@ -1056,6 +1098,53 @@ mod tests {
             }
             other => panic!("expected partial measurements, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cancelling_while_the_next_frame_waits_to_be_taken_still_finishes() {
+        // The reader is a frame ahead, blocked handing it over. Stopping has
+        // to release it, or the job never reports and the window waits on it
+        // for ever.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(200, 200, -32);
+        let pixels = fits_core::testutil::gaussian_background(200, 200, 1000.0, 10.0, 3);
+        let paths: Vec<PathBuf> = (0..40)
+            .map(|i| write_synthetic(dir.path(), &format!("f{i}.fits"), &spec, &pixels).unwrap())
+            .collect();
+
+        let mut job = Job::measure(paths, Some(DetectionParams::default()));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut started = false;
+        while !started && Instant::now() < deadline {
+            assert!(job.poll().is_empty(), "finished before it could be stopped");
+            started = job.fraction() >= 2.0 / 40.0;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(started, "measuring never got going");
+        job.cancel();
+
+        let finished = run(&mut job).into_iter().find_map(|u| match u {
+            Update::Finished(Outcome::Measured(m)) => Some(m.len()),
+            _ => None,
+        });
+        let measured = finished.expect("a cancelled measurement still reports");
+        assert!((2..40).contains(&measured), "measured {measured}");
+    }
+
+    #[test]
+    fn measurements_come_back_in_the_order_asked_for() {
+        // Read on one thread and measured on another; the order must survive.
+        let (_dir, paths) = frames(12, 10.0);
+        let mut job = Job::measure(paths.clone(), None);
+        let measured = run(&mut job)
+            .into_iter()
+            .find_map(|u| match u {
+                Update::Finished(Outcome::Measured(m)) => Some(m),
+                _ => None,
+            })
+            .unwrap();
+        let order: Vec<PathBuf> = measured.into_iter().map(|(p, _, _)| p).collect();
+        assert_eq!(order, paths);
     }
 
     #[test]

@@ -487,6 +487,7 @@ mod tests {
                     path: PathBuf::from("/session").join(n),
                     name: (*n).to_string(),
                     size: 100,
+                    stamp: None,
                     flagged: false,
                     quality: None,
                     stars: None,

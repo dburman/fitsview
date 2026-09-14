@@ -422,8 +422,8 @@ easiest: macOS mounts it read-only. `mount | grep -i <name>` should show
       FOCALLEN and XPIXSZ are among the keywords pinned at the top of the pane.
 - [ ] The arcsecond figure is believable for the sky you shot under: single
       figures at worst, not tens.
-- [ ] A frame taken with the cover on reports a roundness near zero, since what
-      it finds are noise blobs rather than stars.
+- [ ] A frame taken with the cover on reports neither a width nor a roundness,
+      since what it finds are noise blobs rather than stars.
 - [ ] A frame from a camera whose header omits the focal length shows the width
       in pixels alone, with no arcseconds and no invented scale.
 
@@ -442,3 +442,54 @@ easiest: macOS mounts it read-only. `mount | grep -i <name>` should show
 - [ ] Plain **Measure** does not fill the star columns, and is still quick on a
       folder of full-frame captures.
 - [ ] Stopping the job partway keeps the frames it had already measured.
+
+## Measurements remembered
+
+- [ ] Measure a folder for stars, close the application, and open the folder
+      again: every column is filled at once, and neither **Measure** button is
+      shown.
+- [ ] Open one night, or one filter, of a target that was measured by opening
+      the target: its figures are there too.
+- [ ] Measure a few frames by viewing them, then press **Measure**: only the
+      frames not yet measured are read, and the count says so.
+- [ ] Change the star detection settings: **Measure stars** comes back, and
+      running it finds the stars again under the new settings.
+- [ ] Rename a measured frame, reopen the folder: it still has its figures.
+- [ ] Recalibrate or otherwise rewrite a frame in place, reopen the folder: that
+      frame is blank and the rest are not.
+- [ ] Each folder that holds frames gains a hidden `.fitsview-measurements.json`
+      after measuring, and nothing visible.
+- [ ] On a read-only volume measuring still works, nothing is written, and no
+      error is shown.
+
+## During a session
+
+Easiest with the capture software running; copying frames into an open folder
+one at a time does nearly as well.
+
+- [ ] A frame saved into the open folder joins the list within a few seconds,
+      without touching the mouse or keyboard.
+- [ ] With the folder measured, the new frame's columns fill on their own; with
+      star figures in the folder, its width and roundness fill too.
+- [ ] A frame with a much brighter sky than the rest is named in a message
+      saying what stands out. An ordinary frame arrives without one.
+- [ ] Sitting on the last frame, in name order, moves to each new frame as it
+      arrives. Stepping back to an earlier frame stops that.
+- [ ] A frame deleted or renamed in Finder or Explorer leaves the list.
+- [ ] Stacking writes its stacks into the list without jumping to them.
+- [ ] A frame opened while it is still being written says so in the status
+      line, not as an error, and opens once it is complete.
+- [ ] A file cut short long ago is still reported as damaged.
+- [ ] On a network share the list still keeps up, if more slowly.
+
+## Rejecting outliers
+
+- [ ] Stack a night whose sky brightens: the samples rejected, shown when the
+      stack finishes, are well under one per cent, not several.
+- [ ] A frame crossed by a satellite stacks without the trail.
+- [ ] A night that crosses the meridian stacks with rejection on without a
+      ghost of the trail or a soft patch where the frames were turned.
+- [ ] With rejection on, a stack of five frames still leaves out a satellite in
+      one of them; with four it says nothing was rejected.
+- [ ] Stacking a long night of full frames with rejection does not run the
+      machine out of memory.

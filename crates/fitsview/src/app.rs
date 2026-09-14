@@ -8,8 +8,10 @@
 //! The thin `eframe` wrapper that turns input into [`Action`]s and draws the
 //! result lives in [`crate::ui`].
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui::{Pos2, Rect, Vec2};
 use fits_core::calib::{self, MasterFlat, MasterFrame};
@@ -20,12 +22,34 @@ use fits_core::FitsImage;
 use fits_core::StarField;
 
 use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
-use crate::folder::{scan_folder, Folder, SortKey};
+use crate::folder::{scan_folder, Changes, FileEntry, Folder, SortKey};
 use crate::jobs::{self, Job};
 use crate::loader::{Cache, Loader};
+use crate::measurements;
 use crate::sidecar;
 use crate::stardetect::StarDetector;
 use crate::view::ViewState;
+use crate::watch::{self, Watcher};
+
+/// How often a file still being written is looked at again.
+///
+/// Often enough that a frame appears within a moment of being finished, and
+/// seldom enough that reading half a 60-megapixel file over and over does not
+/// compete with the capture software writing it.
+const RETRY_ARRIVING: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// How often the window wakes to take in what the folder watcher found.
+///
+/// Well inside the watcher's own interval, so a frame appears within moments
+/// of being noticed, and slow enough that an idle window costs nothing.
+const WATCH_WAKE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether a file is a stack this program wrote rather than a frame.
+fn is_stack(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(jobs::STACK_PREFIX))
+}
 
 /// An image that has been loaded and is being displayed.
 #[derive(Debug, Clone)]
@@ -491,6 +515,12 @@ pub struct Model {
     pub viewport: Rect,
     /// True while the selected file is still being decoded.
     pub loading: bool,
+    /// The selected file, when it could not be read because it is still being
+    /// written, and when to try it again.
+    ///
+    /// Not an error: during a session the newest frame is half there for a
+    /// moment, and the right thing is to wait for it.
+    pub arriving: Option<(PathBuf, Instant)>,
     /// A confirmation or rename waiting on the user.
     pub pending: Pending,
     /// When on, even unflagged files ask before being deleted.
@@ -536,7 +566,21 @@ pub struct Model {
     /// becomes three planes of floats, 288 MB, so a budget sized for mono holds
     /// fewer than two and re-debayers almost every step.
     calibrated: Cache,
-    /// Whether the automatic stretch is applied to every image shown.
+    /// Notices frames added to the open folder while it is open.
+    watcher: Option<Watcher>,
+    /// How often it looks. A field rather than a constant so that tests do not
+    /// wait seconds for it.
+    pub watch_interval: std::time::Duration,
+    /// Frames that arrived or changed while the folder was open and are still
+    /// to be measured.
+    fresh: HashSet<PathBuf>,
+    /// Those being measured now, so that what they show can be pointed out.
+    ///
+    /// Taken out of `fresh` when their measuring starts, so a frame that
+    /// cannot be measured — one still being written — is not tried over and
+    /// over. It comes back when the file changes again.
+    measuring_fresh: HashSet<PathBuf>,
+    /// Whether the stretch is applied to every image shown.
     pub stretch_enabled: bool,
     /// How the stretch is chosen.
     pub stretch_params: StretchParams,
@@ -594,6 +638,7 @@ impl Model {
             generation: 0,
             viewport: Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0)),
             loading: false,
+            arriving: None,
             pending: Pending::None,
             confirm_every_delete: false,
             show_help: false,
@@ -612,6 +657,10 @@ impl Model {
             bayer: Bayer::default(),
             job: None,
             calibrated: Cache::new(CALIBRATED_CACHE_ENTRIES, CALIBRATED_CACHE_BYTES),
+            watcher: None,
+            watch_interval: watch::INTERVAL,
+            fresh: HashSet::new(),
+            measuring_fresh: HashSet::new(),
             stretch_enabled: false,
             stretch_params: StretchParams::default(),
             toast: None,
@@ -1009,6 +1058,8 @@ impl Model {
                 if let Err(e) = actions::save_flags(folder) {
                     self.error = Some(format!("Could not save flags: {e}"));
                 }
+                // The measurements follow the file to its new name.
+                measurements::remember(folder);
                 self.toast = Some(Toast::new(format!("Renamed {from} to {to}")));
                 self.after_list_changed();
             }
@@ -1227,7 +1278,25 @@ impl Model {
         if folder.is_empty() {
             return;
         }
-        let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
+        // Only what is not already known: a frame measured on an earlier visit
+        // and unchanged since is not read again. Star figures found under other
+        // settings are not known, since they would not be these.
+        let settings = measurements::settings_of(&self.star_params);
+        let paths: Vec<PathBuf> = folder
+            .files
+            .iter()
+            .filter(|e| {
+                if with_stars {
+                    !e.stars.is_some_and(|s| s.settings == settings)
+                } else {
+                    e.quality.is_none()
+                }
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
         // The stars are found for the whole folder only when they are being
         // looked at, because finding them costs a hundred times what the sky
         // background does and most of the time nobody is asking.
@@ -1307,6 +1376,8 @@ impl Model {
                 }
                 jobs::Update::Finished(jobs::Outcome::Measured(measured)) => {
                     let count = measured.len();
+                    let arrived = std::mem::take(&mut self.measuring_fresh);
+                    let asked_for = arrived.is_empty();
                     if let Some(folder) = self.folder.as_mut() {
                         for (path, quality, stars) in measured {
                             folder.set_quality(&path, quality);
@@ -1317,8 +1388,19 @@ impl Model {
                         // Keep whatever ordering is in force, now that more
                         // files have a value to order by.
                         folder.sort_by(self.sort_key);
+                        // So that opening the folder again does not mean
+                        // measuring it again.
+                        if !self.read_only {
+                            measurements::remember(folder);
+                        }
                     }
-                    self.toast = Some(Toast::new(format!("Measured {count} frames")));
+                    if asked_for {
+                        self.toast = Some(Toast::new(format!("Measured {count} frames")));
+                    } else if let Some(note) = self.standing_out(&arrived) {
+                        // Measured without being asked, so said only when it
+                        // is worth interrupting for.
+                        self.toast = Some(Toast::new(note));
+                    }
                 }
                 jobs::Update::Finished(jobs::Outcome::Stacked {
                     stacks,
@@ -1363,6 +1445,8 @@ impl Model {
 
         if finished {
             self.job = None;
+            // Frames that arrived while something else was running.
+            self.measure_fresh();
         }
         true
     }
@@ -1551,6 +1635,12 @@ impl Model {
                     ));
                 }
                 self.loader.reset();
+                self.fresh.clear();
+                self.watcher = Some(Watcher::start(
+                    dir.clone(),
+                    &folder.files,
+                    self.watch_interval,
+                ));
                 self.folder = Some(folder);
                 self.show_selection();
                 self.restore_calibration();
@@ -1568,14 +1658,149 @@ impl Model {
         let Some(folder) = self.folder.as_mut() else {
             return;
         };
+        let before = folder.selected_path().map(Path::to_path_buf);
         match folder.rescan() {
-            Ok(()) => {
-                // Cached images may be stale, and files may have gone.
-                self.loader.reset();
-                self.show_selection();
-            }
+            Ok(changes) => self.after_changes(&changes, before),
             Err(e) => self.error = Some(format!("Rescan failed: {e}")),
         }
+    }
+
+    /// Takes in what the watcher found, if the folder has changed.
+    fn poll_watcher(&mut self) -> bool {
+        let Some(listing) = self.watcher.as_ref().and_then(Watcher::poll) else {
+            return false;
+        };
+        self.apply_listing(listing)
+    }
+
+    /// Brings the folder in line with a fresh listing of it.
+    ///
+    /// Someone sitting on the newest frame in capture order is following the
+    /// session, and moves on to each new frame as it lands, the way a terminal
+    /// follows a log. Anyone who has stepped back to look at something is left
+    /// where they are.
+    fn apply_listing(&mut self, listing: Vec<FileEntry>) -> bool {
+        let Some(folder) = self.folder.as_mut() else {
+            return false;
+        };
+        let following = self.sort_key == SortKey::Name
+            && folder.selected.is_some_and(|i| i + 1 == folder.len());
+        let before = folder.selected_path().map(Path::to_path_buf);
+
+        let changes = folder.merge(listing);
+        if changes.is_empty() {
+            return false;
+        }
+        if following {
+            if let Some(newest) = folder.files.iter().rposition(|e| !is_stack(&e.path)) {
+                if changes.added.contains(&folder.files[newest].path) {
+                    folder.selected = Some(newest);
+                    self.scroll_to_selection = true;
+                }
+            }
+        }
+        self.after_changes(&changes, before);
+        true
+    }
+
+    /// Brings everything else in line after the file list has changed.
+    ///
+    /// Only what changed is let go of: a decoded image of a file that is still
+    /// the same file is still right, and throwing every one away would make
+    /// each new frame of a session cost a stutter on the one being looked at.
+    fn after_changes(&mut self, changes: &Changes, before: Option<PathBuf>) {
+        for path in changes.changed.iter().chain(&changes.removed) {
+            self.loader.cache_mut().remove(path);
+            self.calibrated.remove(path);
+            self.fresh.remove(path);
+        }
+        // A stack this program wrote is not a frame of the session, and is
+        // not measured against the frames that made it.
+        self.fresh.extend(
+            changes
+                .added
+                .iter()
+                .chain(&changes.changed)
+                .filter(|p| !is_stack(p))
+                .cloned(),
+        );
+
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        folder.sort_by(self.sort_key);
+        let now = folder.selected_path().map(Path::to_path_buf);
+        let reload = now != before || now.as_ref().is_some_and(|p| changes.changed.contains(p));
+        if reload {
+            self.after_list_changed();
+        }
+        self.measure_fresh();
+    }
+
+    /// Measures the frames that arrived while the folder was open.
+    ///
+    /// As far as the rest of the folder has been measured: the stars too when
+    /// the others have star figures, since a new frame without them could not
+    /// be compared with anything. Taking the background costs a read, which is
+    /// nothing beside the exposure that produced the frame.
+    fn measure_fresh(&mut self) {
+        if self.job.is_some() || self.fresh.is_empty() {
+            return;
+        }
+        let Some(folder) = self.folder.as_ref() else {
+            return;
+        };
+        let settings = measurements::settings_of(&self.star_params);
+        let with_stars = folder.measured_stars(settings) > 0;
+        let paths: Vec<PathBuf> = folder
+            .files
+            .iter()
+            .filter(|e| self.fresh.contains(&e.path))
+            .filter(|e| {
+                e.quality.is_none()
+                    || (with_stars && !e.stars.is_some_and(|s| s.settings == settings))
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        self.fresh.clear();
+        if paths.is_empty() {
+            return;
+        }
+        self.measuring_fresh = paths.iter().cloned().collect();
+        self.job = Some(Job::measure(paths, with_stars.then_some(self.star_params)));
+    }
+
+    /// What is worth saying about frames just measured, if any stands out
+    /// from the rest of the folder.
+    fn standing_out(&self, paths: &HashSet<PathBuf>) -> Option<String> {
+        let folder = self.folder.as_ref()?;
+        let ranges: Vec<_> = SortKey::ALL
+            .into_iter()
+            .filter(|&k| k != SortKey::Name)
+            .map(|k| (k, folder.usual_range(k)))
+            .collect();
+
+        let mut noted: Vec<(String, Vec<&str>)> = folder
+            .files
+            .iter()
+            .filter(|e| paths.contains(&e.path))
+            .filter_map(|e| {
+                let unusual: Vec<&str> = ranges
+                    .iter()
+                    .filter(|(k, range)| folder.is_unusual(e, *k, *range))
+                    .map(|(k, _)| k.label())
+                    .collect();
+                (!unusual.is_empty()).then(|| (e.file_name().to_string(), unusual))
+            })
+            .collect();
+        noted.sort();
+
+        let (name, by) = noted.first()?;
+        let by = by.join(", ").to_lowercase();
+        Some(match noted.len() {
+            1 => format!("{name} stands out: {by}"),
+            n => format!("{n} new frames stand out, {name} by {by}"),
+        })
     }
 
     /// Applies a selection change and displays whatever it lands on.
@@ -1605,8 +1830,17 @@ impl Model {
         let Some(path) = path else {
             self.loaded = None;
             self.loading = false;
+            self.arriving = None;
             return;
         };
+        // Moving to another file stops the wait for this one; staying on it is
+        // how the wait asks again.
+        if self.arriving.as_ref().is_some_and(|(p, _)| *p != path) {
+            self.arriving = None;
+        }
+        if let Some((_, at)) = self.arriving.as_mut() {
+            *at = Instant::now() + RETRY_ARRIVING;
+        }
 
         // A cached image is shown at once, so stepping back and forth through
         // a folder never flickers.
@@ -1625,6 +1859,16 @@ impl Model {
     /// Returns true if anything changed, so the caller knows to repaint.
     pub fn poll(&mut self) -> bool {
         let mut job_changed = self.poll_job();
+        job_changed |= self.poll_watcher();
+        if self
+            .arriving
+            .as_ref()
+            .is_some_and(|(_, at)| Instant::now() >= *at)
+        {
+            // Asked for again as the selection, so that the neighbours it
+            // would have prefetched are still wanted too.
+            self.show_selection();
+        }
         if let Some(field) = self.detector.poll() {
             log::debug!("found {} stars", field.count());
             self.stars = Some(field);
@@ -1653,15 +1897,23 @@ impl Model {
             match arrival.result {
                 Ok(image) => {
                     if is_selected {
+                        self.arriving = None;
                         self.display(arrival.path, image, Some(arrival.millis));
                         self.loading = false;
                         changed = true;
                     }
                 }
+                Err(_) if is_selected && arrival.arriving => {
+                    log::debug!("{} is still being written", arrival.path.display());
+                    self.arriving = Some((arrival.path, Instant::now() + RETRY_ARRIVING));
+                    self.loading = false;
+                    changed = true;
+                }
                 Err(message) => {
                     // Only complain about the file the user is looking at. A
                     // prefetch that fails will be reported when they reach it.
                     if is_selected {
+                        self.arriving = None;
                         log::warn!("could not load {}: {message}", arrival.path.display());
                         self.error = Some(format!("{}: {message}", arrival.path.display()));
                         self.loading = false;
@@ -1844,6 +2096,15 @@ impl Model {
         if let Some(e) = &self.error {
             return format!("Error: {e}");
         }
+        // Ahead of the image on screen, which is the previous frame and not
+        // the one selected.
+        if let Some((path, _)) = &self.arriving {
+            let name = path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy();
+            return format!("{name} is still being written, and will open when it is complete");
+        }
         // Carried for as long as the folder is open, because it is a property
         // of the folder rather than a passing event.
         let read_only = if self.read_only {
@@ -1870,6 +2131,23 @@ impl Model {
     #[must_use]
     pub fn busy(&self) -> bool {
         self.loading || self.detector.is_busy()
+    }
+
+    /// How long until something may be due that nothing will announce:
+    /// another look at a file still being written, or a frame the watcher has
+    /// found.
+    ///
+    /// The interface asks to be woken then, rather than painting continuously
+    /// for as long as a folder is open. Without it a new frame would sit
+    /// unnoticed until the mouse moved.
+    #[must_use]
+    pub fn next_wake(&self) -> Option<std::time::Duration> {
+        let retry = self
+            .arriving
+            .as_ref()
+            .map(|(_, at)| at.saturating_duration_since(Instant::now()));
+        let watch = self.watcher.as_ref().map(|_| WATCH_WAKE);
+        retry.into_iter().chain(watch).min()
     }
 
     /// Cached images and the bytes they occupy.
@@ -2008,6 +2286,14 @@ mod tests {
         let dir = folder_of(1, 10, 10);
         let bad = dir.path().join("broken.fits");
         std::fs::write(&bad, b"SIMPLE but not really a fits file").unwrap();
+        // Written a while ago. A file this short written a moment ago could be
+        // the start of a frame the camera is still saving, and is waited for.
+        std::fs::File::options()
+            .write(true)
+            .open(&bad)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
 
         let mut m = Model::new();
         m.handle(Action::Open(bad));
@@ -4476,6 +4762,31 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_whose_pixels_are_cut_short_is_left_out_of_its_stack() {
+        // Grouping by filter reads only headers now, so a frame whose header
+        // is whole and whose pixels are not gets as far as being stacked. It
+        // must be passed over there, not take the stack down with it.
+        let dir = stackable_folder(
+            &[(0.0, 0.0), (5.0, -3.0), (-4.0, 6.0), (3.0, 2.0)],
+            &["L", "L", "L", "L"],
+        );
+        let cut = dir.path().join("f3.fits");
+        let bytes = std::fs::read(&cut).unwrap();
+        std::fs::write(&cut, &bytes[..bytes.len() - 2 * fits_core::BLOCK_SIZE]).unwrap();
+        assert!(fits_core::read_fits_header(&cut).is_ok());
+        assert!(fits_core::read_fits(&cut).is_err());
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        assert!(m.error.is_none(), "{:?}", m.error);
+        let said = &m.toast.as_ref().unwrap().text;
+        assert!(said.starts_with("Stacked 3 frames"), "{said}");
+        assert!(dir.path().join("stack_L.fits").exists());
+    }
+
+    #[test]
     fn a_stack_lines_the_frames_up_before_adding_them() {
         // Added where they lie, four shifted frames scatter each star into
         // four; lined up, the stack holds exactly what one frame holds.
@@ -4634,13 +4945,334 @@ mod tests {
         assert!(m.job.is_none(), "measuring never finished");
 
         let folder = m.folder.as_ref().unwrap();
-        assert_eq!(folder.measured_stars(), 3, "every frame needs figures");
+        assert_eq!(
+            folder.measured_stars(measurements::settings_of(&m.star_params)),
+            3,
+            "every frame needs figures"
+        );
         for entry in &folder.files {
             let stars = entry.stars.expect("stars for every frame");
             assert!(stars.count >= 4, "found {} stars", stars.count);
             assert!(stars.fwhm.is_some(), "and a width for them");
             assert!(stars.roundness.is_some());
         }
+    }
+
+    #[test]
+    fn a_folder_measured_once_is_not_measured_again_when_reopened() {
+        // Twenty seconds of star finding on a night's work should be paid once.
+        let dir = folder_of(3, 40, 40);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::MeasureFolderStars);
+        wait_for_job(&mut m);
+        let before: Vec<_> = m
+            .folder
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .map(|e| (e.quality, e.stars))
+            .collect();
+        assert!(before.iter().all(|(q, s)| q.is_some() && s.is_some()));
+
+        let (mut again, _spy) = model_over(dir.path());
+        let settings = measurements::settings_of(&again.star_params);
+        let folder = again.folder.as_ref().unwrap();
+        assert_eq!(folder.measured_stars(settings), 3, "the figures came back");
+        let after: Vec<_> = folder.files.iter().map(|e| (e.quality, e.stars)).collect();
+        assert_eq!(after, before, "and they are the same figures");
+
+        again.handle(Action::MeasureFolderStars);
+        again.handle(Action::MeasureFolder);
+        assert!(again.job.is_none(), "nothing is left to measure");
+    }
+
+    #[test]
+    fn new_detection_settings_mean_the_stars_are_found_again() {
+        let dir = folder_of(2, 40, 40);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::MeasureFolderStars);
+        wait_for_job(&mut m);
+
+        let stricter = DetectionParams {
+            threshold: m.star_params.threshold + 2.0,
+            ..m.star_params
+        };
+        m.handle(Action::SetStarParams(stricter));
+        let settings = measurements::settings_of(&m.star_params);
+        assert_eq!(
+            m.folder.as_ref().unwrap().measured_stars(settings),
+            0,
+            "figures found under the old settings are not these"
+        );
+
+        m.handle(Action::MeasureFolderStars);
+        assert!(m.job.is_some(), "so measuring runs again");
+        wait_for_job(&mut m);
+        assert_eq!(m.folder.as_ref().unwrap().measured_stars(settings), 2);
+    }
+
+    #[test]
+    fn a_read_only_folder_is_still_measured_but_nothing_is_written() {
+        let dir = folder_of(2, 40, 40);
+        let (mut m, _spy) = model_over_read_only(dir.path());
+        m.handle(Action::MeasureFolder);
+        wait_for_job(&mut m);
+        assert_eq!(m.folder.as_ref().unwrap().measured(), 2);
+        assert!(!measurements::path_for(dir.path()).exists());
+    }
+
+    /// Writes the first `fraction` of a FITS file, as capture software leaves
+    /// it partway through writing, and returns the whole of it.
+    fn partly_written(dir: &Path, name: &str, fraction: f64) -> Vec<u8> {
+        let spec = SyntheticSpec::new(40, 40, 16);
+        let pixels: Vec<f64> = (0..1600).map(|i| f64::from(i % 1000)).collect();
+        let full = fits_core::testutil::synthetic_fits(&spec, &pixels).unwrap();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cut = (full.len() as f64 * fraction) as usize;
+        std::fs::write(dir.join(name), &full[..cut]).unwrap();
+        full
+    }
+
+    /// Pumps the model until `done` holds, or fails after a few seconds.
+    fn pump_until(m: &mut Model, what: &str, done: impl Fn(&Model) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            m.poll();
+            if done(m) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("{what}: arriving={:?} error={:?}", m.arriving, m.error);
+    }
+
+    #[test]
+    fn a_frame_still_being_written_is_waited_for_rather_than_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = partly_written(dir.path(), "light_0001.fits", 0.6);
+
+        let mut m = Model::with_file_ops(Box::new(std::sync::Arc::new(SpyOps::default())));
+        m.handle(Action::Open(dir.path().to_path_buf()));
+        pump_until(&mut m, "never noticed it was arriving", |m| {
+            m.arriving.is_some()
+        });
+        assert!(m.error.is_none(), "not an error: {:?}", m.error);
+        assert!(
+            m.status_text().contains("still being written"),
+            "{}",
+            m.status_text()
+        );
+        assert!(m.next_wake().is_some(), "something has to wake the window");
+
+        // The capture software finishes the file.
+        std::fs::write(dir.path().join("light_0001.fits"), &full).unwrap();
+        pump_until(&mut m, "never opened once finished", |m| m.loaded.is_some());
+        assert!(m.arriving.is_none());
+        assert!(m.error.is_none());
+    }
+
+    #[test]
+    fn a_file_cut_short_long_ago_is_damaged_not_arriving() {
+        let dir = tempfile::tempdir().unwrap();
+        partly_written(dir.path(), "light_0001.fits", 0.6);
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("light_0001.fits"))
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let (m, _spy) = model_over(dir.path());
+        assert!(m.arriving.is_none());
+        let error = m.error.as_deref().unwrap_or_default();
+        assert!(error.contains("truncated"), "{error}");
+    }
+
+    #[test]
+    fn stepping_away_from_a_frame_being_written_stops_waiting_for_it() {
+        let dir = folder_of(1, 40, 40);
+        partly_written(dir.path(), "light_2.fits", 0.3);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::NextFile);
+        pump_until(&mut m, "never noticed it was arriving", |m| {
+            m.arriving.is_some()
+        });
+
+        m.handle(Action::PreviousFile);
+        assert!(m.arriving.is_none(), "the wait belongs to that frame");
+        settle(&mut m);
+        assert!(m.status_text().contains("light_1"), "{}", m.status_text());
+    }
+
+    /// A model over `dir` whose watcher looks every few milliseconds.
+    fn model_watching(dir: &Path) -> Model {
+        let mut m = Model::with_file_ops(Box::new(std::sync::Arc::new(SpyOps::default())));
+        m.watch_interval = Duration::from_millis(10);
+        m.handle(Action::Open(dir.to_path_buf()));
+        settle(&mut m);
+        m
+    }
+
+    /// A frame of sky at `background`, different in its noise for each `seed`.
+    fn sky(dir: &Path, name: &str, background: f64, seed: u64) {
+        let pixels = fits_core::testutil::gaussian_background(40, 40, background, 10.0, seed);
+        write_synthetic(dir, name, &SyntheticSpec::new(40, 40, -32), &pixels).unwrap();
+    }
+
+    fn names(m: &Model) -> Vec<String> {
+        m.folder
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_frame_written_during_a_session_joins_the_list_and_is_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 1..=3 {
+            sky(dir.path(), &format!("light_{i}.fits"), 1000.0, i);
+        }
+        let mut m = model_watching(dir.path());
+        m.handle(Action::MeasureFolder);
+        wait_for_job(&mut m);
+
+        sky(dir.path(), "light_4.fits", 1000.0, 4);
+        pump_until(&mut m, "the new frame never joined the list", |m| {
+            m.folder.as_ref().unwrap().len() == 4 && m.job.is_none()
+        });
+        let folder = m.folder.as_ref().unwrap();
+        let new = folder
+            .files
+            .iter()
+            .find(|e| e.name == "light_4.fits")
+            .unwrap();
+        assert!(new.quality.is_some(), "it should be measured on arrival");
+        assert_eq!(
+            folder.selected_entry().unwrap().name,
+            "light_1.fits",
+            "someone looking at the first frame is left there"
+        );
+    }
+
+    #[test]
+    fn sitting_on_the_newest_frame_follows_the_session() {
+        let dir = folder_of(3, 40, 40);
+        let mut m = model_watching(dir.path());
+        m.handle(Action::LastFile);
+        settle(&mut m);
+
+        sky(dir.path(), "light_4.fits", 1000.0, 4);
+        pump_until(&mut m, "never moved on to the new frame", |m| {
+            m.loaded
+                .as_ref()
+                .is_some_and(|l| l.path.ends_with("light_4.fits"))
+        });
+    }
+
+    #[test]
+    fn a_stack_written_into_the_folder_is_neither_followed_nor_measured() {
+        let dir = folder_of(3, 40, 40);
+        let mut m = model_watching(dir.path());
+        m.handle(Action::LastFile);
+        settle(&mut m);
+
+        sky(dir.path(), "stack_L.fits", 1000.0, 9);
+        pump_until(&mut m, "the stack never joined the list", |m| {
+            m.folder.as_ref().unwrap().len() == 4
+        });
+        let folder = m.folder.as_ref().unwrap();
+        assert_eq!(folder.selected_entry().unwrap().name, "light_3.fits");
+        assert!(m.job.is_none(), "nothing to measure");
+        let stack = folder
+            .files
+            .iter()
+            .find(|e| e.name == "stack_L.fits")
+            .unwrap();
+        assert!(stack.quality.is_none());
+    }
+
+    #[test]
+    fn a_new_frame_unlike_the_rest_is_pointed_out() {
+        // Cloud rolling in: the sky suddenly five times as bright.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 1..=6 {
+            sky(dir.path(), &format!("light_{i}.fits"), 1000.0, i);
+        }
+        let mut m = model_watching(dir.path());
+        m.handle(Action::MeasureFolder);
+        wait_for_job(&mut m);
+
+        sky(dir.path(), "light_7.fits", 5000.0, 7);
+        pump_until(&mut m, "never said anything", |m| {
+            m.toast
+                .as_ref()
+                .is_some_and(|t| t.text.contains("stands out"))
+        });
+        let text = &m.toast.as_ref().unwrap().text;
+        assert!(text.contains("light_7.fits"), "{text}");
+        assert!(text.contains("background"), "{text}");
+    }
+
+    #[test]
+    fn an_ordinary_new_frame_arrives_without_a_word() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 1..=6 {
+            sky(dir.path(), &format!("light_{i}.fits"), 1000.0, i);
+        }
+        let mut m = model_watching(dir.path());
+        m.handle(Action::MeasureFolder);
+        wait_for_job(&mut m);
+        m.toast = None;
+
+        sky(dir.path(), "light_7.fits", 1000.0, 7);
+        pump_until(&mut m, "never measured", |m| {
+            m.folder
+                .as_ref()
+                .unwrap()
+                .files
+                .iter()
+                .any(|e| e.name == "light_7.fits" && e.quality.is_some())
+        });
+        assert!(m.toast.is_none(), "{:?}", m.toast.as_ref().map(|t| &t.text));
+    }
+
+    #[test]
+    fn a_frame_rewritten_on_disk_is_shown_as_it_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        sky(dir.path(), "light_1.fits", 1000.0, 1);
+        let mut m = model_watching(dir.path());
+        let before = m.loaded.as_ref().unwrap().raw.data[0];
+
+        // Rewritten in place, a different size so the change is plain.
+        let pixels = vec![7.0; 50 * 50];
+        write_synthetic(
+            dir.path(),
+            "light_1.fits",
+            &SyntheticSpec::new(50, 50, -32),
+            &pixels,
+        )
+        .unwrap();
+        pump_until(&mut m, "still showing the old frame", |m| {
+            m.loaded.as_ref().is_some_and(|l| l.raw.width == 50)
+        });
+        assert_ne!(m.loaded.as_ref().unwrap().raw.data[0], before);
+    }
+
+    #[test]
+    fn a_frame_deleted_elsewhere_leaves_the_list() {
+        let dir = folder_of(3, 40, 40);
+        let mut m = model_watching(dir.path());
+        std::fs::remove_file(dir.path().join("light_2.fits")).unwrap();
+        pump_until(&mut m, "the frame stayed in the list", |m| {
+            m.folder.as_ref().unwrap().len() == 2
+        });
+        assert_eq!(names(&m), ["light_1.fits", "light_3.fits"]);
     }
 
     #[test]
@@ -4659,7 +5291,11 @@ mod tests {
 
         let folder = m.folder.as_ref().unwrap();
         assert_eq!(folder.measured(), 2, "the cheap measures are still taken");
-        assert_eq!(folder.measured_stars(), 0, "the expensive one is not");
+        assert_eq!(
+            folder.measured_stars(measurements::settings_of(&m.star_params)),
+            0,
+            "the expensive one is not"
+        );
     }
 
     #[test]

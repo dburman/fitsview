@@ -49,6 +49,12 @@ else
     printf '%-28s%s\n' "windows build" "skipped (rustup target add x86_64-pc-windows-msvc)"
 fi
 
+if docker info >/dev/null 2>&1; then
+    run "linux tests" ./scripts/test-linux.sh
+else
+    printf '%-28s%s\n' "linux tests" "skipped (start Docker)"
+fi
+
 if [ "$status" -eq 0 ]; then
     echo "all checks passed"
 else

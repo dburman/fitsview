@@ -11,11 +11,13 @@
 //! - [`shortcuts`] is the single list of key bindings, used by both the help
 //!   overlay and `--help`.
 //! - [`sidecar`] remembers keep flags beside the images.
+//! - [`measurements`] remembers what each frame measured, beside it.
 //! - [`jobs`] runs slow work, such as combining darks or exporting a folder,
 //!   on a background thread with progress and cancellation.
 //! - [`loader`] decodes images on a worker thread and caches the results.
 //! - [`natsort`] orders file names so `light_2` comes before `light_10`.
 //! - [`view`] is the zoom and pan arithmetic.
+//! - [`watch`] notices frames added to the open folder while it is open.
 //! - [`texture`] converts decoded samples into something the GPU can draw,
 //!   including the vertical flip FITS requires.
 //! - [`ui`] is the only part that touches `eframe`, and contains no rules of
@@ -35,6 +37,7 @@ pub mod folder;
 pub mod icon;
 pub mod jobs;
 pub mod loader;
+pub mod measurements;
 pub mod natsort;
 pub mod shortcuts;
 pub mod sidecar;
@@ -42,6 +45,7 @@ pub mod stardetect;
 pub mod texture;
 pub mod ui;
 pub mod view;
+pub mod watch;
 
 /// Human-readable version string, shown in the window title and by `--version`.
 #[must_use]

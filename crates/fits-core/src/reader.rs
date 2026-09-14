@@ -74,6 +74,16 @@ fn log_timing(path: &Path, image: &FitsImage, started: std::time::Instant) {
 ///
 /// As [`read_fits`], minus the I/O variants.
 pub fn read_fits_from_bytes(bytes: &[u8]) -> Result<FitsImage, FitsError> {
+    // Nothing yet, or the first letters of `SIMPLE` and no more, is a file that
+    // has only just been created: cut short rather than not FITS at all, so
+    // that it is treated as something that may yet arrive.
+    if bytes.len() < 6 && b"SIMPLE".starts_with(bytes) {
+        return Err(FitsError::Truncated {
+            what: "header",
+            expected: crate::BLOCK_SIZE,
+            found: bytes.len(),
+        });
+    }
     if !bytes.starts_with(b"SIMPLE") {
         return Err(FitsError::NotFits);
     }
@@ -105,6 +115,86 @@ pub fn read_fits_from_bytes(bytes: &[u8]) -> Result<FitsImage, FitsError> {
         min,
         max,
     })
+}
+
+/// Reads the header of the unit that carries the image, and not the pixels.
+///
+/// For deciding what a file is — which filter it was taken through, which
+/// side of the pier — before deciding what to do with it. The file is read a
+/// block at a time as far as the `END` card, so a 61-megapixel frame costs a
+/// few kilobytes rather than a hundred and twenty megabytes.
+///
+/// The header is the one [`read_fits`] would put on the image, including when
+/// the image is in the first extension behind an empty primary unit, and the
+/// geometry it declares is checked the same way.
+///
+/// # Errors
+///
+/// As [`read_fits`], except that pixel data cut short is not noticed, since
+/// none of it is read.
+pub fn read_fits_header(path: &Path) -> Result<FitsHeader, FitsError> {
+    let file = std::fs::File::open(path).map_err(|e| FitsError::io(path, e))?;
+    header_from_reader(file, path)
+}
+
+/// Reads a header from the start of `reader`; `path` is for error messages.
+fn header_from_reader(
+    mut reader: impl std::io::Read,
+    path: &Path,
+) -> Result<FitsHeader, FitsError> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(4 * crate::BLOCK_SIZE);
+    // Appends the next block, or what is left of the file. False at its end.
+    let mut more = |bytes: &mut Vec<u8>| -> Result<bool, FitsError> {
+        let start = bytes.len();
+        bytes.resize(start + crate::BLOCK_SIZE, 0);
+        let mut filled = 0;
+        while filled < crate::BLOCK_SIZE {
+            match reader.read(&mut bytes[start + filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(FitsError::io(path, e)),
+            }
+        }
+        bytes.truncate(start + filled);
+        Ok(filled > 0)
+    };
+
+    more(&mut bytes)?;
+    // The same judgement `read_fits_from_bytes` makes, on the same bytes.
+    if bytes.len() < 6 && b"SIMPLE".starts_with(&bytes) {
+        return Err(FitsError::Truncated {
+            what: "header",
+            expected: crate::BLOCK_SIZE,
+            found: bytes.len(),
+        });
+    }
+    if !bytes.starts_with(b"SIMPLE") {
+        return Err(FitsError::NotFits);
+    }
+
+    let mut offset = 0;
+    loop {
+        match header::parse_at(&bytes, offset) {
+            // An empty primary unit: the image is in the one after it, which
+            // starts at once since there is no data between them.
+            Ok((primary, parsed)) if offset == 0 && primary.get_i64("NAXIS") == Some(0) => {
+                offset = parsed.data_start;
+            }
+            Ok((header, _)) => {
+                Geometry::from_header(&header)?;
+                return Ok(header);
+            }
+            // Headers run to a few blocks, so parsing again from the start of
+            // the unit each time costs nothing worth avoiding.
+            Err(e) if e.is_truncated() => {
+                if !more(&mut bytes)? {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Finds the first header unit that actually carries an image.
@@ -270,11 +360,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_empty_input() {
-        assert!(matches!(
-            read_fits_from_bytes(&[]).unwrap_err(),
-            FitsError::NotFits
-        ));
+    fn an_empty_input_is_refused_as_cut_short() {
+        // An empty file is what capture software leaves for an instant before
+        // it writes the first block, so it is truncated rather than not FITS.
+        let err = read_fits_from_bytes(&[]).unwrap_err();
+        assert!(err.is_truncated(), "got {err:?}");
     }
 
     #[test]
@@ -321,6 +411,30 @@ mod tests {
         bytes.truncate(bytes.len() - BLOCK_SIZE);
         let err = read_fits_from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, FitsError::Truncated { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_file_cut_off_anywhere_reads_as_cut_short_never_as_damaged() {
+        // Every length a file passes through while capture software writes it.
+        // Each must read either as the finished image or as truncated, which is
+        // what lets the viewer wait for it rather than call it corrupt.
+        let spec = SyntheticSpec::new(30, 30, 16).with_card("FILTER", "'Ha'");
+        let pixels: Vec<f64> = (0..900).map(f64::from).collect();
+        let full = synthetic_fits(&spec, &pixels).unwrap();
+        for len in 0..=full.len() {
+            match read_fits_from_bytes(&full[..len]) {
+                Ok(img) => assert_eq!(img.len(), 900, "at {len} bytes"),
+                Err(e) => assert!(e.is_truncated(), "at {len} bytes: {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_fits_is_not_mistaken_for_one_cut_short() {
+        for bytes in [&b"GIF89a"[..], b"x", b"SIMPLY", b"\0\0\0\0"] {
+            let err = read_fits_from_bytes(bytes).unwrap_err();
+            assert!(matches!(err, FitsError::NotFits), "{bytes:?}: {err:?}");
+        }
     }
 
     #[test]
@@ -373,6 +487,142 @@ mod tests {
         let img = read_fits_from_bytes(&bytes).unwrap();
         assert_eq!((img.width, img.height), (2, 2));
         assert_eq!(img.data, as_f32(&pixels));
+    }
+
+    /// The layout some cameras write: an empty primary unit, and the image in
+    /// the first extension.
+    fn in_an_extension(spec: SyntheticSpec, pixels: &[f64]) -> Vec<u8> {
+        let mut bytes = crate::testutil::header_block(&[
+            ("SIMPLE", "                   T"),
+            ("BITPIX", "                   8"),
+            ("NAXIS", "                   0"),
+            ("EXTEND", "                   T"),
+        ]);
+        bytes.extend_from_slice(&synthetic_fits(&spec.as_extension(), pixels).unwrap());
+        bytes
+    }
+
+    /// A frame whose header runs to several blocks, as a busy capture program's
+    /// does.
+    fn with_a_long_header() -> (SyntheticSpec, Vec<f64>) {
+        let mut spec = SyntheticSpec::new(30, 20, 16).with_card("FILTER", "'Ha'");
+        for i in 0..90 {
+            spec = spec.with_card(&format!("NOTE{i}"), &format!("{i}"));
+        }
+        (spec, (0..600).map(f64::from).collect())
+    }
+
+    #[test]
+    fn the_header_alone_is_the_header_a_full_read_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        let (long, long_pixels) = with_a_long_header();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "mono",
+                synthetic_fits(&SyntheticSpec::new(4, 3, 16), &[1.0; 12]).unwrap(),
+            ),
+            (
+                "colour",
+                synthetic_fits(&SyntheticSpec::new(2, 2, -32).with_channels(3), &[1.0; 12])
+                    .unwrap(),
+            ),
+            ("long header", synthetic_fits(&long, &long_pixels).unwrap()),
+            (
+                "extension",
+                in_an_extension(
+                    SyntheticSpec::new(2, 2, 16).with_card("FILTER", "'L'"),
+                    &[1.0; 4],
+                ),
+            ),
+        ];
+        for (what, bytes) in cases {
+            let path = dir.path().join(format!("{what}.fits"));
+            std::fs::write(&path, &bytes).unwrap();
+            let full = read_fits(&path).unwrap();
+            assert_eq!(read_fits_header(&path).unwrap(), full.header, "{what}");
+        }
+    }
+
+    #[test]
+    fn reading_the_header_reads_no_pixels() {
+        /// Counts what is taken from the file.
+        struct Counting<'a> {
+            bytes: &'a [u8],
+            taken: usize,
+        }
+        impl std::io::Read for Counting<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let n = out.len().min(self.bytes.len() - self.taken);
+                out[..n].copy_from_slice(&self.bytes[self.taken..self.taken + n]);
+                self.taken += n;
+                Ok(n)
+            }
+        }
+
+        let (spec, _) = with_a_long_header();
+        let spec = SyntheticSpec {
+            width: 1000,
+            height: 1000,
+            ..spec
+        };
+        let bytes = synthetic_fits(&spec, &vec![5.0; 1_000_000]).unwrap();
+        let mut reader = Counting {
+            bytes: &bytes,
+            taken: 0,
+        };
+        let header = header_from_reader(&mut reader, Path::new("x.fits")).unwrap();
+        assert_eq!(header.get("FILTER"), Some("Ha"));
+        assert!(
+            reader.taken <= 3 * BLOCK_SIZE,
+            "read {} of {} bytes for a header of two blocks",
+            reader.taken,
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn a_header_cut_off_anywhere_reads_as_cut_short_and_is_whole_once_there() {
+        let (spec, pixels) = with_a_long_header();
+        for bytes in [
+            synthetic_fits(&spec, &pixels).unwrap(),
+            in_an_extension(spec, &pixels),
+        ] {
+            let whole = read_fits_from_bytes(&bytes).unwrap().header;
+            // Past the headers nothing more is read, so cutting there says
+            // nothing new. Every block boundary, where the reading steps, and
+            // every thirteenth byte between, which lands in every card.
+            let limit = bytes.len().min(5 * BLOCK_SIZE);
+            let near_a_boundary = |l: usize| matches!(l % BLOCK_SIZE, 0 | 1 | 2879);
+            for len in (0..=limit).filter(|&l| l % 13 == 0 || near_a_boundary(l)) {
+                match header_from_reader(&bytes[..len], Path::new("x.fits")) {
+                    Ok(header) => assert_eq!(header, whole, "at {len} bytes"),
+                    Err(e) => assert!(e.is_truncated(), "at {len} bytes: {e:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_header_of_a_frame_whose_pixels_are_cut_short_still_reads() {
+        // None of the pixels are read, so none of them are missed. Whether the
+        // frame can be used is found out when it is.
+        let (spec, pixels) = with_a_long_header();
+        let bytes = synthetic_fits(&spec, &pixels).unwrap();
+        let cut = &bytes[..bytes.len() - BLOCK_SIZE];
+        assert!(read_fits_from_bytes(cut).is_err());
+        assert!(header_from_reader(cut, Path::new("x.fits")).is_ok());
+    }
+
+    #[test]
+    fn a_header_read_refuses_what_a_full_read_refuses() {
+        for bytes in [&b"this is a text file"[..], b"GIF89a", b"SIMPLY"] {
+            let err = header_from_reader(bytes, Path::new("x.fits")).unwrap_err();
+            assert!(matches!(err, FitsError::NotFits), "{bytes:?}: {err:?}");
+        }
+        let err = header_from_reader(&b""[..], Path::new("x.fits")).unwrap_err();
+        assert!(err.is_truncated());
+        let err = read_fits_header(Path::new("/nonexistent/here.fits")).unwrap_err();
+        assert!(matches!(err, FitsError::Io { .. }), "{err:?}");
     }
 
     #[test]

@@ -53,6 +53,18 @@ pub enum FitsError {
 }
 
 impl FitsError {
+    /// Whether the file ended before it should have.
+    ///
+    /// Worth asking because a file cut short is very often a file still being
+    /// written: capture software writes each frame as its exposure ends, and a
+    /// folder open during a session will see the newest one half there. Only
+    /// the caller can tell that from real damage, by asking how recently the
+    /// file was written to.
+    #[must_use]
+    pub const fn is_truncated(&self) -> bool {
+        matches!(self, FitsError::Truncated { .. })
+    }
+
     /// Attaches a path to an [`std::io::Error`], because a bare "file not
     /// found" with no filename is useless in a viewer that opens many files.
     pub(crate) fn io(path: impl Into<std::path::PathBuf>, source: std::io::Error) -> Self {
