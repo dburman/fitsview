@@ -3435,11 +3435,67 @@ The first version cost 3.5 s on that stack. Most of it was not the kernel:
 ### Not done
 
 - **Colour is still reconstructed twice for every frame**, once in each pass of
-  a rejecting stack: 1.8 s of the 10.7. Placing the raw mosaic and
-  reconstructing colour on the way into the stack would take one of them away.
+  a rejecting stack: 1.6 s of the 10.7. Phase 22 halved it instead of
+  removing one of the runs; see there for why.
 - **Corners are soft in every version**: five pixels against under three in the
   middle. That is the optics — tilt or field curvature — and no placement can
   take it out.
+
+---
+
+## Phase 22 — Faster Colour Reconstruction
+
+A rejecting stack reconstructs the colour of every frame twice, once in each
+pass: 1.64 s of a 10.4 s stack of ten 61-megapixel frames. The plan was to
+remove one of the two. Timing the reconstruction first changed the plan: it was
+taking 84 ms a frame, about 9 GB/s of output on a machine that moves far more,
+so the cheaper thing was to make it fast — which helps both passes, and every
+colour frame looked at in the viewer as well.
+
+### What was slow
+
+- **A branch on every pixel.** Each pixel asked the pattern which colour it
+  was, and the answer alternates with every step along a row, so the processor
+  mispredicted it half the time.
+- **Eight neighbours read at every site**, though a green site uses four.
+- **Every pixel written twice.** The planes were filled with "undefined" and
+  then every pixel overwritten.
+- **A loop over every pixel to find the edges**, and then **a whole further
+  pass over all three planes** for the lowest and highest values.
+
+### What changed
+
+Each row is taken as its even pixels and then its odd ones, each a single kind
+of site, with a loop written out for each kind: no question asked per pixel.
+Means of neighbours that are all defined — nearly all of them — skip the check
+on each while summing in the same order and precision. The ends of each row are
+done in the same pass as its middle, the range is gathered as the values are
+written, and the planes start as zeros.
+
+The existing property test holds the fast path to the general one **bit for
+bit**. It was widened to larger and awkward sizes — odd widths, three-pixel
+strips, dense and sparse undefined pixels — and now also checks the range
+against a separate pass over the planes. Swapping two colours at one kind of
+site, confusing the two kinds of green site, leaving a colour out of the range,
+and skipping a neighbour in the fast mean each fail it.
+
+### What it measures
+
+| | Before | After |
+|---|---|---|
+| 24-megapixel mosaic, benchmark | 32.9 ms | **15.7 ms** |
+| Both passes, ten 61-megapixel frames | 1.64 s | **0.79 s** |
+| Whole stack, with rejection | 10.9–11.0 s | **10.0–10.3 s** |
+
+The stack is back to 0.1.8's time with Phase 21's sharper stars, and its output
+is unchanged to the bit.
+
+### Why not remove the second run
+
+It now costs 0.39 s, four per cent of the stack. Removing it means placing the
+raw mosaic rather than the colour frame, and so judging each sample's noise
+before colour reconstruction has quietened it — a change to how rejection
+works, for four per cent. Not worth it yet.
 
 ---
 

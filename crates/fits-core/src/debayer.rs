@@ -206,34 +206,54 @@ pub fn debayer(image: &FitsImage, pattern: BayerPattern) -> Result<FitsImage, De
 
     let (width, height) = (image.width, image.height);
     let plane = width * height;
-    let mut data = vec![f32::NAN; plane * 3];
+    // Every pixel is written below, so there is no need to fill it with
+    // anything first; zeros cost the least to ask for.
+    let mut data = vec![0.0f32; plane * 3];
 
     // Split into the three planes so each row can be written without sharing.
     let (red, rest) = data.split_at_mut(plane);
     let (green, blue) = rest.split_at_mut(plane);
 
-    // The interior, where every neighbour exists, takes the specialised path.
-    reconstruct_interior(image, pattern, red, green, blue);
-
-    // The border keeps the general path, which copes with missing neighbours.
-    red.par_chunks_mut(width)
+    // Each row in one go — its interior by the specialised path, its ends and
+    // the first and last rows by the general one, which copes with missing
+    // neighbours — gathering the lowest and highest values as they are
+    // written, rather than reading all three planes again afterwards.
+    let (lowest, highest) = red
+        .par_chunks_mut(width)
         .zip(green.par_chunks_mut(width))
         .zip(blue.par_chunks_mut(width))
         .enumerate()
-        .for_each(|(y, ((red_row, green_row), blue_row))| {
+        .map(|(y, ((red_row, green_row), blue_row))| {
+            let mut rows = Rows {
+                red: red_row,
+                green: green_row,
+                blue: blue_row,
+                lowest: f32::INFINITY,
+                highest: f32::NEG_INFINITY,
+            };
             let edge_row = y == 0 || y + 1 >= height;
-            for x in 0..width {
-                if !edge_row && x != 0 && x + 1 < width {
-                    continue;
+            if edge_row {
+                for x in 0..width {
+                    rows.put(x, reconstruct(image, pattern, x, y));
                 }
-                let [r, g, b] = reconstruct(image, pattern, x, y);
-                red_row[x] = r;
-                green_row[x] = g;
-                blue_row[x] = b;
+            } else {
+                rows.put(0, reconstruct(image, pattern, 0, y));
+                rows.put(width - 1, reconstruct(image, pattern, width - 1, y));
+                reconstruct_interior_row(image, pattern, y, &mut rows);
             }
-        });
+            (rows.lowest, rows.highest)
+        })
+        .reduce(
+            || (f32::INFINITY, f32::NEG_INFINITY),
+            |a, b| (a.0.min(b.0), a.1.max(b.1)),
+        );
 
-    let (min, max) = crate::image::finite_min_max(&data);
+    // As `finite_min_max` settles it: a range to divide by, always.
+    let (min, max) = if lowest.is_finite() && highest.is_finite() && highest > lowest {
+        (lowest, highest)
+    } else {
+        (0.0, 1.0)
+    };
     Ok(FitsImage {
         width,
         height,
@@ -377,82 +397,151 @@ fn debayer_generally(image: &FitsImage, pattern: BayerPattern) -> Vec<f32> {
     data
 }
 
-/// Reconstructs the interior of the image, where every neighbour exists.
+/// One row of the three planes being written, and the range written so far.
+struct Rows<'a> {
+    red: &'a mut [f32],
+    green: &'a mut [f32],
+    blue: &'a mut [f32],
+    lowest: f32,
+    highest: f32,
+}
+
+impl Rows<'_> {
+    /// Writes one pixel's three values. Undefined ones are left out of the
+    /// range, which `min` and `max` do on their own: they return the other
+    /// argument when one is not a number. A value is never infinite here,
+    /// being a sample or the mean of finite ones.
+    #[inline(always)]
+    fn put(&mut self, x: usize, [r, g, b]: [f32; 3]) {
+        self.red[x] = r;
+        self.green[x] = g;
+        self.blue[x] = b;
+        self.lowest = self.lowest.min(r).min(g).min(b);
+        self.highest = self.highest.max(r).max(g).max(b);
+    }
+}
+
+/// What a site reconstructs its missing colours from.
+///
+/// Fixed for every other pixel of a row, which is why it is worked out once a
+/// row rather than once a pixel: asked a pixel at a time, the answer alternates
+/// with every step and the processor mispredicts it half the time.
+#[derive(Debug, Clone, Copy)]
+enum Site {
+    /// Green on the four orthogonal neighbours, blue on the diagonals.
+    Red,
+    /// Green on the orthogonals, red on the diagonals.
+    Blue,
+    /// Red either side, blue above and below.
+    GreenBetweenReds,
+    /// Blue either side, red above and below.
+    GreenBetweenBlues,
+}
+
+impl Site {
+    fn of(pattern: BayerPattern, x: usize, y: usize) -> Self {
+        match pattern.colour_at(x, y) {
+            Colour::Red => Self::Red,
+            Colour::Blue => Self::Blue,
+            Colour::Green if pattern.colour_at(x + 1, y) == Colour::Red => Self::GreenBetweenReds,
+            Colour::Green => Self::GreenBetweenBlues,
+        }
+    }
+}
+
+/// The mean of four neighbours, as [`mean_of`] gives it.
+///
+/// When all four are defined, which is nearly always, the sum is the one
+/// `mean_of` forms, in the same order and precision, without asking of each
+/// whether it is defined.
+#[inline(always)]
+fn mean_of_four(a: f32, b: f32, c: f32, d: f32) -> f32 {
+    if a.is_finite() && b.is_finite() && c.is_finite() && d.is_finite() {
+        let mut sum = 0.0f64;
+        sum += f64::from(a);
+        sum += f64::from(b);
+        sum += f64::from(c);
+        sum += f64::from(d);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (sum / 4.0) as f32
+        }
+    } else {
+        mean_of([a, b, c, d], 4)
+    }
+}
+
+/// The mean of two neighbours, as [`mean_of`] gives it.
+#[inline(always)]
+fn mean_of_two(a: f32, b: f32) -> f32 {
+    if a.is_finite() && b.is_finite() {
+        let mut sum = 0.0f64;
+        sum += f64::from(a);
+        sum += f64::from(b);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (sum / 2.0) as f32
+        }
+    } else {
+        mean_of([a, b, 0.0, 0.0], 2)
+    }
+}
+
+/// Reconstructs the interior of row `y`, where every neighbour exists.
 ///
 /// The general path in [`reconstruct`] scans a 3x3 neighbourhood and asks the
 /// pattern which colour each neighbour carries. But the site type already
 /// determines that: at a red site the greens are the four orthogonal
-/// neighbours and the blues are the four diagonals, always. Writing the four
-/// cases out removes a lookup and a dynamically indexed accumulator from every
-/// one of a hundred million neighbour visits.
+/// neighbours and the blues are the four diagonals, always. The row is taken
+/// as its even pixels and then its odd ones, each a single kind of site, so
+/// each loop is written out for its kind with nothing asked per pixel.
 ///
-/// The edges keep the general path: they are a rounding error's worth of
-/// pixels, and the general version already handles missing neighbours.
-fn reconstruct_interior(
-    image: &FitsImage,
-    pattern: BayerPattern,
-    red: &mut [f32],
-    green: &mut [f32],
-    blue: &mut [f32],
-) {
-    let (width, height) = (image.width, image.height);
+/// The neighbours are summed in the order the general path visits them — up,
+/// left, right, down; up-left, up-right, down-left, down-right — so that the
+/// two agree bit for bit. A property test holds them to that.
+fn reconstruct_interior_row(image: &FitsImage, pattern: BayerPattern, y: usize, rows: &mut Rows) {
+    let width = image.width;
     let data = &image.data;
+    let (above, row, below) = (
+        &data[(y - 1) * width..y * width],
+        &data[y * width..(y + 1) * width],
+        &data[(y + 1) * width..(y + 2) * width],
+    );
 
-    red.par_chunks_mut(width)
-        .zip(green.par_chunks_mut(width))
-        .zip(blue.par_chunks_mut(width))
-        .enumerate()
-        .for_each(|(y, ((red_row, green_row), blue_row))| {
-            if y == 0 || y + 1 >= height {
-                return; // the general path handles the first and last rows
+    for first in [1, 2] {
+        let site = Site::of(pattern, first, y);
+        let columns = (first..width - 1).step_by(2);
+        match site {
+            Site::Red => {
+                for x in columns {
+                    let green = mean_of_four(above[x], row[x - 1], row[x + 1], below[x]);
+                    let blue = mean_of_four(above[x - 1], above[x + 1], below[x - 1], below[x + 1]);
+                    rows.put(x, [keep(row[x]), green, blue]);
+                }
             }
-            let row = y * width;
-            let above = row - width;
-            let below = row + width;
-
-            for x in 1..width - 1 {
-                let index = row + x;
-                let own = pattern.colour_at(x, y);
-
-                // Visited in the same order as the general path, so the two
-                // agree exactly: up-left, up, up-right, left, right,
-                // down-left, down, down-right.
-                let up = data[above + x];
-                let down = data[below + x];
-                let left = data[index - 1];
-                let right = data[index + 1];
-                let up_left = data[above + x - 1];
-                let up_right = data[above + x + 1];
-                let down_left = data[below + x - 1];
-                let down_right = data[below + x + 1];
-
-                let centre = data[index];
-                let orthogonal = mean_of([up, left, right, down], 4);
-                let diagonal = mean_of([up_left, up_right, down_left, down_right], 4);
-
-                let (r, g, b) = match own {
-                    // Green sits on the four orthogonal neighbours, and the
-                    // opposite primary on the four diagonals.
-                    Colour::Red => (keep(centre), orthogonal, diagonal),
-                    Colour::Blue => (diagonal, orthogonal, keep(centre)),
-                    // At a green site the two primaries lie on the horizontal
-                    // and vertical pairs; which is which depends on the row.
-                    Colour::Green => {
-                        let horizontal = mean_of([left, right, 0.0, 0.0], 2);
-                        let vertical = mean_of([up, down, 0.0, 0.0], 2);
-                        if pattern.colour_at(x + 1, y) == Colour::Red {
-                            (horizontal, keep(centre), vertical)
-                        } else {
-                            (vertical, keep(centre), horizontal)
-                        }
-                    }
-                };
-
-                red_row[x] = r;
-                green_row[x] = g;
-                blue_row[x] = b;
+            Site::Blue => {
+                for x in columns {
+                    let green = mean_of_four(above[x], row[x - 1], row[x + 1], below[x]);
+                    let red = mean_of_four(above[x - 1], above[x + 1], below[x - 1], below[x + 1]);
+                    rows.put(x, [red, green, keep(row[x])]);
+                }
             }
-        });
+            Site::GreenBetweenReds => {
+                for x in columns {
+                    let across = mean_of_two(row[x - 1], row[x + 1]);
+                    let down = mean_of_two(above[x], below[x]);
+                    rows.put(x, [across, keep(row[x]), down]);
+                }
+            }
+            Site::GreenBetweenBlues => {
+                for x in columns {
+                    let across = mean_of_two(row[x - 1], row[x + 1]);
+                    let down = mean_of_two(above[x], below[x]);
+                    rows.put(x, [down, keep(row[x]), across]);
+                }
+            }
+        }
+    }
 }
 
 /// A pixel's own measurement, or undefined if it did not make one.
@@ -815,12 +904,22 @@ mod tests {
         // same order, so any difference is a bug rather than rounding.
         let mut rng = crate::testutil::Prng::new(20);
         for pattern in BayerPattern::ALL {
-            for (w, h) in [(2, 2), (3, 5), (16, 16), (33, 17)] {
+            for (w, h, gaps) in [
+                (2, 2, 23),
+                (3, 5, 23),
+                (16, 16, 23),
+                (33, 17, 23),
+                (64, 48, 7),
+                (65, 3, 11),
+                (3, 65, 11),
+                (2, 9, 5),
+                (101, 77, 997),
+            ] {
                 let pixels: Vec<f64> = (0..w * h)
                     .map(|i| {
                         // A scattering of undefined pixels, since those take
                         // the branch most likely to differ between the two.
-                        if i % 23 == 0 {
+                        if i % gaps == 0 {
                             f64::NAN
                         } else {
                             rng.next_f64() * 60_000.0
@@ -829,7 +928,16 @@ mod tests {
                     .collect();
                 let img = mosaic(w, h, &pixels);
 
-                let fast = debayer(&img, pattern).unwrap().data;
+                let whole = debayer(&img, pattern).unwrap();
+                // The range is gathered as the planes are written; it has to
+                // be the range a separate pass over them finds.
+                assert_eq!(
+                    (whole.min, whole.max),
+                    crate::image::finite_min_max(&whole.data),
+                    "{} at {w}x{h}",
+                    pattern.name()
+                );
+                let fast = whole.data;
                 let slow = debayer_generally(&img, pattern);
 
                 assert_eq!(fast.len(), slow.len());

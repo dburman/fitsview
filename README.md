@@ -101,7 +101,7 @@ off.
 
 The calibration and colour settings in force are applied on the way in, and the
 stacks are written beside the frames. Ten 61-megapixel frames take about four
-seconds, or eleven with outliers rejected, which reads every frame a second time
+seconds, or ten with outliers rejected, which reads every frame a second time
 and judges every sample of it against the others.
 
 **Knowing what you are looking at.** The metadata panel shows the FITS header,
@@ -409,7 +409,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in twenty-one phases, each with its own acceptance criteria
+`fitsview` was built in twenty-two phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in
