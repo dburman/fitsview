@@ -240,6 +240,22 @@ fn bench_stack(c: &mut Criterion) {
             criterion::BatchSize::LargeInput,
         );
     });
+    // Almost every frame lands between the stack's pixels and is resampled
+    // there. Whether its inner step was inlined once made the difference
+    // between half a second and three on a night's stack, so it is watched.
+    group.bench_function("add a 24 MP frame between pixels", |b| {
+        let between = Alignment {
+            dx: 7.37,
+            dy: -3.61,
+            rotation: 1.3e-5,
+            ..Alignment::still()
+        };
+        b.iter_batched_ref(
+            || Stack::new(w, h, 1),
+            |stack| stack.add(black_box(&image), between),
+            criterion::BatchSize::LargeInput,
+        );
+    });
     group.bench_function("average 24 MP out", |b| {
         let mut stack = Stack::new(w, h, 1);
         stack.add(&image, alignment);

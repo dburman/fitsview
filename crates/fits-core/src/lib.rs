@@ -20,6 +20,7 @@ pub mod histogram;
 pub mod image;
 pub mod quality;
 pub mod reader;
+pub mod resample;
 pub mod stack;
 pub mod stars;
 pub mod stretch;

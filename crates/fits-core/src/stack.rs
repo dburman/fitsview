@@ -14,6 +14,7 @@ use rayon::prelude::*;
 
 use crate::header::FitsHeader;
 use crate::image::FitsImage;
+use crate::resample::{Affine, Resampler};
 use crate::stars::{Star, StarField};
 
 /// Which side of the mount the telescope was on.
@@ -351,6 +352,7 @@ impl Rejecting {
         for (channel, sigma) in noise.iter().enumerate() {
             let plane = channel * pixels;
             let source = &image.data[plane..plane + pixels];
+            let placement = Placement::new(source, width, height, alignment, *sigma);
             let inverse = inverse_variance(*sigma);
             let rows: Vec<(&mut [f64], &mut [f32])> = self.stack.total[plane..plane + pixels]
                 .chunks_mut(width)
@@ -363,25 +365,17 @@ impl Rejecting {
                 .map(|(y, (total, counted))| {
                     let first = plane + y * width;
                     let mut dropped = 0usize;
-                    each_placed(
-                        y,
-                        width,
-                        height,
-                        alignment,
-                        source,
-                        |x, value, quietened| {
-                            if evidence.is_outlier(first + x, value, inverse / quietened, critical)
-                            {
-                                dropped += 1;
-                                return;
-                            }
-                            total[x] += value * alignment.weight;
-                            #[allow(clippy::cast_possible_truncation)]
-                            {
-                                counted[x] += alignment.weight as f32;
-                            }
-                        },
-                    );
+                    placement.each_in_row(y, |x, value, quietened| {
+                        if evidence.is_outlier(first + x, value, inverse / quietened, critical) {
+                            dropped += 1;
+                            return;
+                        }
+                        total[x] += value * alignment.weight;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            counted[x] += alignment.weight as f32;
+                        }
+                    });
                     dropped
                 })
                 .sum::<usize>();
@@ -460,75 +454,170 @@ fn row_span(
     Some((first..upto, from, alignment.turned))
 }
 
-/// Hands each of a frame's samples that lands in row `y` of the stack to
-/// `visit`: its column, its levelled value, and its noise variance as a
-/// fraction of the frame's, which is one unless it had to be resampled.
+/// Where a frame's samples go in the stack, worked out once for each channel.
 ///
-/// The one place that decides where a sample goes, so that both passes of a
-/// rejecting stack place every sample identically. The second pass takes each
-/// sample back out of the figures the first recorded, and a sample placed
-/// differently would be taken out of a pixel it never went into. Until this
-/// was shared, the first pass resampled a frame with any turn at all — which
-/// after a fitted alignment is nearly every frame — and the second placed it
-/// to the nearest whole pixel.
-///
-/// Written as a visitor rather than an iterator so that the common case stays
-/// a straight walk along a slice, with the choice of path made once a row.
-fn each_placed(
-    y: usize,
-    width: usize,
-    height: usize,
-    alignment: Alignment,
-    source: &[f32],
-    mut visit: impl FnMut(usize, f64, f64),
-) {
-    let offset = alignment.offset;
+/// The one place that decides it, so that both passes of a rejecting stack
+/// place every sample identically. The second pass takes each sample back out
+/// of the figures the first recorded, and a sample placed differently would be
+/// taken out of a pixel it never went into. Until this was shared, the first
+/// pass resampled a frame with any turn at all — which after a fitted
+/// alignment is nearly every frame — and the second placed it to the nearest
+/// whole pixel.
+enum Placement<'a> {
+    /// A frame that lands exactly on the stack's pixels: the reference, or one
+    /// moved by whole pixels. Read as it is, reversed for the half turn of a
+    /// meridian flip.
+    Direct {
+        source: &'a [f32],
+        width: usize,
+        height: usize,
+        alignment: Alignment,
+    },
+    /// Every other frame, placed by the Lanczos kernel. See [`crate::resample`].
+    Resampled { resampler: Resampler, offset: f64 },
+    /// A frame turned too far for the kernel's two passes, placed by blending
+    /// the four nearest pixels. No frame of a real stack is turned that far —
+    /// the half turn of a flip is not a turn to the kernel — but a stack must
+    /// not refuse one that is.
+    Blended {
+        source: &'a [f32],
+        width: usize,
+        height: usize,
+        alignment: Alignment,
+    },
+}
 
-    // A turned frame has to be resampled, since its pixels no longer fall on
-    // the stack's grid. The softening that costs is the better bargain than
-    // leaving the frame out.
-    if alignment.rotation.abs() > f64::EPSILON {
-        #[allow(clippy::cast_precision_loss)]
-        let centre = ((width - 1) as f64 / 2.0, (height - 1) as f64 / 2.0);
-        let (c, s) = (alignment.rotation.cos(), alignment.rotation.sin());
-        #[allow(clippy::cast_precision_loss)]
-        let ay = y as f64 - centre.1;
-        for x in 0..width {
-            #[allow(clippy::cast_precision_loss)]
-            let ax = x as f64 - centre.0;
-            let (mut sx, mut sy) = (
-                centre.0 + ax * c - ay * s + alignment.dx,
-                centre.1 + ax * s + ay * c + alignment.dy,
-            );
-            if alignment.turned {
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    sx = (width - 1) as f64 - sx;
-                    sy = (height - 1) as f64 - sy;
-                }
-            }
-            if let Some((value, quietened)) = sample(source, width, height, sx, sy) {
-                visit(x, value + offset, quietened);
-            }
+impl<'a> Placement<'a> {
+    /// Works out where one channel of a frame goes, `noise` being that
+    /// channel's noise, which says how deep a dip must be to be a ring.
+    fn new(
+        source: &'a [f32],
+        width: usize,
+        height: usize,
+        alignment: Alignment,
+        noise: f64,
+    ) -> Self {
+        if !needs_resampling(alignment) {
+            return Self::Direct {
+                source,
+                width,
+                height,
+                alignment,
+            };
         }
-        return;
+        match Resampler::new(
+            source,
+            width,
+            height,
+            affine_of(alignment, width, height),
+            noise,
+        ) {
+            Some(resampler) => Self::Resampled {
+                resampler,
+                offset: alignment.offset,
+            },
+            None => Self::Blended {
+                source,
+                width,
+                height,
+                alignment,
+            },
+        }
     }
 
-    let Some((out, from, reversed)) = row_span(y, width, height, alignment, source) else {
-        return;
-    };
-    if reversed {
-        for (x, value) in out.zip(from.iter().rev()) {
-            if value.is_finite() {
-                visit(x, f64::from(*value) + offset, 1.0);
+    /// Hands each sample that lands in row `y` of the stack to `visit`: its
+    /// column, its levelled value, and its noise variance as a fraction of the
+    /// frame's, which is one unless it had to be resampled.
+    ///
+    /// Written as a visitor rather than an iterator so that the common case
+    /// stays a straight walk along a slice.
+    fn each_in_row(&self, y: usize, mut visit: impl FnMut(usize, f64, f64)) {
+        match self {
+            Self::Resampled { resampler, offset } => {
+                resampler.row(y, |x, value, kept| {
+                    visit(x, f64::from(value) + offset, kept)
+                });
             }
+            Self::Direct {
+                source,
+                width,
+                height,
+                alignment,
+            } => {
+                let offset = alignment.offset;
+                let Some((out, from, reversed)) = row_span(y, *width, *height, *alignment, source)
+                else {
+                    return;
+                };
+                if reversed {
+                    for (x, value) in out.zip(from.iter().rev()) {
+                        if value.is_finite() {
+                            visit(x, f64::from(*value) + offset, 1.0);
+                        }
+                    }
+                } else {
+                    for (x, value) in out.zip(from) {
+                        if value.is_finite() {
+                            visit(x, f64::from(*value) + offset, 1.0);
+                        }
+                    }
+                }
+            }
+            Self::Blended {
+                source,
+                width,
+                height,
+                alignment,
+            } => {
+                let affine = affine_of(*alignment, *width, *height);
+                for x in 0..*width {
+                    #[allow(clippy::cast_precision_loss)]
+                    let (sx, sy) = affine.apply(x as f64, y as f64);
+                    if let Some((value, quietened)) = sample(source, *width, *height, sx, sy) {
+                        visit(x, value + alignment.offset, quietened);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether a frame falls between the stack's pixels, and so has to be
+/// resampled to be placed.
+fn needs_resampling(alignment: Alignment) -> bool {
+    let fraction = |v: f64| (v - v.round()).abs() > 1e-9;
+    alignment.rotation.abs() > f64::EPSILON || fraction(alignment.dx) || fraction(alignment.dy)
+}
+
+/// Where each pixel of the stack reads from in a frame at `alignment`.
+///
+/// Turned by `rotation` about the middle of the frame and moved by `(dx, dy)`,
+/// then, for the far side of a meridian flip, turned half a circle — which is
+/// reading the frame from its opposite corner.
+fn affine_of(alignment: Alignment, width: usize, height: usize) -> Affine {
+    #[allow(clippy::cast_precision_loss)]
+    let (last_x, last_y) = ((width - 1) as f64, (height - 1) as f64);
+    let (cx, cy) = (last_x / 2.0, last_y / 2.0);
+    let (c, s) = (alignment.rotation.cos(), alignment.rotation.sin());
+    let affine = Affine {
+        a: c,
+        b: -s,
+        e: cx - cx * c + cy * s + alignment.dx,
+        c: s,
+        d: c,
+        f: cy - cx * s - cy * c + alignment.dy,
+    };
+    if alignment.turned {
+        Affine {
+            a: -affine.a,
+            b: -affine.b,
+            e: last_x - affine.e,
+            c: -affine.c,
+            d: -affine.d,
+            f: last_y - affine.f,
         }
     } else {
-        for (x, value) in out.zip(from) {
-            if value.is_finite() {
-                visit(x, f64::from(*value) + offset, 1.0);
-            }
-        }
+        affine
     }
 }
 
@@ -1057,9 +1146,9 @@ impl Stack {
 
     /// Adds a frame at the given alignment.
     ///
-    /// A frame that only needs shifting goes to the nearest whole pixel: a
-    /// fraction would need the frame resampled, which softens it. One that has
-    /// to be turned is resampled anyway.
+    /// A frame that lands between the stack's pixels — nearly every frame but
+    /// the reference — is resampled to exactly where it belongs, by the
+    /// Lanczos kernel. See [`crate::resample`].
     ///
     /// Returns false, and adds nothing, if the frame is not the same shape as
     /// the stack — a different sensor, or a different binning, has no business
@@ -1070,12 +1159,22 @@ impl Stack {
         }
         let (width, height) = (self.width, self.height);
         let pixels = width * height;
-        // Measured only when it will be used: it is a pass over the frame.
-        let noise = self.evidence.as_ref().map(|_| channel_noise(image));
+        // Measured only when it will be used — to judge the frame, or to tell
+        // a ring from the noise when it is resampled — since it is a pass over
+        // the frame.
+        let noise =
+            (self.evidence.is_some() || needs_resampling(alignment)).then(|| channel_noise(image));
 
         for channel in 0..self.channels {
             let plane = channel * pixels;
             let source = &image.data[plane..plane + pixels];
+            let placement = Placement::new(
+                source,
+                width,
+                height,
+                alignment,
+                noise.as_ref().map_or(0.0, |noise| noise[channel]),
+            );
             let totals = self.total[plane..plane + pixels]
                 .chunks_mut(width)
                 .zip(self.counted[plane..plane + pixels].chunks_mut(width));
@@ -1086,21 +1185,14 @@ impl Stack {
                     let rows: Vec<_> = totals.zip(evidence.rows(plane, pixels, width)).collect();
                     rows.into_par_iter().enumerate().for_each(
                         |(y, ((total, counted), (records, samples)))| {
-                            each_placed(
-                                y,
-                                width,
-                                height,
-                                alignment,
-                                source,
-                                |x, value, quietened| {
-                                    total[x] += value * alignment.weight;
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    {
-                                        counted[x] += alignment.weight as f32;
-                                    }
-                                    records[x].take(&mut samples[x], value, inverse / quietened);
-                                },
-                            );
+                            placement.each_in_row(y, |x, value, quietened| {
+                                total[x] += value * alignment.weight;
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    counted[x] += alignment.weight as f32;
+                                }
+                                records[x].take(&mut samples[x], value, inverse / quietened);
+                            });
                         },
                     );
                 }
@@ -1109,7 +1201,7 @@ impl Stack {
                     rows.into_par_iter()
                         .enumerate()
                         .for_each(|(y, (total, counted))| {
-                            each_placed(y, width, height, alignment, source, |x, value, _| {
+                            placement.each_in_row(y, |x, value, _| {
                                 total[x] += value * alignment.weight;
                                 #[allow(clippy::cast_possible_truncation)]
                                 {
@@ -2127,6 +2219,177 @@ mod tests {
         }
         assert!((student_critical(1_000_000, chance) - 3.0).abs() < 0.002);
         assert!(student_critical(0, chance).is_infinite());
+    }
+
+    /// A field of stars `sigma` wide at the given places, with noise, as
+    /// seen from a frame `(dx, dy)` away: the stack reads it at `x + dx`.
+    fn field_seen_from(
+        (w, h): (usize, usize),
+        places: &[(f64, f64)],
+        sigma: f64,
+        (dx, dy): (f64, f64),
+        seed: u64,
+    ) -> FitsImage {
+        let mut pixels = gaussian_background(w, h, 1000.0, 5.0, seed);
+        for (px, py) in places {
+            let (cx, cy) = (px + dx, py + dy);
+            for y in 0..h {
+                for x in 0..w {
+                    #[allow(clippy::cast_precision_loss)]
+                    let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+                    if r2 < 100.0 {
+                        pixels[y * w + x] += 20_000.0 * (-r2 / (2.0 * sigma * sigma)).exp();
+                    }
+                }
+            }
+        }
+        let spec = SyntheticSpec::new(w, h, -32);
+        read_fits_from_bytes(&synthetic_fits(&spec, &pixels).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn frames_a_fraction_of_a_pixel_apart_stack_to_stars_as_sharp_as_one_frame() {
+        // What placing between pixels is for. To the nearest pixel, frames a
+        // different fraction out each double every star slightly; blended from
+        // the four nearest, every star is blurred. Placed properly, a stack of
+        // eight frames holds stars as narrow as any one of them.
+        let (w, h) = (160usize, 160usize);
+        let places = [
+            (40.0, 45.0),
+            (110.0, 50.0),
+            (75.0, 115.0),
+            (120.0, 120.0),
+            (45.0, 100.0),
+        ];
+        let sigma = 1.2;
+        let offsets = [
+            (0.0, 0.0),
+            (0.5, 0.5),
+            (0.25, -0.4),
+            (-0.35, 0.3),
+            (0.45, -0.15),
+            (-0.5, -0.45),
+            (0.3, 0.2),
+            (-0.2, 0.5),
+        ];
+        let frames: Vec<(FitsImage, Alignment)> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, (dx, dy))| {
+                (
+                    field_seen_from((w, h), &places, sigma, (*dx, *dy), 400 + i as u64),
+                    Alignment {
+                        dx: *dx,
+                        dy: *dy,
+                        ..Alignment::still()
+                    },
+                )
+            })
+            .collect();
+
+        let width_of = |image: &FitsImage| {
+            detect(image, &DetectionParams::default())
+                .fwhm
+                .expect("stars to measure")
+        };
+        let one = width_of(&frames[0].0);
+
+        let stacked = |adjust: &dyn Fn(Alignment) -> Alignment| {
+            let mut stack = Stack::new(w, h, 1);
+            for (image, alignment) in &frames {
+                assert!(stack.add(image, adjust(*alignment)));
+            }
+            width_of(&stack.finish(FitsHeader { cards: Vec::new() }))
+        };
+        let placed = stacked(&|a| a);
+        // The same frames to the nearest whole pixel, as a shift alone once was.
+        let rounded = stacked(&|a| {
+            let (dx, dy) = a.whole();
+            #[allow(clippy::cast_precision_loss)]
+            Alignment {
+                dx: dx as f64,
+                dy: dy as f64,
+                ..a
+            }
+        });
+
+        assert!(
+            (placed / one - 1.0).abs() < 0.03,
+            "one frame's stars are {one:.3} wide, the stack's {placed:.3}"
+        );
+        // Rounding is out by up to half a pixel each way, 0.29 of a pixel on
+        // average, which on stars 1.2 pixels in deviation is three per cent.
+        assert!(
+            rounded > placed * 1.02,
+            "to the nearest pixel {rounded:.3}, placed {placed:.3}: the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_frame_from_across_the_meridian_lands_its_stars_on_the_reference_s() {
+        // After a flip every frame is turned half a circle, a fraction of a
+        // degree more, and moved by a fraction of a pixel: the one placement
+        // that exercises all three at once, and every frame of the second half
+        // of a night that crosses the meridian needs it.
+        let (w, h) = (160usize, 160usize);
+        let places = [
+            (40.0, 45.0),
+            (110.0, 50.0),
+            (75.0, 115.0),
+            (120.0, 120.0),
+            (45.0, 100.0),
+        ];
+        let (rotation, dx, dy): (f64, f64, f64) = (0.003, 0.3, -0.45);
+        #[allow(clippy::cast_precision_loss)]
+        let (last_x, last_y) = ((w - 1) as f64, (h - 1) as f64);
+        let (cx, cy) = (last_x / 2.0, last_y / 2.0);
+        // Where each star sits in the flipped frame: turned and moved, then
+        // read from the opposite corner.
+        let seen: Vec<(f64, f64)> = places
+            .iter()
+            .map(|(px, py)| {
+                let (ax, ay) = (px - cx, py - cy);
+                let (sx, sy) = (
+                    cx + ax * rotation.cos() - ay * rotation.sin() + dx,
+                    cy + ax * rotation.sin() + ay * rotation.cos() + dy,
+                );
+                (last_x - sx, last_y - sy)
+            })
+            .collect();
+
+        let reference = field_seen_from((w, h), &places, 1.2, (0.0, 0.0), 51);
+        let flipped = field_seen_from((w, h), &seen, 1.2, (0.0, 0.0), 52);
+        let mut stack = Stack::new(w, h, 1);
+        assert!(stack.add(&reference, Alignment::still()));
+        assert!(stack.add(
+            &flipped,
+            Alignment {
+                dx,
+                dy,
+                turned: true,
+                rotation,
+                ..Alignment::still()
+            }
+        ));
+        let stacked = stack.finish(FitsHeader { cards: Vec::new() });
+
+        let params = DetectionParams::default();
+        let field = detect(&stacked, &params);
+        assert_eq!(field.count(), places.len(), "two frames, one set of stars");
+        for (px, py) in places {
+            let nearest = field
+                .stars
+                .iter()
+                .map(|s| ((s.x - px).powi(2) + (s.y - py).powi(2)).sqrt())
+                .fold(f64::INFINITY, f64::min);
+            assert!(nearest < 0.1, "the star at {px},{py} is {nearest:.3} away");
+        }
+        let one = detect(&reference, &params).fwhm.expect("a width");
+        let both = field.fwhm.expect("a width");
+        assert!(
+            (both / one - 1.0).abs() < 0.03,
+            "one frame {one:.3}, both {both:.3}"
+        );
     }
 
     #[test]

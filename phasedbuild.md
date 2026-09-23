@@ -3338,6 +3338,111 @@ they agree. Resampling costs about 2.4 s of the 10.7 here.
 
 ---
 
+## Phase 21 — Placing Frames Between Pixels
+
+A mount does not drift in whole pixels, so nearly every frame of a stack
+belongs somewhere between the reference's pixels. There were two ways of
+putting it there, and both cost the picture. A frame that only needed shifting
+went to the nearest whole pixel: sharp, but up to 0.7 of a pixel out, and a
+stack of frames each a different fraction out is a stack of slightly doubled
+stars. A frame with any turn at all — and a fitted alignment always has one,
+of about a hundred-thousandth of a radian — was blended from the four nearest
+pixels, which puts it in the right place and blurs every star.
+
+### What it does now
+
+Every frame but the reference is placed by the Lanczos kernel of radius three,
+the standard in astronomical registration, in `fits-core/src/resample.rs`:
+
+- **Two passes** — along the frame's rows, then down the result's columns —
+  which is exact for any shift, turn, and the half turn of a meridian flip, at
+  twelve pixels read for each placed rather than thirty-six. The weights come
+  from a table at a two-thousandth of a pixel.
+- **Straight lines stay straight.** Lanczos as usually written does not
+  reproduce a line: a quarter of the way between two pixels it reads from
+  0.2303 of the way, and a star placed there lands a fiftieth of a pixel short.
+  Found because the tests' stars landed 0.02 pixels out. The table's weights
+  are corrected, once, by the least change that makes them exact.
+- **Rings are judged against the frame's noise.** The kernel's negative lobes
+  dig a dark ring beside a very sharp star: five per cent of its peak at a
+  pixel across, 0.8 at two, and 0.016 per cent at the 2.8 pixels this rig
+  gives. A dip below both of the nearest two pixels deeper than three
+  deviations of the frame's noise is taken for a ring, and those two are
+  blended there instead. The first rule tried — PixInsight's, comparing the
+  negative lobes with the positive — clamped 31 per cent of ordinary noise
+  back to the blend it was meant to replace.
+- **Rejection is told how much noise survived** the placing, from the same
+  table: all of it on a pixel, 0.62 of it midway between four.
+
+### What it measures
+
+Ten 61-megapixel frames of the Barnard's Loop night, stacked three ways:
+
+| | Blended (0.1.8) | Whole pixels | Lanczos |
+|---|---|---|---|
+| Median star width | 3.310 px (5.94″) | 3.238 px | **3.155 px (5.66″)** |
+| Width, frame centre | 2.995 px | 2.943 px | **2.861 px** |
+| Width, a corner | 5.098 px | 5.040 px | **4.985 px** |
+| Roundness | 0.783 | 0.802 | **0.808** |
+| Background noise, red | 2.41 | 2.80 | 2.90 |
+| Samples rejected | 10.88 M | 19.05 M | **9.42 M** |
+| Time, with rejection | 10.1–10.3 s | 7.2–7.3 s | 10.6–11.1 s |
+| Time, without | 3.9 s | — | 4.2–4.3 s |
+
+Stars are 4.7 per cent narrower than 0.1.8's and rounder, and fewer samples
+disagree because the frames line up better. The background noise figure
+rises by a fifth, and that is not new noise: blending was smoothing the grain
+away along with the stars. Whole-pixel placement, which does not smooth at
+all, reads within four per cent of the kernel.
+
+### Where the time went
+
+The first version cost 3.5 s on that stack. Most of it was not the kernel:
+
+- **The row pass needs no table at all for a real frame.** With a turn of a
+  hundred-thousandth of a radian, the fraction a pixel lands at drifts by a
+  millionth of a pixel along a row, so one set of weights serves the whole row
+  and the kernel slides along it — forwards, or backwards for a flipped frame.
+  Only a frame turned by a measurable angle is worked out pixel by pixel.
+- **The weights are passed in**, not fetched through a lazily built global
+  for every pixel, and whether any of the six pixels is undefined is asked of
+  their sum, once, rather than of each.
+- **Inlining was the rest.** Profiling the application showed the per-pixel
+  step compiled as a call in one build and inlined in another; the stand-alone
+  timing had it inlined and saw half a second where the application saw three.
+  It is now always inlined, and `stack/add a 24 MP frame between pixels` in the
+  benchmarks watches it: 27 ms against 3.7 ms for a frame on whole pixels.
+
+### Acceptance criteria
+
+- [x] A frame moved by whole pixels is placed unchanged.
+- [x] A star placed by a fraction lands within 0.002 of a pixel of where it
+      belongs, at its own width; blending widens it several times as much.
+- [x] A star turned, and a star from across the meridian, land where the
+      arithmetic says.
+- [x] Smooth sky is reproduced at least ten times as accurately as blending.
+- [x] The weights place a straight line exactly at every table step.
+- [x] A star sharper than any real one digs no ring deeper than the noise; a
+      star as wide as a real one is not clamped at all.
+- [x] Ordinary noise is clamped less than 0.2 per cent of the time.
+- [x] The noise said to survive placing is the noise that does.
+- [x] Nothing is invented near an edge or an undefined pixel.
+- [x] Frames a fraction of a pixel apart stack to stars within 3 per cent of
+      one frame's width; to the nearest pixel they come out wider.
+- [x] A turned, shifted frame from across the meridian lands its stars on the
+      reference's.
+
+### Not done
+
+- **Colour is still reconstructed twice for every frame**, once in each pass of
+  a rejecting stack: 1.8 s of the 10.7. Placing the raw mosaic and
+  reconstructing colour on the way into the stack would take one of them away.
+- **Corners are soft in every version**: five pixels against under three in the
+  middle. That is the optics — tilt or field curvature — and no placement can
+  take it out.
+
+---
+
 ## 9. Performance Checklist (apply throughout)
 
 - Read files with a single `std::fs::read`; do not use `BufReader` per-element reads, and do not use `mmap` (unsafe).

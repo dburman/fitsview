@@ -493,3 +493,14 @@ one at a time does nearly as well.
       one of them; with four it says nothing was rejected.
 - [ ] Stacking a long night of full frames with rejection does not run the
       machine out of memory.
+
+## Placing frames between pixels
+
+- [ ] Stack a night and compare its stars with a 0.1.8 stack of the same
+      frames: they should be slightly narrower and rounder, never doubled.
+- [ ] The sky of the new stack looks a little grainier at full size than the
+      0.1.8 one did. That is the grain the frames have; blending was smoothing
+      it away along with the stars.
+- [ ] Zoomed in on the brightest stars, there is no dark ring around them.
+- [ ] A night that crosses the meridian stacks with its stars single and round
+      right to the corners.

@@ -81,7 +81,10 @@ a 24-megapixel frame, runs in the background, and is off until asked for.
 
 **Stacking.** **Stack folder** combines a night into one image per filter,
 lining the frames up by their stars, so the signal adds while the noise adds
-only with its root. Frames taken on the other side of a meridian flip are turned
+only with its root. Each frame is laid exactly where it belongs, to a fraction
+of a pixel, by the Lanczos kernel — neither rounded to the nearest pixel, which
+doubles stars slightly, nor blended into place, which blurs them — with a guard
+against the dark rings that kernel digs around stars too sharp for the pixels. Frames taken on the other side of a meridian flip are turned
 to match — including the fraction of a degree the mount does not come back by,
 which would otherwise leave the middle of the frame lining up and the edges
 smeared. Frames are brought to a common sky before they are added, so a frame
@@ -108,7 +111,7 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 759 automated tests, run on macOS and on Linux before every release; the
+by 771 automated tests, run on macOS and on Linux before every release; the
 Windows build is compiled on every check and tested by hand.
 
 ---
@@ -406,7 +409,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in twenty phases, each with its own acceptance criteria
+`fitsview` was built in twenty-one phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in
