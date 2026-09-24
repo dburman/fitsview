@@ -18,6 +18,7 @@ use fits_core::stars::{self, DetectionParams, StarField};
 use fits_core::{quality, read_fits, read_fits_header, write_fits, FitsHeader, FitsImage, Quality};
 
 use crate::folder::StarMeasure;
+use crate::memory::{self, Memory};
 
 /// What a finished job produced.
 #[derive(Debug)]
@@ -34,6 +35,8 @@ pub enum Outcome {
         unaligned: usize,
         /// Samples left out as outliers, across every stack.
         rejected: usize,
+        /// Whether a stack was made a colour at a time, to fit in memory.
+        colour_at_a_time: bool,
     },
     /// Every file in the folder was measured.
     Measured(Vec<(PathBuf, Quality, Option<StarMeasure>)>),
@@ -140,15 +143,7 @@ impl Job {
     /// stay comparable however the display is configured.
     #[must_use]
     /// Stacks every file in `paths`, one output per filter.
-    pub fn stack(
-        paths: Vec<PathBuf>,
-        dark: Option<Arc<MasterFrame>>,
-        flat: Option<Arc<MasterFlat>>,
-        pattern: Option<fits_core::BayerPattern>,
-        params: DetectionParams,
-        reject: bool,
-        weighted: bool,
-    ) -> Self {
+    pub fn stack(paths: Vec<PathBuf>, recipe: StackRecipe) -> Self {
         let (tx, updates) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -157,14 +152,6 @@ impl Job {
         std::thread::Builder::new()
             .name("fitsview-stack".into())
             .spawn(move || {
-                let recipe = StackRecipe {
-                    dark,
-                    flat,
-                    pattern,
-                    params,
-                    reject,
-                    weighted,
-                };
                 stack_worker(&paths, &recipe, &tx, &worker_cancel);
             })
             .ok();
@@ -378,13 +365,23 @@ fn frame_weight(weighted: bool, noise: f64, fwhm: Option<f64>) -> f64 {
 }
 
 /// Everything a stack needs beyond the files themselves.
-struct StackRecipe {
-    dark: Option<Arc<MasterFrame>>,
-    flat: Option<Arc<MasterFlat>>,
-    pattern: Option<fits_core::BayerPattern>,
-    params: DetectionParams,
-    reject: bool,
-    weighted: bool,
+#[derive(Debug, Clone)]
+pub struct StackRecipe {
+    /// Master dark to subtract, if any.
+    pub dark: Option<Arc<MasterFrame>>,
+    /// Master flat to divide by, if any.
+    pub flat: Option<Arc<MasterFlat>>,
+    /// The mosaic's filter pattern, for frames from a colour camera.
+    pub pattern: Option<fits_core::BayerPattern>,
+    /// How hard to look for the stars the frames are lined up by.
+    pub params: DetectionParams,
+    /// Whether to leave out samples the other frames disagree with.
+    pub reject: bool,
+    /// Whether a quiet, sharp frame counts for more than a noisy, soft one.
+    pub weighted: bool,
+    /// Bytes the stack may take, or `None` to ask the system when it starts.
+    /// A colour stack that would take more is stacked a colour at a time.
+    pub room: Option<u64>,
 }
 
 /// Stacks a folder, one file per filter.
@@ -395,7 +392,10 @@ struct StackRecipe {
 /// stars, turning any that were taken on the other side of the pier.
 ///
 /// Only one frame is held at a time beyond the running totals, because a
-/// night of full-frame captures does not fit in memory otherwise.
+/// night of full-frame captures does not fit in memory otherwise. When even the
+/// totals would not fit, a colour stack is made a colour at a time: the frames
+/// are lined up once, and each further colour reads them again and adds them
+/// where they were put. The result is the same to the bit.
 #[allow(clippy::too_many_lines)]
 fn stack_worker(
     paths: &[PathBuf],
@@ -410,9 +410,11 @@ fn stack_worker(
         params,
         reject,
         weighted,
+        room,
     } = recipe;
     let (dark, flat) = (dark.as_deref(), flat.as_deref());
     let (pattern, reject, weighted) = (*pattern, *reject, *weighted);
+    let room = room.unwrap_or_else(|| memory::room(Memory::now(), 0));
     // Which filter each frame belongs to, read from the header alone so that
     // grouping costs a few kilobytes a frame rather than a decode. A frame
     // whose pixels turn out to be unreadable is passed over when it is
@@ -434,21 +436,43 @@ fn stack_worker(
         }
     }
 
+    // A frame calibrated and in colour, ready to add, or `None` if it cannot
+    // be read.
+    let prepare = |path: &Path| -> Option<FitsImage> {
+        let light = read_fits(path).ok()?;
+        calib::calibrate_and_debayer(&light, dark, flat, pattern).ok()
+    };
+    let new_stack = |(width, height): (usize, usize), channels: usize| {
+        if reject {
+            Stack::rejecting(width, height, channels)
+        } else {
+            Stack::new(width, height, channels)
+        }
+    };
+
     let mut stacks = Vec::new();
     let mut unaligned = 0usize;
     let mut rejected = 0usize;
+    let mut colour_at_a_time = false;
     let mut done = 0usize;
     // Rejecting means reading every frame a second time, to measure it against
-    // what the first pass found ordinary.
-    let steps = if reject { paths.len() * 2 } else { paths.len() };
+    // what the first pass found ordinary. A colour at a time means reading it
+    // again for each further colour, in each pass; that is added when it is
+    // decided.
+    let passes = if reject { 2 } else { 1 };
+    let mut steps = paths.len() * passes;
 
     for (filter, group) in &groups {
         let mut stack: Option<Stack> = None;
         let mut reference: Option<(StarField, PierSide, (usize, usize))> = None;
         let mut header = None;
         let mut sky: Option<f64> = None;
-        // Where each frame ended up, so that a second pass does not have to
-        // find its stars all over again. That is most of what makes rejection
+        // The frames' channels, and how many of them each stack holds: all of
+        // them, or one when all at once would not fit. Set by the first frame.
+        let mut channels = 0usize;
+        let mut per_stack = 0usize;
+        // Where each frame ended up, so that later passes do not have to find
+        // its stars all over again. That is most of what makes rejection
         // cheaper the second time round.
         let mut placed: Vec<(PathBuf, Alignment)> = Vec::new();
 
@@ -483,17 +507,25 @@ fn stack_worker(
             match &reference {
                 None => {
                     // The first readable frame of the group sets the frame of
-                    // reference for the rest of it, its sky included.
-                    let mut fresh = if reject {
-                        Stack::rejecting(size.0, size.1, prepared.channels)
+                    // reference for the rest of it, its sky included, and says
+                    // how big the stack will be.
+                    channels = prepared.channels;
+                    per_stack = if memory::together_fits(size.0, size.1, channels, reject, room) {
+                        channels
                     } else {
-                        Stack::new(size.0, size.1, prepared.channels)
+                        1
                     };
+                    if per_stack < channels {
+                        log::info!("stacking {filter} a colour at a time to fit in memory");
+                        colour_at_a_time = true;
+                        steps += group.len() * passes * (channels / per_stack - 1);
+                    }
+                    let mut fresh = new_stack(size, per_stack);
                     let placing = Alignment {
                         weight: frame_weight(weighted, measured.noise, found.fwhm),
                         ..Alignment::still()
                     };
-                    fresh.add(&prepared, placing);
+                    fresh.add_channels(&prepared, 0, placing);
                     placed.push((path.clone(), placing));
                     header = Some(light.header.clone());
                     sky = Some(fits_core::stack::sky_level(&prepared));
@@ -514,7 +546,9 @@ fn stack_worker(
                             }
                             alignment.weight = frame_weight(weighted, measured.noise, found.fwhm);
                             if let Some(stack) = stack.as_mut() {
-                                if stack.add(&prepared, alignment) {
+                                if prepared.channels == channels
+                                    && stack.add_channels(&prepared, 0, alignment)
+                                {
                                     placed.push((path.clone(), alignment));
                                 } else {
                                     unaligned += 1;
@@ -530,7 +564,7 @@ fn stack_worker(
             }
         }
 
-        let (Some(stack), Some(header)) = (stack, header) else {
+        let (Some(stack), Some(header), Some((_, _, size))) = (stack, header, reference) else {
             continue;
         };
         if stack.frames() == 0 {
@@ -543,48 +577,89 @@ fn stack_worker(
         };
         let out = directory.join(format!("{STACK_PREFIX}{}.fits", safe_name(filter)));
 
-        // The second pass, when it is wanted and there are enough frames for
-        // it. The first pass is handed over rather than copied, which on full
-        // frames was several gigabytes held for nothing.
-        let first = if reject {
-            stack.into_rejecting(fits_core::stack::DEFAULT_CLIP)
-        } else {
-            Err(Box::new(stack))
-        };
-        let (result, history) = match first {
-            Ok(mut second) => {
-                for (path, alignment) in &placed {
-                    if cancel.load(Ordering::Relaxed) {
-                        let _ = tx.send(Update::Cancelled);
-                        return;
+        // Each stack's channels in turn: all of them at once, or a colour after
+        // another, each further colour reading the frames again and adding
+        // them where the first pass put them.
+        let mut first_stack = Some(stack);
+        let mut data: Vec<f32> = Vec::with_capacity(size.0 * size.1 * channels);
+        let mut judged = false;
+        let mut group_rejected = 0usize;
+        for first in (0..channels).step_by(per_stack) {
+            let stack = match first_stack.take() {
+                Some(stack) => stack,
+                None => {
+                    let mut stack = new_stack(size, per_stack);
+                    for (path, alignment) in &placed {
+                        if cancel.load(Ordering::Relaxed) {
+                            let _ = tx.send(Update::Cancelled);
+                            return;
+                        }
+                        let _ = tx.send(Update::Progress {
+                            done,
+                            total: steps,
+                            item: file_name_of(path),
+                        });
+                        done += 1;
+                        if let Some(prepared) = prepare(path) {
+                            stack.add_channels(&prepared, first, *alignment);
+                        }
                     }
-                    let _ = tx.send(Update::Progress {
-                        done,
-                        total: steps,
-                        item: file_name_of(path),
-                    });
-                    done += 1;
-
-                    let Ok(light) = read_fits(path) else { continue };
-                    let Ok(prepared) = calib::calibrate_and_debayer(&light, dark, flat, pattern)
-                    else {
-                        continue;
-                    };
-                    second.add(&prepared, *alignment);
+                    stack
                 }
-                rejected += second.rejected();
-                let history = format!(
-                    "Stacked {} frames of filter {filter}, {} samples rejected",
-                    second.frames(),
-                    second.rejected()
-                );
-                (second.finish(header), history)
-            }
-            Err(stack) => {
-                let history = format!("Stacked {} frames of filter {filter}", stack.frames());
-                (stack.finish(header), history)
-            }
+            };
+
+            // The second pass, when it is wanted and there are enough frames
+            // for it. The first pass is handed over rather than copied, which
+            // on full frames was several gigabytes held for nothing.
+            let part = if reject {
+                stack.into_rejecting(fits_core::stack::DEFAULT_CLIP)
+            } else {
+                Err(Box::new(stack))
+            };
+            let finished = match part {
+                Ok(mut second) => {
+                    for (path, alignment) in &placed {
+                        if cancel.load(Ordering::Relaxed) {
+                            let _ = tx.send(Update::Cancelled);
+                            return;
+                        }
+                        let _ = tx.send(Update::Progress {
+                            done,
+                            total: steps,
+                            item: file_name_of(path),
+                        });
+                        done += 1;
+                        if let Some(prepared) = prepare(path) {
+                            second.add_channels(&prepared, first, *alignment);
+                        }
+                    }
+                    judged = true;
+                    group_rejected += second.rejected();
+                    second.finish(header.clone())
+                }
+                Err(stack) => stack.finish(header.clone()),
+            };
+            data.extend(finished.data);
+        }
+
+        rejected += group_rejected;
+        let (min, max) = fits_core::finite_min_max(&data);
+        let result = FitsImage {
+            width: size.0,
+            height: size.1,
+            channels,
+            data,
+            header,
+            min,
+            max,
         };
+        let mut history = format!("Stacked {frames} frames of filter {filter}");
+        if judged {
+            history.push_str(&format!(", {group_rejected} samples rejected"));
+        }
+        if per_stack < channels {
+            history.push_str(", a colour at a time");
+        }
         if let Err(e) = write_fits(&out, &result, &[history]) {
             let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(&out))));
             return;
@@ -601,6 +676,7 @@ fn stack_worker(
         stacks,
         unaligned,
         rejected,
+        colour_at_a_time,
     }));
 }
 

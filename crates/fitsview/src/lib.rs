@@ -12,6 +12,7 @@
 //!   overlay and `--help`.
 //! - [`sidecar`] remembers keep flags beside the images.
 //! - [`measurements`] remembers what each frame measured, beside it.
+//! - [`memory`] says whether a stack fits in memory all at once.
 //! - [`jobs`] runs slow work, such as combining darks or exporting a folder,
 //!   on a background thread with progress and cancellation.
 //! - [`loader`] decodes images on a worker thread and caches the results.
@@ -38,6 +39,7 @@ pub mod icon;
 pub mod jobs;
 pub mod loader;
 pub mod measurements;
+pub mod memory;
 pub mod natsort;
 pub mod shortcuts;
 pub mod sidecar;

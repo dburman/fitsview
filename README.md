@@ -102,7 +102,11 @@ off.
 The calibration and colour settings in force are applied on the way in, and the
 stacks are written beside the frames. Ten 61-megapixel frames take about four
 seconds, or ten with outliers rejected, which reads every frame a second time
-and judges every sample of it against the others.
+and judges every sample of it against the others. Rejecting against colour
+frames that size needs about 8.5 GB of memory at its peak, however many frames
+there are; on a machine without that to spare it stacks a colour at a time
+instead, in about 5.5 GB, reading every frame three times as often, to exactly
+the same result.
 
 **Knowing what you are looking at.** The metadata panel shows the FITS header,
 with the keywords that identify a frame pinned to the top and a filter for
@@ -111,7 +115,7 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 771 automated tests, run on macOS and on Linux before every release; the
+by 787 automated tests, run on macOS and on Linux before every release; the
 Windows build is compiled on every check and tested by hand.
 
 ---
@@ -205,8 +209,8 @@ differs is only what has to be installed first.
 The macOS and Windows instructions below have been run; the Linux package lists
 have not, and say so where they are uncertain.
 
-**Rust.** Any platform needs a stable toolchain of **1.92 or newer**, which is
-what `egui` requires. `rust-toolchain.toml` names the stable channel, so
+**Rust.** Any platform needs a stable toolchain of **1.95 or newer**, which is
+what `sysinfo` requires. `rust-toolchain.toml` names the stable channel, so
 `rustup` fetches the right one automatically the first time you build. Install
 it from [rustup.rs](https://rustup.rs) if you have none.
 
@@ -409,7 +413,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in twenty-two phases, each with its own acceptance criteria
+`fitsview` was built in twenty-three phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in

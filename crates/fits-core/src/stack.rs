@@ -340,21 +340,34 @@ impl Rejecting {
     /// Returns false, and adds nothing, if the frame is not the shape of the
     /// stack.
     pub fn add(&mut self, image: &FitsImage, alignment: Alignment) -> bool {
-        if !self.stack.fits(image) {
+        self.stack.fits(image) && self.add_channels(image, 0, alignment)
+    }
+
+    /// Adds the channels of a frame from `first` on, as many as the stack
+    /// holds, keeping only the samples that agree with the others. See
+    /// [`Stack::add_channels`].
+    pub fn add_channels(&mut self, image: &FitsImage, first: usize, alignment: Alignment) -> bool {
+        if !self.stack.fits_from(image, first) {
             return false;
         }
         let (width, height) = (self.stack.width, self.stack.height);
         let pixels = width * height;
-        let noise = channel_noise(image);
+        let noise: Vec<f64> = (0..self.stack.channels)
+            .map(|channel| channel_noise_of(image, first + channel))
+            .collect();
         let (evidence, critical) = (&self.evidence, &self.critical);
         let mut rejected = 0usize;
 
         for (channel, sigma) in noise.iter().enumerate() {
+            // Where the channel goes in the stack, and where it comes from in
+            // the frame, which differ when the stack holds only some of them.
             let plane = channel * pixels;
-            let source = &image.data[plane..plane + pixels];
+            let from = (first + channel) * pixels;
+            let source = &image.data[from..from + pixels];
+            let pedestal = self.stack.pedestal.get(channel).copied().unwrap_or(0.0);
             let placement = Placement::new(source, width, height, alignment, *sigma);
             let inverse = inverse_variance(*sigma);
-            let rows: Vec<(&mut [f64], &mut [f32])> = self.stack.total[plane..plane + pixels]
+            let rows: Vec<(&mut [f32], &mut [f32])> = self.stack.total[plane..plane + pixels]
                 .chunks_mut(width)
                 .zip(self.stack.counted[plane..plane + pixels].chunks_mut(width))
                 .collect();
@@ -370,7 +383,10 @@ impl Rejecting {
                             dropped += 1;
                             return;
                         }
-                        total[x] += value * alignment.weight;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            total[x] += ((value - pedestal) * alignment.weight) as f32;
+                        }
                         #[allow(clippy::cast_possible_truncation)]
                         {
                             counted[x] += alignment.weight as f32;
@@ -637,61 +653,62 @@ fn inverse_variance(noise: f64) -> f64 {
 /// What a rejecting stack records about each sample position in its first
 /// pass: enough to judge any one frame's sample against all the others.
 ///
-/// Sums rather than the samples themselves, since holding every frame is not
-/// affordable (see [`Stack`]), and sums are enough to take one sample back out
-/// again. Each sample counts by the inverse square of its frame's noise, which
-/// is what puts a noisy frame and a quiet one on the same footing.
+/// Running figures rather than the samples themselves, since holding every
+/// frame is not affordable (see [`Stack`]), and running figures are enough to
+/// take one sample back out again. Each sample counts by the inverse square of
+/// its frame's noise, which is what puts a noisy frame and a quiet one on the
+/// same footing.
 ///
-/// Thirty-four bytes a sample: six gigabytes for a stack of 61-megapixel colour
-/// frames, which is why it is only kept when rejection was asked for. Held as
-/// one record a sample rather than as an array for each figure, because the
-/// second pass reads all of them for every sample of every frame, and six
-/// streams through memory cost it half as much again as the arithmetic did.
+/// Twenty-two bytes a sample: four gigabytes for a stack of 61-megapixel colour
+/// frames, which is why it is only kept when rejection was asked for. It was
+/// thirty-four, in double precision, until the figures were kept in a form
+/// single precision can hold: see [`Record`]. Held as one record a sample
+/// rather than as an array for each figure, because the second pass reads all
+/// of them for every sample of every frame, and six streams through memory
+/// cost it half as much again as the arithmetic did.
 #[derive(Debug, Clone)]
 struct Evidence {
     records: Vec<Record>,
     /// How many samples there were, beside the records rather than in them,
-    /// where it would round each record up from thirty-two bytes to forty.
+    /// where it would round each record up from twenty bytes to twenty-four.
     samples: Vec<u16>,
 }
 
-/// One sample position's figures.
+/// One sample position's figures: the brightest sample, held aside, and the
+/// mean, scatter and total weight of all the rest.
 ///
-/// In the first pass the three sums are of what each sample counted for, times
-/// one, the sample, and the sample squared. Turned into the second pass they
-/// are rewritten in place to describe the others once the brightest is set
-/// aside: their mean, how far they scatter about it, and what they count for
-/// altogether. Setting the brightest aside once, rather than once for every
-/// sample judged against it, is most of what the second pass used to cost.
+/// **The brightest never enters the running figures.** It is set aside to
+/// judge the others by in any case, so it is held apart from the start: when
+/// a brighter sample arrives, the old brightest joins the rest and the new one
+/// takes its place. Nothing is ever taken back out.
+///
+/// That is what lets single precision hold them. These figures used to be sums
+/// of samples and of their squares, from which the brightest was subtracted
+/// and the scatter found as the small difference of two large numbers; in
+/// single precision that difference moved by tens when it should be about the
+/// number of frames, so each record took thirty-two bytes. Kept instead as a
+/// running mean and the scatter about it, updated a sample at a time in the way
+/// Welford gave, nothing large is ever subtracted from anything, and twenty
+/// bytes do.
 #[derive(Debug, Clone, Copy)]
 struct Record {
-    /// The weighted sum, becoming the others' mean.
-    first: f64,
-    /// The weighted sum of squares, becoming the others' scatter about that
-    /// mean, which on pure noise is about one for each of them.
-    second: f64,
-    /// What the samples counted for altogether.
-    ///
-    /// Double precision, though single looks as if it would do: the scatter is
-    /// the small difference between two large figures, and a total rounded to
-    /// single precision moves that difference by tens when it should be about
-    /// the number of frames.
-    total: f64,
-    /// The brightest sample, so that it can be set aside.
+    /// The mean of all but the brightest, each weighted by what it counts for.
+    mean: f32,
+    /// Their weighted scatter about that mean: on pure noise, about one for
+    /// each of them.
+    scatter: f32,
+    /// What they count for altogether.
+    total: f32,
+    /// The brightest sample.
     brightest: f32,
-    /// What the brightest counted for.
-    ///
-    /// Single precision, unlike the total it comes out of. Taking out a
-    /// slightly rounded weight leaves a sliver of that sample behind, at the
-    /// same slight weight in all three sums, which is a sample counting for
-    /// almost nothing rather than an error in the scatter.
+    /// What the brightest counts for.
     brightest_inverse: f32,
 }
 
 impl Record {
     const EMPTY: Self = Self {
-        first: 0.0,
-        second: 0.0,
+        mean: 0.0,
+        scatter: 0.0,
         total: 0.0,
         brightest: f32::NEG_INFINITY,
         brightest_inverse: 0.0,
@@ -699,43 +716,50 @@ impl Record {
 
     /// Takes in one sample, in the first pass.
     fn take(&mut self, samples: &mut u16, value: f64, inverse: f64) {
-        self.first += inverse * value;
-        self.second += inverse * value * value;
-        self.total += inverse;
         *samples = samples.saturating_add(1);
         #[allow(clippy::cast_possible_truncation)]
-        let value = value as f32;
-        if value > self.brightest {
-            self.brightest = value;
+        let narrow = value as f32;
+        if narrow > self.brightest {
+            // The new brightest takes the old one's place, and the old one
+            // joins the rest, as stored.
+            let (old, old_inverse) = (self.brightest, self.brightest_inverse);
+            self.brightest = narrow;
             #[allow(clippy::cast_possible_truncation)]
             {
                 self.brightest_inverse = inverse as f32;
             }
+            if old.is_finite() {
+                self.join(f64::from(old), f64::from(old_inverse));
+            }
+        } else {
+            self.join(value, inverse);
         }
     }
 
-    /// Sets the brightest sample aside and rewrites the sums as the rest's
-    /// mean, scatter and total. Returns how many samples that leaves.
-    fn set_brightest_aside(&mut self, samples: u16) -> u16 {
-        let (mut first, mut second, mut total, mut others) =
-            (self.first, self.second, self.total, samples);
-        if self.brightest.is_finite() && others > 0 {
-            let (top, inverse) = (f64::from(self.brightest), f64::from(self.brightest_inverse));
-            first -= inverse * top;
-            second -= inverse * top * top;
-            total -= inverse;
-            others -= 1;
+    /// Adds a sample to the running figures, worked out in double precision
+    /// and stored in single.
+    fn join(&mut self, value: f64, inverse: f64) {
+        let total = f64::from(self.total) + inverse;
+        let mean = f64::from(self.mean);
+        let difference = value - mean;
+        let moved = mean + difference * inverse / total;
+        let scatter = f64::from(self.scatter) + inverse * difference * (value - moved);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.total = total as f32;
+            self.mean = moved as f32;
+            self.scatter = scatter as f32;
         }
-        if total > 0.0 {
-            let mean = first / total;
-            self.first = mean;
-            self.second = (second - first * mean).max(0.0);
+    }
+
+    /// How many of `samples` are in the running figures: all but the
+    /// brightest, when there is one.
+    fn others(&self, samples: u16) -> u16 {
+        if self.brightest.is_finite() {
+            samples.saturating_sub(1)
         } else {
-            self.first = 0.0;
-            self.second = 0.0;
+            samples
         }
-        self.total = total;
-        others
     }
 }
 
@@ -769,13 +793,14 @@ impl Evidence {
             .collect()
     }
 
-    /// Sets every position's brightest sample aside, once, before the second
-    /// pass judges anything against it.
+    /// Turns each position's count of samples into its count of the others,
+    /// the brightest having been held aside all along, before the second pass
+    /// judges anything against them.
     fn set_brightest_aside(&mut self) {
         self.records
-            .par_iter_mut()
+            .par_iter()
             .zip(self.samples.par_iter_mut())
-            .for_each(|(record, samples)| *samples = record.set_brightest_aside(*samples));
+            .for_each(|(record, samples)| *samples = record.others(*samples));
     }
 
     /// Whether `value`, from a frame whose samples count for `inverse`, is out
@@ -803,24 +828,32 @@ impl Evidence {
 
         // The record already leaves the brightest out. When this sample is the
         // brightest, that is exactly the others; otherwise it comes out too.
+        let (mean, spread, total) = (
+            f64::from(record.mean),
+            f64::from(record.scatter),
+            f64::from(record.total),
+        );
         let others = usize::from(self.samples[slot]);
         let (others, left) = if is_brightest {
-            (others, record.total)
+            (others, total)
         } else {
-            (others.saturating_sub(1), record.total - inverse)
+            (others.saturating_sub(1), total - inverse)
         };
         if others < MINIMUM_OTHERS || left <= 0.0 {
             return false;
         }
 
-        let difference = value - record.first;
-        let mut scatter = record.second * left;
+        // Taking this sample back out of the others is the one subtraction
+        // left, and it is a small one unless this sample is far out — in
+        // which case the answer is plain whatever it is off by.
+        let difference = value - mean;
+        let mut scatter = spread * left;
         if !is_brightest {
-            scatter -= inverse * record.total * difference * difference;
+            scatter -= inverse * total * difference * difference;
         }
         // Distance and scatter both scaled by what the others count for, which
         // is what leaves the comparison free of divisions.
-        let distance = record.total * difference;
+        let distance = total * difference;
         #[allow(clippy::cast_precision_loss)]
         let freedom = (others - 1) as f64;
         let allowed = critical.get(others - 1).copied().unwrap_or(f64::INFINITY);
@@ -1044,7 +1077,19 @@ pub struct Stack {
     width: usize,
     height: usize,
     channels: usize,
-    total: Vec<f64>,
+    /// The weighted sum of what each pixel has received, above the pedestal.
+    ///
+    /// Single precision, which halves what the largest figure of a plain stack
+    /// costs. Summed as they are, five hundred frames of a sky at thirty
+    /// thousand counts reach tens of millions, where single precision resolves
+    /// only a couple of counts, and the average came out a fourteenth of its
+    /// own noise wrong. Summed above the sky, they stay small where the sky is
+    /// and lose nothing that matters where a star is. A test holds five hundred
+    /// frames to a hundredth of the noise of their average.
+    total: Vec<f32>,
+    /// A level near each channel's sky, taken from the first frame, which the
+    /// totals are summed above. Empty until then.
+    pedestal: Vec<f64>,
     /// Total weight each pixel has received, which is the count when every
     /// frame counts for one.
     counted: Vec<f32>,
@@ -1083,9 +1128,10 @@ impl Stack {
             width,
             height,
             channels,
-            total: vec![0.0; samples],
+            total: vec![0.0f32; samples],
             counted: vec![0.0; samples],
             evidence: None,
+            pedestal: Vec::new(),
             frames: 0,
         }
     }
@@ -1101,7 +1147,15 @@ impl Stack {
 
     /// Whether a frame is the shape of this stack.
     fn fits(&self, image: &FitsImage) -> bool {
-        image.width == self.width && image.height == self.height && image.channels == self.channels
+        image.channels == self.channels && self.fits_from(image, 0)
+    }
+
+    /// Whether a frame is this stack's size, with channels enough from `first`
+    /// on to fill it.
+    fn fits_from(&self, image: &FitsImage, first: usize) -> bool {
+        image.width == self.width
+            && image.height == self.height
+            && first + self.channels <= image.channels
     }
 
     /// Turns a first pass into the second one that does the rejecting.
@@ -1154,7 +1208,22 @@ impl Stack {
     /// the stack — a different sensor, or a different binning, has no business
     /// in it.
     pub fn add(&mut self, image: &FitsImage, alignment: Alignment) -> bool {
-        if !self.fits(image) {
+        self.fits(image) && self.add_channels(image, 0, alignment)
+    }
+
+    /// Adds the channels of a frame from `first` on, as many as the stack
+    /// holds.
+    ///
+    /// For stacking a colour frame a colour at a time, which needs a third of
+    /// the memory: a stack of one channel takes the frame's red, then another
+    /// its green, and so on, each read straight from the frame. Every figure is
+    /// worked out exactly as it is when all three go in together, so the
+    /// result is the same to the bit.
+    ///
+    /// Returns false, and adds nothing, if the frame is not the stack's size
+    /// or has too few channels.
+    pub fn add_channels(&mut self, image: &FitsImage, first: usize, alignment: Alignment) -> bool {
+        if !self.fits_from(image, first) {
             return false;
         }
         let (width, height) = (self.width, self.height);
@@ -1162,12 +1231,30 @@ impl Stack {
         // Measured only when it will be used — to judge the frame, or to tell
         // a ring from the noise when it is resampled — since it is a pass over
         // the frame.
-        let noise =
-            (self.evidence.is_some() || needs_resampling(alignment)).then(|| channel_noise(image));
+        let noise = (self.evidence.is_some() || needs_resampling(alignment)).then(|| {
+            (0..self.channels)
+                .map(|channel| channel_noise_of(image, first + channel))
+                .collect::<Vec<_>>()
+        });
+
+        if self.pedestal.is_empty() {
+            // Brought to the level the frame is added at, as every later frame
+            // is brought to it too.
+            self.pedestal = (0..self.channels)
+                .map(|channel| {
+                    let from = (first + channel) * pixels;
+                    level_of(&image.data[from..from + pixels]) + alignment.offset
+                })
+                .collect();
+        }
 
         for channel in 0..self.channels {
+            // Where the channel goes in the stack, and where it comes from in
+            // the frame.
             let plane = channel * pixels;
-            let source = &image.data[plane..plane + pixels];
+            let from = (first + channel) * pixels;
+            let source = &image.data[from..from + pixels];
+            let pedestal = self.pedestal[channel];
             let placement = Placement::new(
                 source,
                 width,
@@ -1186,7 +1273,10 @@ impl Stack {
                     rows.into_par_iter().enumerate().for_each(
                         |(y, ((total, counted), (records, samples)))| {
                             placement.each_in_row(y, |x, value, quietened| {
-                                total[x] += value * alignment.weight;
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    total[x] += ((value - pedestal) * alignment.weight) as f32;
+                                }
                                 #[allow(clippy::cast_possible_truncation)]
                                 {
                                     counted[x] += alignment.weight as f32;
@@ -1202,7 +1292,10 @@ impl Stack {
                         .enumerate()
                         .for_each(|(y, (total, counted))| {
                             placement.each_in_row(y, |x, value, _| {
-                                total[x] += value * alignment.weight;
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    total[x] += ((value - pedestal) * alignment.weight) as f32;
+                                }
                                 #[allow(clippy::cast_possible_truncation)]
                                 {
                                     counted[x] += alignment.weight as f32;
@@ -1223,17 +1316,20 @@ impl Stack {
     /// and writing zero would put a black border into the result.
     #[must_use]
     pub fn finish(&self, header: FitsHeader) -> FitsImage {
+        let pixels = self.width * self.height;
         let data: Vec<f32> = self
             .total
             .par_iter()
             .zip(&self.counted)
-            .map(|(total, count)| {
+            .enumerate()
+            .map(|(i, (total, count))| {
                 if *count <= 0.0 {
                     f32::NAN
                 } else {
+                    let pedestal = self.pedestal.get(i / pixels).copied().unwrap_or(0.0);
                     #[allow(clippy::cast_possible_truncation)]
                     {
-                        (total / f64::from(*count)) as f32
+                        (pedestal + f64::from(*total) / f64::from(*count)) as f32
                     }
                 }
             })
@@ -1250,6 +1346,26 @@ impl Stack {
             max,
         }
     }
+}
+
+/// A level near a plane's sky: the median of an even sample of it.
+///
+/// It need not be the sky exactly — any level near it keeps the totals small —
+/// so a hundred thousand samples are plenty.
+fn level_of(plane: &[f32]) -> f64 {
+    let step = (plane.len() / 100_000).max(1);
+    let mut sample: Vec<f32> = plane
+        .iter()
+        .step_by(step)
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    if sample.is_empty() {
+        return 0.0;
+    }
+    let middle = sample.len() / 2;
+    let (_, level, _) = sample.select_nth_unstable_by(middle, f32::total_cmp);
+    f64::from(*level)
 }
 
 /// Each channel's noise, as a standard deviation in counts.
@@ -1270,40 +1386,44 @@ impl Stack {
 /// and a half.
 #[must_use]
 pub fn channel_noise(image: &FitsImage) -> Vec<f64> {
+    (0..image.channels)
+        .map(|channel| channel_noise_of(image, channel))
+        .collect()
+}
+
+/// One channel's noise, as [`channel_noise`] measures it.
+#[must_use]
+pub fn channel_noise_of(image: &FitsImage, channel: usize) -> f64 {
     let (width, height) = (image.width, image.height);
     let pixels = width * height;
-    if width < 5 || height == 0 {
-        return vec![0.0; image.channels];
+    if width < 5 || height == 0 || channel >= image.channels {
+        return 0.0;
     }
     let rows = (NOISE_SAMPLES / (width - 4)).clamp(1, height);
     let stride = (height / rows).max(1);
 
-    (0..image.channels)
-        .map(|channel| {
-            let plane = &image.data[channel * pixels..(channel + 1) * pixels];
-            let mut differences: Vec<f32> = (0..height)
-                .step_by(stride)
-                .flat_map(|y| {
-                    let row = &plane[y * width..(y + 1) * width];
-                    row.iter()
-                        .zip(&row[2..])
-                        .zip(&row[4..])
-                        .filter_map(|((a, b), c)| {
-                            let curve = a - 2.0 * b + c;
-                            curve.is_finite().then_some(curve.abs())
-                        })
+    let plane = &image.data[channel * pixels..(channel + 1) * pixels];
+    let mut differences: Vec<f32> = (0..height)
+        .step_by(stride)
+        .flat_map(|y| {
+            let row = &plane[y * width..(y + 1) * width];
+            row.iter()
+                .zip(&row[2..])
+                .zip(&row[4..])
+                .filter_map(|((a, b), c)| {
+                    let curve = a - 2.0 * b + c;
+                    curve.is_finite().then_some(curve.abs())
                 })
-                .collect();
-            if differences.is_empty() {
-                return 0.0;
-            }
-            let middle = differences.len() / 2;
-            let (_, median, _) = differences.select_nth_unstable_by(middle, f32::total_cmp);
-            // The median absolute difference as a standard deviation, and a
-            // second difference, whose variance is six samples', as one.
-            f64::from(*median) * 1.482_602_218_505_602 / 6.0_f64.sqrt()
         })
-        .collect()
+        .collect();
+    if differences.is_empty() {
+        return 0.0;
+    }
+    let middle = differences.len() / 2;
+    let (_, median, _) = differences.select_nth_unstable_by(middle, f32::total_cmp);
+    // The median absolute difference as a standard deviation, and a
+    // second difference, whose variance is six samples', as one.
+    f64::from(*median) * 1.482_602_218_505_602 / 6.0_f64.sqrt()
 }
 
 /// The chance of ordinary Gaussian noise landing further than `deviations`
@@ -2390,6 +2510,248 @@ mod tests {
             (both / one - 1.0).abs() < 0.03,
             "one frame {one:.3}, both {both:.3}"
         );
+    }
+
+    #[test]
+    fn a_record_s_figures_match_double_precision_on_a_bright_sky() {
+        // Where single precision is weakest: large values that barely differ.
+        // The sums these figures replaced lost the scatter entirely here.
+        let mut rng = crate::testutil::Prng::new(77);
+        let values: Vec<(f64, f64)> = (0..300)
+            .map(|i| {
+                let noise = 2.0 + f64::from(i % 5);
+                (
+                    50_000.0 + noise * rng.next_gaussian(),
+                    1.0 / (noise * noise),
+                )
+            })
+            .collect();
+        let mut record = Record::EMPTY;
+        let mut samples = 0u16;
+        for (value, inverse) in &values {
+            record.take(&mut samples, *value, *inverse);
+        }
+
+        // The same, the long way, in double precision, without the brightest.
+        let top = values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| (a.1 .0 as f32).total_cmp(&(b.1 .0 as f32)))
+            .map(|(i, _)| i)
+            .unwrap();
+        let rest: Vec<&(f64, f64)> = values
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != top)
+            .map(|(_, v)| v)
+            .collect();
+        let total: f64 = rest.iter().map(|(_, w)| w).sum();
+        let mean = rest.iter().map(|(v, w)| v * w).sum::<f64>() / total;
+        let scatter: f64 = rest.iter().map(|(v, w)| w * (v - mean).powi(2)).sum();
+
+        assert_eq!(record.others(samples), 299);
+        assert!((f64::from(record.total) - total).abs() < total * 1e-6);
+        // The mean is stored to about a four-thousandth of a count at this sky,
+        // and three hundred updates each round it: it drifts by hundredths.
+        // It is only ever compared with a sample, against an allowance of
+        // several deviations of the noise, so what matters is that it is well
+        // inside the quietest frame's noise — a fiftieth of it here.
+        assert!(
+            (f64::from(record.mean) - mean).abs() < 2.0 / 50.0,
+            "{} against {mean}",
+            record.mean
+        );
+        assert!(
+            (f64::from(record.scatter) - scatter).abs() < scatter * 1e-3,
+            "scatter {} against {scatter}",
+            record.scatter
+        );
+    }
+
+    #[test]
+    fn a_bright_sky_over_many_frames_still_loses_only_what_chance_says() {
+        let (w, h) = (120usize, 120usize);
+        let frames: Vec<FitsImage> = (0..60u64)
+            .map(|i| {
+                sky_frame_with((w, h), 50_000.0, 3.0, 800 + i, |p| {
+                    if i == 17 {
+                        for x in 10..110 {
+                            p[60 * w + x] += 400.0;
+                        }
+                    }
+                })
+            })
+            .collect();
+        let (stacked, lost) = two_passes(&frames, &[Alignment::still(); 60]);
+        let quiet: usize = lost
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 17)
+            .map(|(_, n)| n)
+            .sum();
+        #[allow(clippy::cast_precision_loss)]
+        let share = 100.0 * quiet as f64 / (59 * w * h) as f64;
+        assert!(
+            (0.1..0.8).contains(&share),
+            "{share:.3}% of pure noise rejected"
+        );
+        let excess = row_excess(&stacked, 60, 10..110, 50_000.0);
+        assert!(excess.abs() < 1.0, "the trail lifts the row by {excess:.2}");
+    }
+
+    #[test]
+    fn five_hundred_frames_add_up_as_they_would_in_double_precision() {
+        // The totals are single precision now. Five hundred frames of a bright
+        // sky at weights from a third to three is more than any night gives.
+        let (w, h) = (40usize, 40usize);
+        let mut stack = Stack::new(w, h, 1);
+        let mut sums = vec![0.0f64; w * h];
+        let mut weights = vec![0.0f64; w * h];
+        for i in 0..500u64 {
+            let image = sky_frame(w, h, 30_000.0, 20.0, 2_000 + i);
+            #[allow(clippy::cast_precision_loss)]
+            let weight = 0.33 + (i % 9) as f64 / 3.0;
+            assert!(stack.add(
+                &image,
+                Alignment {
+                    weight,
+                    ..Alignment::still()
+                }
+            ));
+            for (k, v) in image.data.iter().enumerate() {
+                sums[k] += f64::from(*v) * weight;
+                weights[k] += weight;
+            }
+        }
+        let stacked = stack.finish(FitsHeader { cards: Vec::new() });
+        let worst = stacked
+            .data
+            .iter()
+            .zip(sums.iter().zip(&weights))
+            .map(|(v, (sum, weight))| (f64::from(*v) - sum / weight).abs())
+            .fold(0.0, f64::max);
+        // The average of five hundred frames of noise twenty is about 0.9 off
+        // the truth, so a hundredth of that is far below anything visible.
+        assert!(worst < 0.009, "{worst} from the double-precision average");
+    }
+
+    /// Colour frames for stacking a colour at a time against all at once:
+    /// each channel its own sky and noise, one frame crossed by a satellite in
+    /// one channel only, with the placings nearly every real frame has.
+    fn colour_night() -> (Vec<FitsImage>, Vec<Alignment>) {
+        let (w, h) = (60usize, 50usize);
+        let frames = (0..7u64)
+            .map(|i| {
+                let mut pixels = Vec::with_capacity(w * h * 3);
+                for (c, (sky, noise)) in [(900.0, 12.0), (1400.0, 9.0), (700.0, 15.0)]
+                    .iter()
+                    .enumerate()
+                {
+                    let mut plane = gaussian_background(w, h, *sky, *noise, 60 + i * 3 + c as u64);
+                    if i == 3 && c == 1 {
+                        for x in 5..55 {
+                            plane[25 * w + x] += 9_000.0;
+                        }
+                    }
+                    pixels.extend(plane);
+                }
+                let spec = SyntheticSpec::new(w, h, -32).with_channels(3);
+                read_fits_from_bytes(&synthetic_fits(&spec, &pixels).unwrap()).unwrap()
+            })
+            .collect();
+        let placings = (0..7)
+            .map(|i| match i {
+                0 => Alignment::still(),
+                5 => Alignment {
+                    dx: 0.4,
+                    dy: -0.2,
+                    turned: true,
+                    rotation: 0.002,
+                    ..Alignment::still()
+                },
+                _ => Alignment {
+                    dx: 0.3 * f64::from(i),
+                    dy: -0.25,
+                    rotation: 1e-5,
+                    offset: 3.0,
+                    weight: 0.5 + f64::from(i) / 4.0,
+                    ..Alignment::still()
+                },
+            })
+            .collect();
+        (frames, placings)
+    }
+
+    #[test]
+    fn a_colour_at_a_time_stacks_to_the_same_bits_as_all_at_once() {
+        // The memory-saving way must not be a different stack.
+        let (frames, placings) = colour_night();
+        let (w, h) = (frames[0].width, frames[0].height);
+        for reject in [false, true] {
+            let together = |channels: usize, first: usize| {
+                let mut stack = if reject {
+                    Stack::rejecting(w, h, channels)
+                } else {
+                    Stack::new(w, h, channels)
+                };
+                for (image, placing) in frames.iter().zip(&placings) {
+                    assert!(stack.add_channels(image, first, *placing));
+                }
+                if !reject {
+                    return (stack.finish(FitsHeader::default()).data, 0);
+                }
+                let mut second = stack.into_rejecting(DEFAULT_CLIP).expect("seven frames");
+                for (image, placing) in frames.iter().zip(&placings) {
+                    assert!(second.add_channels(image, first, *placing));
+                }
+                (second.finish(FitsHeader::default()).data, second.rejected())
+            };
+
+            let (all, rejected_all) = together(3, 0);
+            let mut apart = Vec::new();
+            let mut rejected_apart = 0;
+            for channel in 0..3 {
+                let (data, rejected) = together(1, channel);
+                apart.extend(data);
+                rejected_apart += rejected;
+            }
+
+            let bits = |data: &[f32]| data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert!(
+                bits(&all) == bits(&apart),
+                "rejecting {reject}: the stacks differ"
+            );
+            assert_eq!(rejected_all, rejected_apart, "rejecting {reject}");
+            if reject {
+                assert!(
+                    rejected_all >= 40,
+                    "the satellite should have gone: {rejected_all}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_of_a_frame_must_be_there_to_be_added() {
+        let (frames, _) = colour_night();
+        let (w, h) = (frames[0].width, frames[0].height);
+        let mut one = Stack::new(w, h, 1);
+        assert!(one.add_channels(&frames[0], 2, Alignment::still()));
+        assert!(
+            !one.add_channels(&frames[0], 3, Alignment::still()),
+            "no fourth channel"
+        );
+        let mut two = Stack::new(w, h, 2);
+        assert!(
+            !two.add_channels(&frames[0], 2, Alignment::still()),
+            "only one left"
+        );
+        assert!(
+            !two.add(&frames[0], Alignment::still()),
+            "a whole frame is three"
+        );
+        let mut wrong = Stack::new(w + 1, h, 1);
+        assert!(!wrong.add_channels(&frames[0], 0, Alignment::still()));
     }
 
     #[test]

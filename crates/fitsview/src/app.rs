@@ -568,6 +568,9 @@ pub struct Model {
     calibrated: Cache,
     /// Notices frames added to the open folder while it is open.
     watcher: Option<Watcher>,
+    /// The room a stack is given, in bytes, in place of asking the system.
+    /// For tests, which need to see what happens on a machine they are not.
+    pub stack_room: Option<u64>,
     /// How often it looks. A field rather than a constant so that tests do not
     /// wait seconds for it.
     pub watch_interval: std::time::Duration,
@@ -658,6 +661,7 @@ impl Model {
             job: None,
             calibrated: Cache::new(CALIBRATED_CACHE_ENTRIES, CALIBRATED_CACHE_BYTES),
             watcher: None,
+            stack_room: None,
             watch_interval: watch::INTERVAL,
             fresh: HashSet::new(),
             measuring_fresh: HashSet::new(),
@@ -1252,14 +1256,23 @@ impl Model {
         }
 
         let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
+        // What the viewer holds stays while the stack runs, so it comes out of
+        // the room the stack has.
+        let held = (self.loader.cache().bytes() + self.calibrated.bytes()) as u64;
+        let room = self
+            .stack_room
+            .unwrap_or_else(|| crate::memory::room(crate::memory::Memory::now(), held));
         self.job = Some(Job::stack(
             paths,
-            self.calibration.dark.clone(),
-            self.calibration.flat.clone(),
-            self.bayer.active(),
-            self.star_params,
-            self.reject_outliers,
-            self.weight_frames,
+            jobs::StackRecipe {
+                dark: self.calibration.dark.clone(),
+                flat: self.calibration.flat.clone(),
+                pattern: self.bayer.active(),
+                params: self.star_params,
+                reject: self.reject_outliers,
+                weighted: self.weight_frames,
+                room: Some(room),
+            },
         ));
     }
 
@@ -1406,8 +1419,8 @@ impl Model {
                     stacks,
                     unaligned,
                     rejected,
+                    colour_at_a_time,
                 }) => {
-                    let _ = rejected;
                     self.toast = Some(Toast::new(match stacks.len() {
                         0 => "Nothing could be stacked".to_string(),
                         _ => {
@@ -1418,6 +1431,9 @@ impl Model {
                             }
                             if rejected > 0 {
                                 skipped.push_str(&format!(", {rejected} samples rejected"));
+                            }
+                            if colour_at_a_time {
+                                skipped.push_str(", a colour at a time to fit in memory");
                             }
                             format!(
                                 "Stacked {frames} frames into {} file{}{skipped}",
@@ -4695,6 +4711,15 @@ mod tests {
 
     /// A folder of star fields, each shifted, tagged with a filter.
     fn stackable_folder(shifts: &[(f64, f64)], filters: &[&str]) -> TempDir {
+        stackable_folder_with(shifts, filters, &[])
+    }
+
+    /// The same, with further header cards on every frame.
+    fn stackable_folder_with(
+        shifts: &[(f64, f64)],
+        filters: &[&str],
+        cards: &[(&str, &str)],
+    ) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (160usize, 160usize);
         let places = [
@@ -4722,9 +4747,12 @@ mod tests {
                     }
                 }
             }
-            let spec = SyntheticSpec::new(w, h, -32)
+            let mut spec = SyntheticSpec::new(w, h, -32)
                 .with_card("FILTER", &format!("'{filter}'"))
                 .with_card("PIERSIDE", "'East'");
+            for (key, value) in cards {
+                spec = spec.with_card(key, value);
+            }
             write_synthetic(dir.path(), &format!("f{index}.fits"), &spec, &pixels).unwrap();
         }
         dir
@@ -4738,6 +4766,77 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(model.job.is_none(), "the job never finished");
+    }
+
+    /// Stacks `dir` with rejection, given `room` bytes, and returns the stack
+    /// it wrote, what it said, and what the file records of it.
+    fn stack_within(dir: &Path, room: u64) -> (Vec<u32>, String, String) {
+        let (mut m, _spy) = model_over(dir);
+        assert!(
+            m.bayer.active().is_some(),
+            "the frames should read as colour"
+        );
+        assert!(m.reject_outliers);
+        m.stack_room = Some(room);
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let path = dir.join("stack_L.fits");
+        let stacked = fits_core::read_fits(&path).unwrap();
+        assert_eq!(stacked.channels, 3);
+        let history = std::fs::read(&path).unwrap();
+        let history = String::from_utf8_lossy(&history[..2880 * 4]).into_owned();
+        std::fs::remove_file(&path).unwrap();
+        let said = m.toast.map(|t| t.text).unwrap_or_default();
+        (
+            stacked.data.iter().map(|v| v.to_bits()).collect(),
+            said,
+            history,
+        )
+    }
+
+    #[test]
+    fn short_of_memory_a_colour_stack_is_made_a_colour_at_a_time_and_is_the_same() {
+        let dir = stackable_folder_with(
+            &[
+                (0.0, 0.0),
+                (5.3, -3.1),
+                (-4.2, 6.4),
+                (3.6, 2.2),
+                (-2.5, -4.7),
+                (1.4, 3.3),
+            ],
+            &["L"; 6],
+            &[("BAYERPAT", "'RGGB'")],
+        );
+        let (together, said_together, history_together) = stack_within(dir.path(), u64::MAX);
+        let (apart, said_apart, history_apart) = stack_within(dir.path(), 0);
+
+        assert!(together == apart, "the two stacks differ");
+        assert!(
+            !said_together.contains("colour at a time"),
+            "{said_together}"
+        );
+        assert!(
+            said_apart.contains("a colour at a time to fit in memory"),
+            "{said_apart}"
+        );
+        assert!(!history_together.contains("a colour at a time"));
+        assert!(
+            history_apart.contains("a colour at a time"),
+            "the file should say how"
+        );
+    }
+
+    #[test]
+    fn a_mono_stack_is_never_split_however_short_the_memory() {
+        let dir = stackable_folder(&[(0.0, 0.0), (5.0, -3.0), (-4.0, 6.0)], &["L"; 3]);
+        let (mut m, _spy) = model_over(dir.path());
+        m.stack_room = Some(0);
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let said = m.toast.map(|t| t.text).unwrap_or_default();
+        assert!(said.starts_with("Stacked 3 frames"), "{said}");
+        assert!(!said.contains("colour at a time"), "{said}");
     }
 
     #[test]

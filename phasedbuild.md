@@ -254,6 +254,7 @@ it silently pick old releases rather than reporting a conflict. Raise
 | `rfd` | 0.17 | fitsview | Native open-file / open-folder / message dialogs on all three OSes. | Wraps OS APIs. | `native-dialog` (fewer features). |
 | `trash` | 5 | fitsview | Move files to OS trash / recycle bin; restore where supported. | Wraps OS APIs. | `std::fs::remove_file` — rejected: permanent deletion. |
 | `serde` + `serde_json` | 1 | fitsview | Read/write `.fitsview.json` sidecar (flags, calibration paths) and `.fitsview-measurements.json` (Phase 18; `float_roundtrip` on, so figures read back exactly). | `forbid(unsafe_code)` in serde_json. | Hand-rolled JSON — rejected. |
+| `sysinfo` | 0.39 | fitsview | How much memory the machine has and has free, to decide whether a colour stack fits all at once (Phase 23). Only the `system` feature. It sets the minimum Rust at 1.95. | The platform calls are `unsafe`, kept inside the crate; fitsview's own code stays `forbid(unsafe_code)`. | Reading `/proc/meminfo` and running `sysctl` — covers two systems of three, and Windows has no safe way in the standard library. |
 | `natord` | 1.0 | fitsview | Natural sort (`light_2` before `light_10`). Tiny, no deps. | Pure safe Rust. | Hand-written comparator (fine too). |
 | `thiserror` | 2 | fits-core | Typed error enums. | Proc-macro, safe. | — |
 | `anyhow` | 1 | fitsview | Error propagation in the app. | Safe. | — |
@@ -347,7 +348,7 @@ with the graphics stack.
 
 | Concern | Choice | Why |
 |---------|--------|-----|
-| Language | Rust, stable toolchain, edition 2021, minimum 1.92 | Minimum set by `egui` 0.35. |
+| Language | Rust, stable toolchain, edition 2021, minimum 1.95 | Minimum set by `sysinfo` 0.39 (Phase 23); `egui` 0.35 needs 1.92. |
 | `unsafe` | Forbidden in our crates (`#![forbid(unsafe_code)]`) | Rule 1.1. |
 | GUI framework | [`egui`](https://crates.io/crates/egui) via [`eframe`](https://crates.io/crates/eframe) | Pure Rust, immediate-mode, one codebase for Linux/macOS/Windows, GPU-backed via `wgpu`, very fast to iterate on. |
 | FITS parsing | **Custom minimal reader** (see Phase 1) | Existing crates (`fitsio` needs a C library `cfitsio`; `fitrs` is unmaintained). A hand-written reader for the image subset of FITS is ~300 lines, has no C dependency, no `unsafe`, and is the fastest option. |
@@ -3496,6 +3497,104 @@ It now costs 0.39 s, four per cent of the stack. Removing it means placing the
 raw mosaic rather than the colour frame, and so judging each sample's noise
 before colour reconstruction has quietened it — a change to how rejection
 works, for four per cent. Not worth it yet.
+
+---
+
+## Phase 23 — A Stack That Fits in Memory
+
+Ten 61-megapixel colour frames stacked with rejection peaked at 11.5 GB. It does
+not grow with the number of frames, but it is already more than a 16 GB machine
+with anything else open can give without swapping, and far more than an 8 GB
+one has.
+
+### Where it went
+
+Measured at each stage of a stack, rather than worked out:
+
+| | |
+|---|---|
+| Rejection records, 34 bytes a sample | 6.2 GB |
+| Running totals, 12 bytes a sample | 2.2 GB |
+| The frame being worked on — raw, in colour, half placed | ~1.5 GB |
+| The viewer's own images: the frame on screen and a neighbour | 1.2 GB |
+
+### What changed
+
+**The rejection records are single precision.** They were sums of each sample
+and of its square, from which the brightest was subtracted and the scatter
+found as the small difference of two large numbers — which is what needed
+double precision. Two changes remove every subtraction of that kind:
+
+- The brightest sample, which is set aside to judge the others by anyway, is
+  **held apart from the start**. When a brighter one arrives, the old brightest
+  joins the rest. Nothing is ever taken back out.
+- The rest are kept as **a running mean and the scatter about it**, updated a
+  sample at a time as Welford gave, rather than as sums.
+
+A record is twenty bytes instead of thirty-two. Its figures match a
+double-precision calculation over three hundred samples of a sky at 50,000
+counts: the scatter to a thousandth, the mean to a fiftieth of the quietest
+frame's noise, which is all a comparison with a sample needs. Sixty frames of
+that sky still lose only what chance says.
+
+**The totals are single precision, summed above the sky.** Summed as they are,
+five hundred frames of a sky at 30,000 counts reach tens of millions, where
+single precision resolves two counts, and the average came out a fourteenth of
+its own noise wrong. Each channel's sky, taken from the first frame, is now
+subtracted before summing and added back at the end: the totals stay small where
+the sky is, and a star keeps a relative precision far beyond anything visible.
+Five hundred frames now land within a hundredth of their noise of the
+double-precision average.
+
+### What it measures
+
+| Ten 61-megapixel colour frames, with rejection | 0.1.9 | Now |
+|---|---|---|
+| Peak memory | 11.47 GB | **8.53 GB** |
+| Time | 10.8–11.2 s | 10.6–11.6 s |
+| Samples rejected | 9,418,933 | 9,418,932 |
+| Star width, roundness, background noise | | unchanged |
+
+### A colour at a time, when memory is short
+
+The stack's own figures were still 5.5 GB of the 8.5. Stacking red, then green,
+then blue takes them to 1.8 GB, but reads every frame three times as often,
+which costs little from an internal disk and seconds a frame from a slow
+external one. So it is done only when all at once would not fit.
+
+**What fits** is half the machine's memory and four fifths of what the system
+says is free, less what the viewer already holds. Half, because macOS reports
+far more free than it can give without compressing and swapping — 60 GB free
+on a 68 GB machine using 42 GB and 12 GB of swap — and the free figure too,
+because on a busy Linux or Windows machine half of everything may already be
+spoken for. A stack is reckoned at 30 bytes a sample for its figures and 32 a
+pixel for the frame being worked on, which matches the 7.46 GB measured for the
+Barnard's Loop night stand-alone. A 16 GB machine splits that stack; a 32 GB
+one does not. Asking the system is the one thing the standard library cannot do
+on every platform, so it goes through `sysinfo`. Its current release needs
+Rust 1.95, and the minimum was raised from 1.92 to match rather than holding it
+at an older release.
+
+The frames are lined up once, in the first colour's first pass; each further
+colour reads them again and adds its channel where they were put. A stack can
+now take some of a frame's channels, straight from the frame, and every figure
+is worked out exactly as when all three go in together: **the result is the same
+to the bit**, which a test holds on colour frames with fractional shifts, a turn,
+a meridian flip and a satellite in one colour, with rejection and without.
+
+| Ten 61-megapixel colour frames, with rejection | All at once | A colour at a time |
+|---|---|---|
+| Peak memory, viewer included | 9.27 GB | **5.47 GB** |
+| Time, files already in memory | 11.2 s | 14.4 s |
+| Values that differ | | **none of 183,514,464** |
+
+The message at the end of a stack says when it was split, and so does the
+file's history.
+
+### Not done
+
+- **The viewer's images** stay while a stack runs. Only the prefetched
+  neighbour could go without blanking the screen, a quarter of a gigabyte.
 
 ---
 

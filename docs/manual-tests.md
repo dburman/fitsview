@@ -504,3 +504,12 @@ one at a time does nearly as well.
 - [ ] Zoomed in on the brightest stars, there is no dark ring around them.
 - [ ] A night that crosses the meridian stacks with its stars single and round
       right to the corners.
+
+## Stacking when memory is short
+
+- [ ] On a 16 GB machine, stack a night of full-frame colour frames with
+      rejection: the message at the end says it went a colour at a time, and
+      the machine does not grind to a halt swapping.
+- [ ] On a 32 GB or larger machine the same stack says nothing of colours.
+- [ ] A mono night is never split, whatever the machine.
+- [ ] The two stacks of the same night, split and not, look the same.
