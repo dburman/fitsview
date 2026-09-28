@@ -1,10 +1,37 @@
 # fitsview
 
-A fast desktop viewer for the FITS images astrophotography produces. Written in
-Rust, it runs on Linux, macOS and Windows, and it is built for the job that
-follows a night's capture: going through a folder of frames, throwing out the
-ones ruined by cloud or tracking, calibrating the rest, and seeing what you
-actually caught.
+**A fast app for going through a night of telescope photos, keeping the good
+ones, and combining them into one clean picture.**
+
+Photographing galaxies and nebulae means taking dozens or hundreds of long
+exposures of the same patch of sky and combining them afterwards, because any
+single one is too faint and too grainy. Astronomy cameras save each exposure as
+a **FITS** file, the standard format for scientific images, which ordinary photo
+apps cannot open.
+
+fitsview is for what comes after, or during, a night at the telescope:
+
+- **See every frame.** Open a folder and step through it with the arrow keys,
+  each frame brightened so the faint detail shows.
+- **Find the bad ones.** Cloud, a gust of wind, focus drifting as the night
+  cools, a satellite streaking through: fitsview measures how bright the sky
+  was and how sharp and round the stars are in every frame, and points out the
+  ones that stand out, so throwing them away takes seconds rather than an
+  evening.
+- **Correct them.** Subtract dark frames and divide by flat frames, the
+  standard corrections for sensor noise, uneven brightness and dust.
+- **Stack them.** Line the frames up by their stars and combine them into one
+  image with far less grain, leaving out satellite trails and cosmic ray hits.
+- **Follow a session as it happens.** Leave a folder open while the camera
+  works, and each new frame appears, is measured, and is flagged if something
+  has gone wrong while there is still time to fix it.
+
+It is not a photo editor. When you want to bring out colour and detail in the
+finished stack, open it in PixInsight, Siril or another processing tool;
+fitsview is the quick step before that.
+
+It runs on Macs with Apple silicon, Windows and Linux, is written in Rust, and
+is released under the [MIT License](LICENSE).
 
 ---
 
