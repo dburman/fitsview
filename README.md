@@ -422,3 +422,11 @@ on the FITS format, and the per-module test plan, is in
 It is worth reading before changing anything: several of the bugs found during
 development were subtle, silent, and are recorded there with the tests that now
 prevent them.
+
+---
+
+## Licence
+
+`fitsview` is released under the [MIT License](LICENSE): use it, change it and
+share it freely, keeping the copyright notice. The libraries it is built on
+carry their own permissive licences — MIT, Apache 2.0, BSD and the like.
