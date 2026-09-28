@@ -294,9 +294,10 @@ The workflow runs on every push. Four jobs: `checks` (format, lints, the unsafe
 guard), `test` (tests and a release build), `docs` (mermaid diagrams), and
 `msrv` (the declared minimum Rust version really builds).
 
-**Which platforms run when.** On a private repository, Actions minutes bill at
-2x for Windows and 10x for macOS, which made those two roughly 80% of the cost
-of every push. The full matrix therefore runs **only on `main`**. Branches and
+**Which platforms run when.** Written while the repository was private, when
+Actions minutes billed at 2x for Windows and 10x for macOS, which made those two
+roughly 80% of the cost of every push. The repository is public now, and public
+repositories are not billed for them. The full matrix therefore runs **only on `main`**. Branches and
 pull requests get Linux, which catches nearly everything. To run the full matrix
 on a branch:
 

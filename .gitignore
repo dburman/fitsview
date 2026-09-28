@@ -20,3 +20,6 @@ Cargo.lock.orig
 node_modules/
 package-lock.json
 package.json
+
+# Claude Code's local settings and skills
+.claude/

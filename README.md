@@ -31,7 +31,7 @@ finished stack, open it in PixInsight, Siril or another processing tool;
 fitsview is the quick step before that.
 
 It runs on Macs with Apple silicon, Windows and Linux, is written in Rust, and
-is released under the [MIT License](LICENSE).
+is free and open source under the [MIT License](LICENSE).
 
 ---
 
@@ -403,9 +403,9 @@ from:
 cargo bench --package fits-core --all-features
 ```
 
-Before pushing, run everything continuous integration runs, so a failure does
-not cost a round trip. See "Continuous integration" in
-[phasedbuild.md](phasedbuild.md) for why that matters on a private repository:
+Before pushing, run everything continuous integration runs, so a failure is
+found here rather than after a round trip. See "Continuous integration" in
+[phasedbuild.md](phasedbuild.md) for what that runs, and when:
 
 ```bash
 ./scripts/check.sh
