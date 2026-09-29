@@ -142,8 +142,8 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 787 automated tests, run on macOS and on Linux before every release; the
-Windows build is compiled on every check and tested by hand.
+by 787 automated tests, run on macOS, Linux and Windows on every change, and
+again on each system before its download is built.
 
 ---
 
