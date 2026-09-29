@@ -43,6 +43,8 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                         .id_salt("calibration")
                         .default_open(true)
                         .show(ui, |ui| {
+                            actions.extend(library_section(ui, model));
+                            ui.separator();
                             actions.extend(darks_section(ui, model));
                             ui.separator();
                             actions.extend(flats_section(ui, model));
@@ -71,6 +73,158 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
                 });
         });
 
+    actions
+}
+
+/// The calibration library: where it is, and what each filter of the open
+/// folder will get from it — said before stacking, so that a missing flat is
+/// seen before it costs a night's stack.
+fn library_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let busy = model.job.is_some();
+    let warn = ui.visuals().warn_fg_color;
+
+    ui.add_space(4.0);
+    ui.label(RichText::new("Library").strong());
+    let Some(root) = &model.library_root else {
+        ui.label(
+            RichText::new(
+                "Choose the folder holding your darks and flats, and the right ones \
+                 are found for each night from how it was taken.",
+            )
+            .weak()
+            .small(),
+        );
+        if ui
+            .add_enabled(!busy, Button::new("Choose library…"))
+            .clicked()
+        {
+            if let Some(path) = pick_folder("Choose the calibration library") {
+                actions.push(Action::SetLibrary(Some(path)));
+            }
+        }
+        return actions;
+    };
+
+    // The last two parts of the path say which library it is; the whole path
+    // is on hover.
+    let parts: Vec<String> = root
+        .components()
+        .rev()
+        .take(2)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let short: Vec<&str> = parts.iter().rev().map(String::as_str).collect();
+    ui.label(RichText::new(short.join("/")).small())
+        .on_hover_text(root.display().to_string());
+
+    let status = if !model.library_connected() {
+        RichText::new("Not found — is its drive connected?")
+            .color(warn)
+            .small()
+    } else if let Some(library) = &model.library {
+        let count = |kind| {
+            library
+                .library
+                .sets
+                .iter()
+                .filter(|s| s.taken.kind == kind)
+                .count()
+        };
+        use crate::library::Kind;
+        RichText::new(format!(
+            "{} dark, {} flat and {} bias sets",
+            count(Kind::Dark),
+            count(Kind::Flat),
+            count(Kind::Bias)
+        ))
+        .weak()
+        .small()
+    } else {
+        RichText::new("Reading…").weak().small()
+    };
+    ui.label(status);
+
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!busy, Button::new("Change…")).clicked() {
+            if let Some(path) = pick_folder("Choose the calibration library") {
+                actions.push(Action::SetLibrary(Some(path)));
+            }
+        }
+        if ui
+            .add_enabled(!busy, Button::new("Read again"))
+            .on_hover_text("For darks and flats added since")
+            .clicked()
+        {
+            actions.push(Action::RereadLibrary);
+        }
+        if ui.add_enabled(!busy, Button::new("Forget")).clicked() {
+            actions.push(Action::SetLibrary(None));
+        }
+    });
+
+    // What each filter of the open folder will get.
+    for (group, plan) in &model.library_plan {
+        ui.add_space(4.0);
+        let exposure = group
+            .taken
+            .exposure
+            .map_or_else(String::new, |e| format!(", {e:.0} s"));
+        ui.label(
+            RichText::new(format!(
+                "{}{exposure}, {} frames",
+                group.filter, group.frames
+            ))
+            .small()
+            .strong(),
+        );
+        let line = |ui: &mut Ui, what: &str, by_hand: bool, found: &Result<String, String>| match (
+            by_hand, found,
+        ) {
+            (true, _) => {
+                ui.label(
+                    RichText::new(format!("{what}: the master chosen by hand"))
+                        .weak()
+                        .small(),
+                );
+            }
+            (false, Ok(set)) => {
+                ui.label(RichText::new(format!("{what}: {set}")).weak().small());
+            }
+            (false, Err(why)) => {
+                ui.label(
+                    RichText::new(format!("No {}: {why}", what.to_lowercase()))
+                        .color(warn)
+                        .small(),
+                );
+            }
+        };
+        line(ui, "Dark", model.calibration.dark.is_some(), &plan.dark);
+        line(ui, "Flat", model.calibration.flat.is_some(), &plan.flat);
+        if group.mixed_exposures {
+            ui.label(
+                RichText::new(
+                    "Not all of these are the same exposure; one dark suits only one of them.",
+                )
+                .color(warn)
+                .small(),
+            );
+        }
+    }
+
+    if !model.calibration_report.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new("Last stack or export").small().strong());
+        for line in &model.calibration_report {
+            let lacking = line.contains("— no dark:") || line.contains("— no flat:");
+            let text = RichText::new(line).small();
+            ui.label(if lacking {
+                text.color(warn)
+            } else {
+                text.weak()
+            });
+        }
+    }
     actions
 }
 

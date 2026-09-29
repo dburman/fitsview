@@ -3599,6 +3599,118 @@ file's history.
 
 ---
 
+## Phase 24 — A Calibration Library
+
+Calibration was chosen by hand: build or load a master dark and flat and apply
+them. Forget, or choose one of the wrong exposure or temperature, and the stack
+carries vignetting, dust shadows or amplifier glow, and nothing says so. The
+L-Pro stack of the Barnard's Loop night had a gradient for exactly that reason:
+no flat had been applied.
+
+### What it does
+
+**Reads a library once.** Every FITS header under a folder, a few kilobytes
+each: 585 frames of a real library in 85 ms. Frames are gathered into sets
+taken the same way — folder, kind, camera, size, binning, gain, offset,
+exposure, cooler setting, and for flats the filter. Lights, and anything that
+does not say what it is, are passed over; so is anything hidden, which includes
+its own masters.
+
+**Matches each night.** For each filter of the lights being stacked or exported:
+
+- **A dark:** the same camera, size, binning, gain, offset and exposure, the
+  cooler within two degrees. Of those, the closest in temperature, then **the
+  most frames**, then the nearest in date. Frames before date: on the real
+  library the date-first rule picked a night's own five darks over forty taken
+  a day later, which is the wrong way round for a cooled sensor.
+- **A flat:** the same camera, size, binning and filter, **nearest in date**,
+  since dust moves. Gain, exposure and temperature do not matter to a flat —
+  that library's flats were taken with the cooler off, at +34 °C.
+- **Its dark:** a flat dark of its exposure, else a dark of it, else a bias.
+
+A miss says what was looked for and what there is instead: *no 180 s dark near
+−10 °C; the nearest was taken at −14 °C*, or *no darks at gain 100, offset 3*.
+Both are real: three Pleiades nights ran warmer than any dark, and one used a
+different offset.
+
+**Makes masters a frame at a time.** A set is combined by the stack's own
+outlier-rejecting average, reading each frame twice, rather than by holding
+every frame and taking the median:
+
+| 40 × 180 s darks | Median, all at once | A frame at a time |
+|---|---|---|
+| Peak memory | 10.7 GB | **2.4 GB** |
+| Time | 4.8 s | 8.0 s |
+| Noise in the master | 0.91 | **0.77** |
+
+The average sits about a count above the median: dark signal is skewed, and
+the lights carry its average, not its median. Flats have their dark taken off
+before they are normalised, by the same normalising the hand-built flats use.
+
+**Keeps them.** In `.fitsview-masters` inside the library, named for what each
+is and a fingerprint of every frame's path, size and time of change — and for a
+flat, of its dark's frames too. A set that gains, loses or changes a frame is
+made again. A library that cannot be written to still gets its masters.
+
+**Says so before the stack, and after it.** The Calibration panel lists each
+filter of the open folder with its dark and flat, or in warning colour why
+there is none, and how far a flat is from the night when it is more than a
+month. The message at the end of a stack counts what was missing; the lines
+stay in the panel; and each stack's and exported file's history names its dark
+and flat, or what was missing, in plain ASCII — a `HISTORY` card turns anything
+else into a question mark.
+
+**A master chosen by hand always wins**, dark and flat separately. A library on
+a drive that is not plugged in is said to be not found, not taken for one with
+nothing in it.
+
+### What it measured
+
+Ten L-Pro frames of the Barnard's Loop night, through the application, with a
+library of the real darks, flats and biases:
+
+| | Without the library | With it |
+|---|---|---|
+| Corners' sky below the centre's | 22–27 % | **9–15 %** |
+| Samples rejected as outliers | 16.5 M | **11.6 M** |
+| Time | 13.5 s | 48 s the first time, **14.1 s** after |
+
+The flat roughly halves the fall-off at the corners, and taking the dark off
+removes the hot pixels that rejection had been catching. What is left is not
+symmetrical, so it is not all vignetting: the only L-Pro flats were taken 103
+days before, and anything moved in the optical train since leaves them not
+quite matching, and some of it is the sky's own light-pollution gradient, which
+no flat can take out. Fresher flats would do more; the gradient of the sky needs
+background extraction.
+
+### Acceptance criteria
+
+- [x] Frame types are read however capture programs write them.
+- [x] The dark of the same exposure and temperature is chosen from near misses;
+      more frames beat a nearer date; a miss is explained.
+- [x] The flat through the same filter nearest in date is chosen; a miss names
+      the filters there are flats for.
+- [x] A flat's dark is a flat dark, then a dark, then a bias.
+- [x] A master keeps hot pixels and loses a cosmic ray, is kept, and is made
+      again when a frame changes.
+- [x] A master flat has its dark taken off before it is normalised.
+- [x] A stack through the application has the library's dark taken off and its
+      flat divided out, and says so in its history.
+- [x] A missing flat is said in the panel, the message and the file.
+- [x] A dark chosen by hand wins.
+- [x] A library that is not there is not taken for an empty one.
+- [x] Export calibrates from the library too.
+
+### Not done
+
+- **The frame on screen is not calibrated from the library.** Masters can take a
+  minute to make the first time; doing that on opening a folder would make the
+  viewer wait. Stacking and export use it.
+- **A filter group of mixed exposures** gets the dark of its first frame's, and
+  the panel says one dark suits only one of them.
+
+---
+
 ## 9. Performance Checklist (apply throughout)
 
 - Read files with a single `std::fs::read`; do not use `BufReader` per-element reads, and do not use `mmap` (unsafe).

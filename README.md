@@ -86,6 +86,16 @@ shadows, applied with `Shift+F`. Both can be saved and reused, and each folder
 remembers which were used with it. Export writes calibrated copies of a whole
 folder in the background, never touching the originals.
 
+**A calibration library.** Point fitsview once at the folder holding your darks,
+flats and biases, and it finds the right ones for every night by reading how
+each frame was taken: a dark of the same exposure, gain, offset and
+temperature, a flat through the same filter, nearest in date. Before you stack,
+the Calibration panel says what each filter will get — and, in warning colour,
+what it will not, such as "no flats for L-Pro; vignetting and dust will remain".
+Masters are made from the raw frames the first time and kept in a hidden folder
+in the library, so later stacks pay nothing for them. A master you choose by
+hand always wins.
+
 **One-shot colour.** A raw frame from a colour camera is a mosaic behind a grid
 of filters and displays as grey. `B` reconstructs the colour, automatically when
 the file records which filter pattern it used. Exports stay as mosaics, because
@@ -142,7 +152,7 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 787 automated tests, run on macOS, Linux and Windows on every change, and
+by 813 automated tests, run on macOS, Linux and Windows on every change, and
 again on each system before its download is built.
 
 ---
@@ -440,7 +450,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in twenty-three phases, each with its own acceptance criteria
+`fitsview` was built in twenty-four phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in

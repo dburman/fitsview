@@ -15,12 +15,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use fits_core::calib::{flat_from_combined, MasterFlat, MasterFrame};
 use fits_core::stack::{Alignment, Stack, DEFAULT_CLIP};
 use fits_core::{read_fits, write_fits, FitsHeader};
 
-use crate::library::{Kind, Set};
+use crate::library::{Kind, Library, Set, Taken};
 use crate::measurements::Stamp;
 
 /// The hidden folder masters are kept in, inside the library.
@@ -273,6 +274,226 @@ impl Masters {
         }
         self.folder.join(format!("{name}-{:016x}.fits", hash.0))
     }
+}
+
+/// A library, read, and the masters kept in it.
+#[derive(Debug, Clone)]
+pub struct InUse {
+    /// Where it is.
+    pub root: PathBuf,
+    /// What is in it.
+    pub library: Library,
+    /// Its masters.
+    pub masters: Masters,
+}
+
+impl InUse {
+    /// Reads the library at `root`.
+    #[must_use]
+    pub fn read(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            library: Library::scan(root),
+            masters: Masters::of_library(root),
+        }
+    }
+}
+
+/// The calibration a group of lights gets, and what is worth saying about it.
+#[derive(Debug, Clone, Default)]
+pub struct Chosen {
+    /// The dark to take off, if any.
+    pub dark: Option<Arc<MasterFrame>>,
+    /// The flat to divide by, if any.
+    pub flat: Option<Arc<MasterFlat>>,
+    /// What was used, a line each: `dark: 40 darks, 180 s, …`.
+    pub used: Vec<String>,
+    /// What was wanted and not found, a line each, saying what it costs.
+    pub missing: Vec<String>,
+}
+
+/// The dark and the flat for a group of lights, as the panel shows them
+/// before anything is made: what would be used, or why nothing would.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    /// The dark set, described, or why there is none.
+    pub dark: Result<String, String>,
+    /// The flat set and what comes off it, described, or why there is none.
+    pub flat: Result<String, String>,
+}
+
+/// What `library` would give `lights`, without making anything.
+#[must_use]
+pub fn plan(lights: &Taken, library: &Library) -> Plan {
+    Plan {
+        dark: library.dark_for(lights).map(Set::describe),
+        flat: library
+            .flat_for(lights)
+            .map(|flats| flat_words(flats, library, lights)),
+    }
+}
+
+/// A flat set described, with what comes off it and how old it is beside the
+/// lights.
+fn flat_words(flats: &Set, library: &Library, lights: &Taken) -> String {
+    let mut words = flats.describe();
+    if let Some(dark) = library.dark_for_flats(&flats.taken) {
+        words.push_str(&format!(
+            ", less {} {}",
+            dark.frames.len(),
+            dark.taken.kind.name()
+        ));
+        if dark.frames.len() != 1 && dark.taken.kind == Kind::Bias {
+            words.push_str("es");
+        } else if dark.frames.len() != 1 {
+            words.push('s');
+        }
+    }
+    if let (Some(flat_day), Some(light_day)) = (flats.taken.day, lights.day) {
+        let days = light_day - flat_day;
+        if days.abs() > FLAT_AGE_WORTH_SAYING {
+            let (n, when) = if days > 0 {
+                (days, "before")
+            } else {
+                (-days, "after")
+            };
+            words.push_str(&format!(" — taken {n} days {when}"));
+        }
+    }
+    words
+}
+
+/// How many days apart a flat and its lights may be before it is worth
+/// saying: dust settles and moves, and a flat from another month may no
+/// longer show it where it is.
+pub const FLAT_AGE_WORTH_SAYING: i64 = 30;
+
+/// Chooses, and makes or reads, the dark and flat for a group of lights.
+///
+/// A master chosen by hand is always used. What is not chosen by hand comes
+/// from the library when there is one; without a library nothing is found,
+/// and nothing is said to be missing, since calibrating is then the user's own
+/// business. `progress` is told what is being made while it is.
+///
+/// # Errors
+///
+/// [`Failed::Cancelled`] if asked to stop. A master that cannot be made is not
+/// an error: it is said to be missing, and the lights go uncorrected by it.
+pub fn choose(
+    lights: &Taken,
+    by_hand: (Option<Arc<MasterFrame>>, Option<Arc<MasterFlat>>),
+    library: Option<&InUse>,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(String),
+) -> Result<Chosen, Failed> {
+    let mut chosen = Chosen::default();
+    let (dark, flat) = by_hand;
+
+    if let Some(dark) = dark {
+        chosen.used.push("dark: the master chosen by hand".into());
+        chosen.dark = Some(dark);
+    } else if let Some(in_use) = library {
+        match in_use.library.dark_for(lights) {
+            Ok(set) => {
+                let label = set.describe();
+                let mut report = |done: usize, total: usize| {
+                    progress(format!("Making the master dark: {done} of {total}"));
+                };
+                match in_use.masters.dark(set, cancel, &mut report) {
+                    Ok((master, _)) => {
+                        chosen.used.push(format!("dark: {label}"));
+                        chosen.dark = Some(Arc::new(master));
+                    }
+                    Err(Failed::Cancelled) => return Err(Failed::Cancelled),
+                    Err(Failed::Because(why)) => chosen.missing.push(format!("no dark: {why}")),
+                }
+            }
+            Err(why) => chosen.missing.push(format!("no dark: {why}")),
+        }
+    }
+
+    if let Some(flat) = flat {
+        chosen.used.push("flat: the master chosen by hand".into());
+        chosen.flat = Some(flat);
+    } else if let Some(in_use) = library {
+        match in_use.library.flat_for(lights) {
+            Ok(flats) => {
+                let label = flat_words(flats, &in_use.library, lights);
+                let flat_dark = in_use.library.dark_for_flats(&flats.taken);
+                let mut report = |done: usize, total: usize| {
+                    progress(format!("Making the master flat: {done} of {total}"));
+                };
+                match in_use.masters.flat(flats, flat_dark, cancel, &mut report) {
+                    Ok((master, _)) => {
+                        chosen.used.push(format!("flat: {label}"));
+                        chosen.flat = Some(Arc::new(master));
+                    }
+                    Err(Failed::Cancelled) => return Err(Failed::Cancelled),
+                    Err(Failed::Because(why)) => chosen
+                        .missing
+                        .push(format!("no flat: {why}; vignetting and dust will remain")),
+                }
+            }
+            Err(why) => chosen
+                .missing
+                .push(format!("no flat: {why}; vignetting and dust will remain")),
+        }
+    }
+    Ok(chosen)
+}
+
+/// A group of lights, as a stack groups them: by filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    /// The filter, or `unfiltered`.
+    pub filter: String,
+    /// How the first of them was taken, which the rest are matched by.
+    pub taken: Taken,
+    /// How many there are.
+    pub frames: usize,
+    /// Whether they were not all exposed for the same time, so that no one
+    /// dark suits them all.
+    pub mixed_exposures: bool,
+}
+
+/// The lights among `paths`, grouped by filter from their headers alone, in
+/// the order their filters first appear. Stacks this program wrote are left
+/// out, as stacking leaves them out.
+#[must_use]
+pub fn groups_of(paths: &[PathBuf]) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    for path in paths {
+        let is_stack = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(crate::jobs::STACK_PREFIX));
+        if is_stack {
+            continue;
+        }
+        let Some(taken) = fits_core::read_fits_header(path)
+            .ok()
+            .as_ref()
+            .and_then(Taken::of_light)
+        else {
+            continue;
+        };
+        let filter = taken.filter.clone().unwrap_or_else(|| "unfiltered".into());
+        match groups.iter_mut().find(|g| g.filter == filter) {
+            Some(group) => {
+                group.frames += 1;
+                if group.taken.exposure != taken.exposure {
+                    group.mixed_exposures = true;
+                }
+            }
+            None => groups.push(Group {
+                filter,
+                taken,
+                frames: 1,
+                mixed_exposures: false,
+            }),
+        }
+    }
+    groups
 }
 
 /// FNV-1a over what a master was made from.

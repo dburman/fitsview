@@ -18,6 +18,8 @@ use fits_core::stars::{self, DetectionParams, StarField};
 use fits_core::{quality, read_fits, read_fits_header, write_fits, FitsHeader, FitsImage, Quality};
 
 use crate::folder::StarMeasure;
+use crate::library::Taken;
+use crate::masters;
 use crate::memory::{self, Memory};
 
 /// What a finished job produced.
@@ -37,6 +39,10 @@ pub enum Outcome {
         rejected: usize,
         /// Whether a stack was made a colour at a time, to fit in memory.
         colour_at_a_time: bool,
+        /// Each filter's calibration, a line each: `L-Pro — dark: …`.
+        calibration: Vec<String>,
+        /// What each filter lacked, a line each, saying what it costs.
+        missing: Vec<String>,
     },
     /// Every file in the folder was measured.
     Measured(Vec<(PathBuf, Quality, Option<StarMeasure>)>),
@@ -46,6 +52,8 @@ pub enum Outcome {
         written: usize,
         /// Where they went.
         directory: PathBuf,
+        /// What each filter lacked, a line each, saying what it costs.
+        missing: Vec<String>,
     },
 }
 
@@ -195,6 +203,7 @@ impl Job {
         paths: Vec<PathBuf>,
         dark: Option<Arc<MasterFrame>>,
         flat: Option<Arc<MasterFlat>>,
+        library: Option<Arc<masters::InUse>>,
         directory: PathBuf,
     ) -> Self {
         let (tx, updates) = mpsc::channel();
@@ -207,8 +216,8 @@ impl Job {
             .spawn(move || {
                 export_worker(
                     &paths,
-                    dark.as_deref(),
-                    flat.as_deref(),
+                    (dark, flat),
+                    library.as_deref(),
                     &directory,
                     &tx,
                     &worker_cancel,
@@ -382,6 +391,9 @@ pub struct StackRecipe {
     /// Bytes the stack may take, or `None` to ask the system when it starts.
     /// A colour stack that would take more is stacked a colour at a time.
     pub room: Option<u64>,
+    /// The calibration library, if one is set: each filter's dark and flat
+    /// come from it, unless chosen by hand.
+    pub library: Option<Arc<masters::InUse>>,
 }
 
 /// Stacks a folder, one file per filter.
@@ -404,15 +416,15 @@ fn stack_worker(
     cancel: &AtomicBool,
 ) {
     let StackRecipe {
-        dark,
-        flat,
+        dark: dark_by_hand,
+        flat: flat_by_hand,
         pattern,
         params,
         reject,
         weighted,
         room,
+        library,
     } = recipe;
-    let (dark, flat) = (dark.as_deref(), flat.as_deref());
     let (pattern, reject, weighted) = (*pattern, *reject, *weighted);
     let room = room.unwrap_or_else(|| memory::room(Memory::now(), 0));
     // Which filter each frame belongs to, read from the header alone so that
@@ -438,7 +450,7 @@ fn stack_worker(
 
     // A frame calibrated and in colour, ready to add, or `None` if it cannot
     // be read.
-    let prepare = |path: &Path| -> Option<FitsImage> {
+    let prepare = |path: &Path, dark: Option<&MasterFrame>, flat: Option<&MasterFlat>| {
         let light = read_fits(path).ok()?;
         calib::calibrate_and_debayer(&light, dark, flat, pattern).ok()
     };
@@ -454,6 +466,8 @@ fn stack_worker(
     let mut unaligned = 0usize;
     let mut rejected = 0usize;
     let mut colour_at_a_time = false;
+    let mut calibration: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     let mut done = 0usize;
     // Rejecting means reading every frame a second time, to measure it against
     // what the first pass found ordinary. A colour at a time means reading it
@@ -463,6 +477,46 @@ fn stack_worker(
     let mut steps = paths.len() * passes;
 
     for (filter, group) in &groups {
+        // This filter's dark and flat: chosen by hand, or found in the
+        // library by how its first frame was taken.
+        let lights = group
+            .first()
+            .and_then(|path| read_fits_header(path).ok())
+            .as_ref()
+            .and_then(Taken::of_light);
+        let by_hand = (dark_by_hand.clone(), flat_by_hand.clone());
+        let chosen = match lights {
+            Some(lights) => {
+                let mut report = |item: String| {
+                    let _ = tx.send(Update::Progress {
+                        done,
+                        total: steps,
+                        item,
+                    });
+                };
+                match masters::choose(&lights, by_hand, library.as_deref(), cancel, &mut report) {
+                    Ok(chosen) => chosen,
+                    Err(_) => {
+                        let _ = tx.send(Update::Cancelled);
+                        return;
+                    }
+                }
+            }
+            None => masters::Chosen {
+                dark: by_hand.0,
+                flat: by_hand.1,
+                ..masters::Chosen::default()
+            },
+        };
+        calibration.extend(chosen.used.iter().map(|line| format!("{filter} — {line}")));
+        missing.extend(
+            chosen
+                .missing
+                .iter()
+                .map(|line| format!("{filter} — {line}")),
+        );
+        let (dark, flat) = (chosen.dark.as_deref(), chosen.flat.as_deref());
+
         let mut stack: Option<Stack> = None;
         let mut reference: Option<(StarField, PierSide, (usize, usize))> = None;
         let mut header = None;
@@ -600,7 +654,7 @@ fn stack_worker(
                             item: file_name_of(path),
                         });
                         done += 1;
-                        if let Some(prepared) = prepare(path) {
+                        if let Some(prepared) = prepare(path, dark, flat) {
                             stack.add_channels(&prepared, first, *alignment);
                         }
                     }
@@ -629,7 +683,7 @@ fn stack_worker(
                             item: file_name_of(path),
                         });
                         done += 1;
-                        if let Some(prepared) = prepare(path) {
+                        if let Some(prepared) = prepare(path, dark, flat) {
                             second.add_channels(&prepared, first, *alignment);
                         }
                     }
@@ -660,7 +714,12 @@ fn stack_worker(
         if per_stack < channels {
             history.push_str(", a colour at a time");
         }
-        if let Err(e) = write_fits(&out, &result, &[history]) {
+        // How it was calibrated, and what it was not, travels with the file.
+        let mut history = vec![history];
+        history.extend(calib::history_for(dark, flat));
+        history.extend(chosen.used.iter().map(|line| history_line(line)));
+        history.extend(chosen.missing.iter().map(|line| history_line(line)));
+        if let Err(e) = write_fits(&out, &result, &history) {
             let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(&out))));
             return;
         }
@@ -677,6 +736,8 @@ fn stack_worker(
         unaligned,
         rejected,
         colour_at_a_time,
+        calibration,
+        missing,
     }));
 }
 
@@ -814,10 +875,11 @@ fn read_all(
 ///
 /// Originals are never opened for writing, and the output name always differs
 /// from the input, so an export cannot overwrite what it is reading.
+#[allow(clippy::too_many_lines)]
 fn export_worker(
     paths: &[PathBuf],
-    dark: Option<&MasterFrame>,
-    flat: Option<&MasterFlat>,
+    by_hand: (Option<Arc<MasterFrame>>, Option<Arc<MasterFlat>>),
+    library: Option<&masters::InUse>,
     directory: &Path,
     tx: &mpsc::Sender<Update>,
     cancel: &AtomicBool,
@@ -827,7 +889,11 @@ fn export_worker(
         return;
     }
 
-    let history = calib::history_for(dark, flat);
+    // Each way the frames were taken is worked out once: a folder holds a few
+    // filters and exposures, not a few hundred.
+    let mut chosen: std::collections::HashMap<String, masters::Chosen> =
+        std::collections::HashMap::new();
+    let mut missing: Vec<String> = Vec::new();
     let mut written = 0usize;
 
     for (index, path) in paths.iter().enumerate() {
@@ -849,6 +915,54 @@ fn export_worker(
             }
         };
 
+        let taken = Taken::of_light(&light.header);
+        let key = taken.as_ref().map_or_else(String::new, |t| {
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                t.filter,
+                t.exposure,
+                t.size,
+                t.binning,
+                t.gain,
+                t.offset,
+                t.set_temperature,
+                t.camera
+            )
+        });
+        if !chosen.contains_key(&key) {
+            let this = match &taken {
+                Some(taken) => {
+                    let mut report = |item: String| {
+                        let _ = tx.send(Update::Progress {
+                            done: index,
+                            total: paths.len(),
+                            item,
+                        });
+                    };
+                    match masters::choose(taken, by_hand.clone(), library, cancel, &mut report) {
+                        Ok(this) => this,
+                        Err(_) => {
+                            let _ = tx.send(Update::Cancelled);
+                            return;
+                        }
+                    }
+                }
+                None => masters::Chosen {
+                    dark: by_hand.0.clone(),
+                    flat: by_hand.1.clone(),
+                    ..masters::Chosen::default()
+                },
+            };
+            let filter = taken
+                .as_ref()
+                .and_then(|t| t.filter.clone())
+                .unwrap_or_else(|| "unfiltered".into());
+            missing.extend(this.missing.iter().map(|line| format!("{filter} — {line}")));
+            chosen.insert(key.clone(), this);
+        }
+        let this = &chosen[&key];
+        let (dark, flat) = (this.dark.as_deref(), this.flat.as_deref());
+
         let calibrated = match calib::calibrate(&light, dark, flat) {
             Ok(image) => image,
             Err(e) => {
@@ -857,6 +971,9 @@ fn export_worker(
             }
         };
 
+        let mut history = calib::history_for(dark, flat);
+        history.extend(this.used.iter().map(|line| history_line(line)));
+        history.extend(this.missing.iter().map(|line| history_line(line)));
         let out = directory.join(output_name_for(path));
         if let Err(e) = write_fits(&out, &calibrated, &history) {
             let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(&out))));
@@ -873,7 +990,22 @@ fn export_worker(
     let _ = tx.send(Update::Finished(Outcome::Exported {
         written,
         directory: directory.to_path_buf(),
+        missing,
     }));
+}
+
+/// A line of what was said about calibration, as a `HISTORY` card holds it.
+///
+/// Cards are ASCII, and anything else is written as a question mark, so the
+/// degrees, times signs and dashes the interface uses are spelt out plainly
+/// rather than arriving as `-14 ?C` and `1?1 binning`.
+fn history_line(line: &str) -> String {
+    let plain = line
+        .replace(" °C", " C")
+        .replace('°', "")
+        .replace('×', "x")
+        .replace('—', "-");
+    format!("fitsview: {plain}")
 }
 
 /// The name a calibrated copy is written under.
@@ -1002,6 +1134,7 @@ mod tests {
             paths.clone(),
             Some(Arc::new(dark)),
             None,
+            None,
             out_dir.path().to_path_buf(),
         );
         let updates = run(&mut job);
@@ -1032,7 +1165,7 @@ mod tests {
         let (_dir, paths) = frames(2, 42.0);
         let out_dir = tempfile::tempdir().unwrap();
 
-        let mut job = Job::export(paths, None, None, out_dir.path().to_path_buf());
+        let mut job = Job::export(paths, None, None, None, out_dir.path().to_path_buf());
         run(&mut job);
 
         let image = fits_core::read_fits(&out_dir.path().join("f0_cal.fits")).unwrap();
@@ -1051,6 +1184,7 @@ mod tests {
             paths,
             Some(Arc::new(dark)),
             None,
+            None,
             out_dir.path().to_path_buf(),
         );
         run(&mut job);
@@ -1065,7 +1199,7 @@ mod tests {
         // The output name always differs from the input name, so exporting in
         // place is safe rather than destructive.
         let (dir, paths) = frames(2, 77.0);
-        let mut job = Job::export(paths.clone(), None, None, dir.path().to_path_buf());
+        let mut job = Job::export(paths.clone(), None, None, None, dir.path().to_path_buf());
         run(&mut job);
 
         for path in &paths {
@@ -1084,7 +1218,7 @@ mod tests {
         let (_dir, paths) = frames(40, 100.0);
         let out_dir = tempfile::tempdir().unwrap();
 
-        let mut job = Job::export(paths, None, None, out_dir.path().to_path_buf());
+        let mut job = Job::export(paths, None, None, None, out_dir.path().to_path_buf());
         job.cancel();
         let updates = run(&mut job);
 
@@ -1105,7 +1239,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("new").join("nested");
 
-        let mut job = Job::export(paths, None, None, target.clone());
+        let mut job = Job::export(paths, None, None, None, target.clone());
         run(&mut job);
         assert!(target.join("f0_cal.fits").exists());
     }

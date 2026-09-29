@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 use egui::{Pos2, Rect, Vec2};
@@ -25,6 +25,7 @@ use crate::actions::{self, ActionError, FileOps, Outcome, RealFileOps};
 use crate::folder::{scan_folder, Changes, FileEntry, Folder, SortKey};
 use crate::jobs::{self, Job};
 use crate::loader::{Cache, Loader};
+use crate::masters;
 use crate::measurements;
 use crate::sidecar;
 use crate::stardetect::StarDetector;
@@ -201,6 +202,10 @@ pub enum Action {
     SetStretchParams(StretchParams),
     /// Return the stretch settings to their defaults.
     ResetStretchParams,
+    /// Use the calibration library in this folder, or none.
+    SetLibrary(Option<PathBuf>),
+    /// Read the calibration library again, for frames added since.
+    RereadLibrary,
     /// Change the star detection settings and look again.
     SetStarParams(DetectionParams),
     /// Return the star detection settings to their defaults.
@@ -568,6 +573,19 @@ pub struct Model {
     calibrated: Cache,
     /// Notices frames added to the open folder while it is open.
     watcher: Option<Watcher>,
+    /// Where the calibration library is: the folder whose darks and flats are
+    /// found for each night. Remembered between sessions.
+    pub library_root: Option<PathBuf>,
+    /// The library, once read.
+    pub library: Option<Arc<masters::InUse>>,
+    /// The library being read, off the interface thread.
+    library_reading: Option<mpsc::Receiver<Arc<masters::InUse>>>,
+    /// What each filter of the open folder would get from the library.
+    pub library_plan: Vec<(masters::Group, masters::Plan)>,
+    /// That being worked out, off the interface thread.
+    plan_reading: Option<mpsc::Receiver<Vec<(masters::Group, masters::Plan)>>>,
+    /// What the last stack or export said of its calibration, a line each.
+    pub calibration_report: Vec<String>,
     /// The room a stack is given, in bytes, in place of asking the system.
     /// For tests, which need to see what happens on a machine they are not.
     pub stack_room: Option<u64>,
@@ -662,6 +680,12 @@ impl Model {
             calibrated: Cache::new(CALIBRATED_CACHE_ENTRIES, CALIBRATED_CACHE_BYTES),
             watcher: None,
             stack_room: None,
+            library_root: None,
+            library: None,
+            library_reading: None,
+            library_plan: Vec::new(),
+            plan_reading: None,
+            calibration_report: Vec::new(),
             watch_interval: watch::INTERVAL,
             fresh: HashSet::new(),
             measuring_fresh: HashSet::new(),
@@ -873,6 +897,8 @@ impl Model {
                     self.toast = Some(Toast::new("Stopping…"));
                 }
             }
+            Action::SetLibrary(root) => self.set_library(root),
+            Action::RereadLibrary => self.read_library(),
             Action::SetStarParams(params) => {
                 if params != self.star_params {
                     self.star_params = params;
@@ -1219,6 +1245,98 @@ impl Model {
         }
     }
 
+    /// Uses the calibration library at `root`, or none.
+    fn set_library(&mut self, root: Option<PathBuf>) {
+        self.library_root = root;
+        self.library = None;
+        self.library_plan.clear();
+        self.plan_reading = None;
+        self.library_reading = None;
+        self.read_library();
+    }
+
+    /// Whether the library's folder is there to read: a library on an external
+    /// disk that is not plugged in is not a library with nothing in it, and
+    /// must not be reported as one.
+    #[must_use]
+    pub fn library_connected(&self) -> bool {
+        self.library_root.as_ref().is_some_and(|root| root.is_dir())
+    }
+
+    /// The library, when it is read and its folder is there.
+    fn library_in_use(&self) -> Option<Arc<masters::InUse>> {
+        self.library.clone().filter(|_| self.library_connected())
+    }
+
+    /// Reads the library off the interface thread. On a slow external disk
+    /// reading every header takes a while, and the window should not wait.
+    fn read_library(&mut self) {
+        let Some(root) = self
+            .library_root
+            .clone()
+            .filter(|_| self.library_connected())
+        else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("fitsview-library".into())
+            .spawn(move || {
+                let _ = tx.send(Arc::new(masters::InUse::read(&root)));
+            });
+        if spawned.is_ok() {
+            self.library_reading = Some(rx);
+        }
+    }
+
+    /// Works out what each filter of the open folder would get from the
+    /// library, off the interface thread: it reads every frame's header.
+    fn plan_calibration(&mut self) {
+        self.library_plan.clear();
+        self.plan_reading = None;
+        let (Some(library), Some(folder)) = (self.library_in_use(), self.folder.as_ref()) else {
+            return;
+        };
+        let paths: Vec<PathBuf> = folder.files.iter().map(|e| e.path.clone()).collect();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("fitsview-plan".into())
+            .spawn(move || {
+                let plan = masters::groups_of(&paths)
+                    .into_iter()
+                    .map(|group| {
+                        let plan = masters::plan(&group.taken, &library.library);
+                        (group, plan)
+                    })
+                    .collect();
+                let _ = tx.send(plan);
+            });
+        if spawned.is_ok() {
+            self.plan_reading = Some(rx);
+        }
+    }
+
+    /// Takes in a library read, or a plan worked out, if either has finished.
+    fn poll_library(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(read) = self
+            .library_reading
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.library_reading = None;
+            self.library = Some(read);
+            self.plan_calibration();
+            changed = true;
+        }
+        if let Some(plan) = self.plan_reading.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.plan_reading = None;
+            self.library_plan = plan;
+            changed = true;
+        }
+        changed
+    }
+
     /// Starts writing calibrated copies of the folder.
     fn start_export(&mut self, directory: PathBuf) {
         if self.job.is_some() {
@@ -1235,6 +1353,7 @@ impl Model {
             paths,
             self.calibration.dark.clone(),
             self.calibration.flat.clone(),
+            self.library_in_use(),
             directory,
         ));
     }
@@ -1272,6 +1391,7 @@ impl Model {
                 reject: self.reject_outliers,
                 weighted: self.weight_frames,
                 room: Some(room),
+                library: self.library_in_use(),
             },
         ));
     }
@@ -1420,7 +1540,11 @@ impl Model {
                     unaligned,
                     rejected,
                     colour_at_a_time,
+                    calibration,
+                    missing,
                 }) => {
+                    let lacking = missing.len();
+                    self.calibration_report = calibration.into_iter().chain(missing).collect();
                     self.toast = Some(Toast::new(match stacks.len() {
                         0 => "Nothing could be stacked".to_string(),
                         _ => {
@@ -1435,6 +1559,12 @@ impl Model {
                             if colour_at_a_time {
                                 skipped.push_str(", a colour at a time to fit in memory");
                             }
+                            if lacking > 0 {
+                                skipped.push_str(&format!(
+                                    "; {lacking} calibration frame{} missing, see Calibration",
+                                    if lacking == 1 { "" } else { "s" }
+                                ));
+                            }
                             format!(
                                 "Stacked {frames} frames into {} file{}{skipped}",
                                 stacks.len(),
@@ -1446,9 +1576,23 @@ impl Model {
                     // part of the folder now.
                     self.rescan();
                 }
-                jobs::Update::Finished(jobs::Outcome::Exported { written, directory }) => {
+                jobs::Update::Finished(jobs::Outcome::Exported {
+                    written,
+                    directory,
+                    missing,
+                }) => {
+                    let lacking = if missing.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; {} calibration frame{} missing, see Calibration",
+                            missing.len(),
+                            if missing.len() == 1 { "" } else { "s" }
+                        )
+                    };
+                    self.calibration_report = missing;
                     self.toast = Some(Toast::new(format!(
-                        "Wrote {written} file{} to {}",
+                        "Wrote {written} file{} to {}{lacking}",
                         if written == 1 { "" } else { "s" },
                         directory.display()
                     )));
@@ -1660,6 +1804,7 @@ impl Model {
                 self.folder = Some(folder);
                 self.show_selection();
                 self.restore_calibration();
+                self.plan_calibration();
             }
             Err(e) => {
                 log::warn!("could not scan {}: {e}", dir.display());
@@ -1875,6 +2020,7 @@ impl Model {
     /// Returns true if anything changed, so the caller knows to repaint.
     pub fn poll(&mut self) -> bool {
         let mut job_changed = self.poll_job();
+        job_changed |= self.poll_library();
         job_changed |= self.poll_watcher();
         if self
             .arriving
@@ -2146,7 +2292,10 @@ impl Model {
     /// repaint.
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.loading || self.detector.is_busy()
+        self.loading
+            || self.detector.is_busy()
+            || self.library_reading.is_some()
+            || self.plan_reading.is_some()
     }
 
     /// How long until something may be due that nothing will announce:
@@ -4837,6 +4986,259 @@ mod tests {
         let said = m.toast.map(|t| t.text).unwrap_or_default();
         assert!(said.starts_with("Stacked 3 frames"), "{said}");
         assert!(!said.contains("colour at a time"), "{said}");
+    }
+
+    /// Light frames that say how they were taken, as a capture program's do.
+    const LIGHT_CARDS: [(&str, &str); 4] = [
+        ("IMAGETYP", "'LIGHT'"),
+        ("EXPTIME", "180.0"),
+        ("GAIN", "100"),
+        ("SET-TEMP", "-14.0"),
+    ];
+
+    /// How much light a column gets in the test flats: a quarter more at the
+    /// left edge than the right, falling smoothly, as vignetting does.
+    fn flat_field(x: usize, w: usize) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let across = x as f64 / (w - 1) as f64;
+        1.25 - 0.25 * across
+    }
+
+    /// A calibration library for those lights: darks that add 200 counts, and,
+    /// if `with_flats`, flats a quarter brighter at the left than the right,
+    /// with a bias of 500 under them.
+    fn library_for_lights(with_flats: bool) -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (160usize, 160usize);
+        let write =
+            |folder: &str, kind: &str, cards: &[(&str, &str)], pixels: &dyn Fn(u64) -> Vec<f64>| {
+                let path = dir.path().join(folder);
+                std::fs::create_dir_all(&path).unwrap();
+                for i in 0..6u64 {
+                    let mut spec =
+                        SyntheticSpec::new(w, h, -32).with_card("IMAGETYP", &format!("'{kind}'"));
+                    for (key, value) in cards {
+                        spec = spec.with_card(key, value);
+                    }
+                    write_synthetic(&path, &format!("{kind}{i}.fits"), &spec, &pixels(i)).unwrap();
+                }
+            };
+        write(
+            "DARK/180",
+            "DARK",
+            &[("EXPTIME", "180.0"), ("GAIN", "100"), ("SET-TEMP", "-14.0")],
+            &|i| fits_core::testutil::gaussian_background(w, h, 200.0, 1.0, 900 + i),
+        );
+        if with_flats {
+            write(
+                "FLAT/L",
+                "FLAT",
+                &[("FILTER", "'L'"), ("EXPTIME", "2.0"), ("GAIN", "100")],
+                &|i| {
+                    let noise = fits_core::testutil::gaussian_background(w, h, 0.0, 5.0, 950 + i);
+                    (0..w * h)
+                        .map(|k| 500.0 + 20_000.0 * flat_field(k % w, w) + noise[k])
+                        .collect()
+                },
+            );
+            write(
+                "BIAS",
+                "BIAS",
+                &[("EXPTIME", "0.0001"), ("GAIN", "100")],
+                &|i| fits_core::testutil::gaussian_background(w, h, 500.0, 1.0, 980 + i),
+            );
+        }
+        dir
+    }
+
+    /// Lights of one filter, L, lined up by their stars.
+    fn lights() -> TempDir {
+        stackable_folder_with(
+            &[
+                (0.0, 0.0),
+                (5.0, -3.0),
+                (-4.0, 6.0),
+                (3.0, 2.0),
+                (-2.0, -4.0),
+                (1.0, 3.0),
+            ],
+            &["L"; 6],
+            &LIGHT_CARDS,
+        )
+    }
+
+    /// Opens `folder` with `library` set, and waits until the plan is ready.
+    fn model_with_library(folder: &Path, library: &Path) -> Model {
+        let (mut m, _spy) = model_over(folder);
+        m.handle(Action::SetLibrary(Some(library.to_path_buf())));
+        pump_until(&mut m, "the library was never read and planned", |m| {
+            !m.library_plan.is_empty()
+        });
+        m
+    }
+
+    /// The stack of filter L, and what its file records of how it was made.
+    fn stacked_l(dir: &Path) -> (FitsImage, String) {
+        let path = dir.join("stack_L.fits");
+        (fits_core::read_fits(&path).unwrap(), history_of(&path))
+    }
+
+    /// A file's `HISTORY` cards put back together: a long line is split across
+    /// several, seventy-two characters to a card.
+    fn history_of(path: &Path) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        let mut text = String::new();
+        for card in bytes.chunks(80) {
+            if card.starts_with(b"END ") {
+                break;
+            }
+            if card.starts_with(b"HISTORY ") {
+                text.push_str(&String::from_utf8_lossy(&card[8..]));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn the_library_s_dark_and_flat_are_found_and_applied() {
+        let (folder, library) = (lights(), library_for_lights(true));
+        let mut m = model_with_library(folder.path(), library.path());
+
+        let (group, plan) = &m.library_plan[0];
+        assert_eq!(group.filter, "L");
+        assert_eq!(group.frames, 6);
+        assert!(
+            plan.dark.as_ref().unwrap().starts_with("6 darks, 180 s"),
+            "{:?}",
+            plan.dark
+        );
+        assert!(
+            plan.flat.as_ref().unwrap().contains("less 6 biases"),
+            "{:?}",
+            plan.flat
+        );
+
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let said = m.toast.as_ref().unwrap().text.clone();
+        assert!(said.starts_with("Stacked 6 frames"), "{said}");
+        assert!(!said.contains("missing"), "{said}");
+
+        let (stacked, history) = stacked_l(folder.path());
+        let (w, h) = (stacked.width, stacked.height);
+        // A sky of 1000 less the dark's 200, then the flat divided out: where
+        // the flat was brighter the sky comes out dimmer, by just as much.
+        let median = |xs: std::ops::Range<usize>| {
+            let mut v: Vec<f64> = (10..h - 10)
+                .flat_map(|y| xs.clone().map(move |x| (x, y)))
+                .map(|(x, y)| f64::from(stacked.data[y * w + x]))
+                .filter(|v| v.is_finite() && *v < 1_100.0)
+                .collect();
+            let mid = v.len() / 2;
+            *v.select_nth_unstable_by(mid, f64::total_cmp).1
+        };
+        let (left, right) = (median(10..20), median(140..150));
+        let expected = flat_field(15, w) / flat_field(145, w);
+        assert!(
+            (right / left - expected).abs() < 0.02,
+            "left {left}, right {right}, expected {expected}"
+        );
+        // The gain map averages one, so the sky under it is where the dark
+        // left it.
+        #[allow(clippy::cast_precision_loss)]
+        let mean_gain = (0..w).map(|x| flat_field(x, w)).sum::<f64>() / w as f64;
+        let level = left * flat_field(15, w) / mean_gain;
+        assert!(
+            (level - 800.0).abs() < 15.0,
+            "the dark was not taken off: sky {level}"
+        );
+
+        assert!(
+            history.contains("fitsview: dark: 6 darks"),
+            "the file should say which dark"
+        );
+        assert!(
+            history.contains("fitsview: flat: 6 flats"),
+            "and which flat"
+        );
+        assert!(m
+            .calibration_report
+            .iter()
+            .any(|l| l.starts_with("L — dark:")));
+    }
+
+    #[test]
+    fn a_missing_flat_is_said_before_the_stack_and_after_it() {
+        let (folder, library) = (lights(), library_for_lights(false));
+        let mut m = model_with_library(folder.path(), library.path());
+        let why = m.library_plan[0].1.flat.as_ref().unwrap_err().clone();
+        assert!(why.starts_with("no flats"), "{why}");
+
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let said = &m.toast.as_ref().unwrap().text;
+        assert!(said.contains("1 calibration frame missing"), "{said}");
+        assert!(m
+            .calibration_report
+            .iter()
+            .any(|l| l.contains("— no flat:")));
+        let (_, history) = stacked_l(folder.path());
+        assert!(
+            history.contains("vignetting and dust will remain"),
+            "the file should say so too"
+        );
+    }
+
+    #[test]
+    fn a_dark_chosen_by_hand_wins_over_the_library_s() {
+        let (folder, library) = (lights(), library_for_lights(true));
+        let mut m = model_with_library(folder.path(), library.path());
+        let master = library.path().join("DARK/180/DARK0.fits");
+        m.handle(Action::LoadMasterDark(master));
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        assert!(
+            m.calibration_report
+                .iter()
+                .any(|l| l == "L — dark: the master chosen by hand"),
+            "{:?}",
+            m.calibration_report
+        );
+        assert!(m
+            .calibration_report
+            .iter()
+            .any(|l| l.starts_with("L — flat: 6 flats")));
+    }
+
+    #[test]
+    fn a_library_on_a_drive_that_is_not_there_is_not_taken_for_an_empty_one() {
+        let folder = lights();
+        let (mut m, _spy) = model_over(folder.path());
+        m.handle(Action::SetLibrary(Some(PathBuf::from(
+            "/Volumes/Not Plugged In/astro",
+        ))));
+        assert!(!m.library_connected());
+        assert!(!m.busy(), "nothing to read");
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        assert!(
+            m.calibration_report.is_empty(),
+            "{:?}",
+            m.calibration_report
+        );
+        assert!(!m.toast.as_ref().unwrap().text.contains("missing"));
+    }
+
+    #[test]
+    fn export_calibrates_from_the_library_too() {
+        let (folder, library) = (lights(), library_for_lights(true));
+        let mut m = model_with_library(folder.path(), library.path());
+        let out = tempfile::tempdir().unwrap();
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        wait_for_job(&mut m);
+        let header = history_of(&out.path().join("f0_cal.fits"));
+        assert!(header.contains("fitsview: dark: 6 darks"), "{header}");
+        assert!(header.contains("fitsview: flat: 6 flats"));
     }
 
     #[test]

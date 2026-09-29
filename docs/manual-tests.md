@@ -513,3 +513,20 @@ one at a time does nearly as well.
 - [ ] On a 32 GB or larger machine the same stack says nothing of colours.
 - [ ] A mono night is never split, whatever the machine.
 - [ ] The two stacks of the same night, split and not, look the same.
+
+## The calibration library
+
+- [ ] Choose a library folder in the Calibration panel: it says how many dark,
+      flat and bias sets it found, and remembers the folder after a restart.
+- [ ] With a night open, each filter shows the dark and flat it will get, or in
+      warning colour why there is none.
+- [ ] A flat more than a month from the night says how many days apart.
+- [ ] Stack: the first time takes longer while masters are made; the progress
+      line says which. A hidden `.fitsview-masters` folder appears in the
+      library. The second stack is as quick as without a library.
+- [ ] The stack's header history names the dark and flat used.
+- [ ] Load a master dark by hand: the panel and the stack both say the one
+      chosen by hand was used.
+- [ ] With the library on an external drive that is unplugged, the panel says
+      it is not found, and stacking goes ahead without it.
+- [ ] Add frames to the library and press **Read again**: they are found.

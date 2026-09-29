@@ -40,6 +40,7 @@ const KEY_STRETCH_TARGET: &str = "stretch_target_bg";
 const KEY_STRETCH_LINKED: &str = "stretch_linked";
 const KEY_CONFIRM_EVERY_DELETE: &str = "confirm_every_delete";
 const KEY_LAST_FOLDER: &str = "last_folder";
+const KEY_LIBRARY: &str = "calibration_library";
 const KEY_SHOW_FILELIST: &str = "show_filelist";
 const KEY_SHOW_HEADER: &str = "show_header";
 const KEY_SHOW_HISTOGRAM: &str = "show_histogram";
@@ -134,6 +135,14 @@ impl FitsViewApp {
             limit: eframe::get_value(storage, KEY_STAR_LIMIT).unwrap_or(star_defaults.limit),
             ..star_defaults
         };
+
+        // The calibration library before the folder, so that the folder's plan
+        // is worked out as soon as both are read.
+        if let Some(root) = eframe::get_value::<String>(storage, KEY_LIBRARY) {
+            if !root.is_empty() {
+                app.model.handle(Action::SetLibrary(Some(root.into())));
+            }
+        }
 
         // Reopen the folder from last time, but only when the command line did
         // not name something, and only if it is still there.
@@ -308,6 +317,12 @@ impl FitsViewApp {
 impl eframe::App for FitsViewApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, KEY_STRETCH_ENABLED, &self.model.stretch_enabled);
+        let library = self
+            .model
+            .library_root
+            .as_ref()
+            .map_or_else(String::new, |root| root.display().to_string());
+        eframe::set_value(storage, KEY_LIBRARY, &library);
         eframe::set_value(
             storage,
             KEY_STRETCH_SHADOWS,

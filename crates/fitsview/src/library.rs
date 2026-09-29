@@ -98,7 +98,17 @@ impl Taken {
     /// it is or how big.
     #[must_use]
     pub fn from_header(header: &FitsHeader) -> Option<Self> {
-        let kind = Kind::parse(header.get("IMAGETYP")?)?;
+        Self::read(header, Kind::parse(header.get("IMAGETYP")?)?)
+    }
+
+    /// Reads a light's header. Capture programs do not all record that a
+    /// light is one, and a frame being stacked is a light whatever it says.
+    #[must_use]
+    pub fn of_light(header: &FitsHeader) -> Option<Self> {
+        Self::read(header, Kind::Light)
+    }
+
+    fn read(header: &FitsHeader, kind: Kind) -> Option<Self> {
         let size = |key: &str| header.get_i64(key).and_then(|v| usize::try_from(v).ok());
         let text = |key: &str| {
             header
