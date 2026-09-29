@@ -100,8 +100,11 @@ temperature, a flat through the same filter, nearest in date. Before you stack,
 the Calibration panel says what each filter will get — and, in warning colour,
 what it will not, such as "no flats for L-Pro; vignetting and dust will remain".
 Masters are made from the raw frames the first time and kept in a hidden folder
-in the library, so later stacks pay nothing for them. A master you choose by
-hand always wins.
+in the library, so later stacks pay nothing for them. Each flat is tried on a
+few of the night's frames first, and one that would leave the sky less even —
+taken with something shadowing the field, or with the camera turned since — is
+passed over for one that suits, or left out, and the panel says why. A master
+you choose by hand always wins.
 
 **One-shot colour.** A raw frame from a colour camera is a mosaic behind a grid
 of filters and displays as grey. `B` reconstructs the colour, automatically when
@@ -160,7 +163,7 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 826 automated tests, run on macOS, Linux and Windows on every change, and
+by 832 automated tests, run on macOS, Linux and Windows on every change, and
 again on each system before its download is built.
 
 ---

@@ -530,6 +530,13 @@ one at a time does nearly as well.
 - [ ] With the library on an external drive that is unplugged, the panel says
       it is not found, and stacking goes ahead without it.
 - [ ] Add frames to the library and press **Read again**: they are found.
+- [ ] After a first stack, the panel shows each flat with how uneven the sky
+      is without it and with it.
+- [ ] Put a flat in the library taken with something across part of the field
+      (a hand, a card over the bottom of the aperture), newer than the good
+      one: the stack uses the older flat, and says what the newer one did.
+- [ ] With only that bad flat, the panel and the stack say none of the flats
+      suits the frames, and the stack's history says so too.
 
 ## Background extraction
 

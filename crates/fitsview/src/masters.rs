@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use fits_core::calib::{flat_from_combined, MasterFlat, MasterFrame};
+use fits_core::gradient::unevenness;
 use fits_core::stack::{Alignment, Stack, DEFAULT_CLIP};
 use fits_core::{read_fits, write_fits, FitsHeader};
 
@@ -191,14 +192,10 @@ impl Masters {
         cancel: &AtomicBool,
         progress: Progress,
     ) -> Result<(MasterFrame, Origin), Failed> {
-        let path = self.file_for(set, None);
-        if let Some(kept) = read_fits(&path)
-            .ok()
-            .map(|image| MasterFrame::from_image(&image))
-            .filter(|m| (m.width, m.height) == set.taken.size)
-        {
+        if let Some(kept) = self.kept_dark(set) {
             return Ok((kept, Origin::Kept));
         }
+        let path = self.file_for(set, None);
         let master = combine(set, cancel, progress)?;
         self.keep(
             &path,
@@ -223,15 +220,10 @@ impl Masters {
         cancel: &AtomicBool,
         progress: Progress,
     ) -> Result<(MasterFlat, Origin), Failed> {
-        let path = self.file_for(flats, flat_dark);
-        if let Some(kept) = read_fits(&path)
-            .ok()
-            .filter(|image| image.header.get_bool("FITSVFLT") == Some(true))
-            .map(|image| MasterFlat::from_image(&image))
-            .filter(|m| (m.width, m.height) == flats.taken.size)
-        {
+        if let Some(kept) = self.kept_flat(flats, flat_dark) {
             return Ok((kept, Origin::Kept));
         }
+        let path = self.file_for(flats, flat_dark);
         let dark = match flat_dark {
             Some(set) => Some(self.dark(set, cancel, &mut |_, _| {})?.0),
             None => None,
@@ -245,6 +237,27 @@ impl Masters {
             &format!("{} combined from {}", flats.describe(), flat.source_count),
         );
         Ok((flat, Origin::Made))
+    }
+
+    /// The master dark of `set` if one is kept and its frames are unchanged,
+    /// without making one.
+    #[must_use]
+    pub fn kept_dark(&self, set: &Set) -> Option<MasterFrame> {
+        read_fits(&self.file_for(set, None))
+            .ok()
+            .map(|image| MasterFrame::from_image(&image))
+            .filter(|m| (m.width, m.height) == set.taken.size)
+    }
+
+    /// The master flat of `flats` less `flat_dark` if one is kept and both
+    /// sets' frames are unchanged, without making one.
+    #[must_use]
+    pub fn kept_flat(&self, flats: &Set, flat_dark: Option<&Set>) -> Option<MasterFlat> {
+        read_fits(&self.file_for(flats, flat_dark))
+            .ok()
+            .filter(|image| image.header.get_bool("FITSVFLT") == Some(true))
+            .map(|image| MasterFlat::from_image(&image))
+            .filter(|m| (m.width, m.height) == flats.taken.size)
     }
 
     /// Writes a master into the library, or says why not in the log. A library
@@ -344,15 +357,138 @@ pub struct Plan {
     pub flat: Result<String, String>,
 }
 
-/// What `library` would give `lights`, without making anything.
+/// What the library would give a group of lights, without making anything.
+///
+/// Each flat that could suit them is tried on a few of their frames, in the
+/// order the library ranks them, if its master has already been made; one that
+/// has not is offered as it is, to be tried when the stack is made.
 #[must_use]
-pub fn plan(lights: &Taken, library: &Library) -> Plan {
+pub fn plan(group: &Group, in_use: &InUse) -> Plan {
+    let library = &in_use.library;
+    let lights = &group.taken;
+    let dark_set = library.dark_for(lights);
+    let flat = library.flats_for(lights).and_then(|candidates| {
+        let dark = dark_set
+            .as_ref()
+            .ok()
+            .and_then(|set| in_use.masters.kept_dark(set));
+        let samples = group.samples();
+        let mut rejected = Vec::new();
+        for flats in candidates {
+            let label = flat_words(flats, library, lights);
+            let flat_dark = library.dark_for_flats(&flats.taken);
+            let Some(master) = in_use.masters.kept_flat(flats, flat_dark) else {
+                return Ok(format!("{label} — to be tried on the frames when stacking"));
+            };
+            match try_flat(&master, dark.as_ref(), &samples) {
+                Some(trial) if !trial.suits() => rejected.push(trial.rejecting(&label)),
+                Some(trial) => return Ok(format!("{label} ({})", trial.words())),
+                None => return Ok(label),
+            }
+        }
+        Err(none_suits(&rejected))
+    });
     Plan {
-        dark: library.dark_for(lights).map(Set::describe),
-        flat: library
-            .flat_for(lights)
-            .map(|flats| flat_words(flats, library, lights)),
+        dark: dark_set.map(Set::describe),
+        flat,
     }
+}
+
+/// How much more uneven a flat may leave a frame's sky, as a ratio, before it
+/// is taken not to match the frame.
+///
+/// A flat that matches evens the sky: it takes away the vignetting it
+/// recorded. On a real night, flats from the same month left the sky 0.37 to
+/// 0.42 as uneven as it was; flats shadowed along one edge when they were taken
+/// left it 1.4 to 1.9 times as uneven. One and a fifth leaves room for a frame
+/// whose sky is lifted by twilight or cloud, which no flat evens.
+pub const FLAT_MAY_WORSEN: f64 = 1.2;
+
+/// What trying a flat on a night's frames found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Trial {
+    /// How uneven the sky was without the flat, from [`unevenness`].
+    pub before: f64,
+    /// And with it.
+    pub after: f64,
+}
+
+impl Trial {
+    /// Whether the flat suits the frames.
+    #[must_use]
+    pub fn suits(&self) -> bool {
+        self.after <= self.before * FLAT_MAY_WORSEN
+    }
+
+    /// What was found, for saying.
+    #[must_use]
+    pub fn words(&self) -> String {
+        format!(
+            "sky {:.0}% uneven without it, {:.0}% with it",
+            100.0 * self.before,
+            100.0 * self.after
+        )
+    }
+
+    /// Why a flat labelled `label` was passed over.
+    fn rejecting(&self, label: &str) -> String {
+        format!(
+            "{label} leaves the sky less even, {:.0}% uneven where it was {:.0}%",
+            100.0 * self.after,
+            100.0 * self.before
+        )
+    }
+}
+
+/// What to say when every flat was tried and none suited: the library's first
+/// choice, and how many others did no better.
+fn none_suits(rejected: &[String]) -> String {
+    let first = rejected.first().map_or("", String::as_str);
+    let others = match rejected.len() {
+        0 | 1 => String::new(),
+        2 => "; the other did no better".into(),
+        n => format!("; the other {} did no better", n - 1),
+    };
+    format!(
+        "none of the flats suits these frames, so none is used: {first}{others}. \
+         Flats taken with the camera as these frames were would suit them"
+    )
+}
+
+/// Tries `flat` on `samples`, with `dark` taken off first where it fits: the
+/// sky's unevenness without the flat and with it, for the middle of the frames
+/// by how much the flat changed it. `None` if no frame could be tried.
+///
+/// The dark comes off first because a sensor's offset lifts every pixel alike,
+/// and measured against it any unevenness looks small.
+#[must_use]
+pub fn try_flat(
+    flat: &MasterFlat,
+    dark: Option<&MasterFrame>,
+    samples: &[PathBuf],
+) -> Option<Trial> {
+    let mut trials: Vec<Trial> = samples
+        .iter()
+        .filter_map(|path| {
+            let light = read_fits(path).ok()?;
+            if !flat.matches(&light) {
+                return None;
+            }
+            let light = match dark.filter(|d| d.matches(&light)) {
+                Some(dark) => fits_core::calib::subtract_dark(&light, dark).ok()?,
+                None => light,
+            };
+            let before = unevenness(&light)?;
+            let divided = fits_core::calib::divide_flat(&light, flat).ok()?;
+            let after = unevenness(&divided)?;
+            Some(Trial { before, after })
+        })
+        .collect();
+    if trials.is_empty() {
+        return None;
+    }
+    trials.sort_by(|a, b| (a.after / a.before).total_cmp(&(b.after / b.before)));
+    Some(trials[trials.len() / 2])
 }
 
 /// A flat set described, with what comes off it and how old it is beside the
@@ -397,12 +533,17 @@ pub const FLAT_AGE_WORTH_SAYING: i64 = 30;
 /// and nothing is said to be missing, since calibrating is then the user's own
 /// business. `progress` is told what is being made while it is.
 ///
+/// Each flat that could suit the lights is tried on `samples`, a few of their
+/// frames, in the order the library ranks them, and the first that does not
+/// leave their sky less even is used. See [`try_flat`].
+///
 /// # Errors
 ///
 /// [`Failed::Cancelled`] if asked to stop. A master that cannot be made is not
 /// an error: it is said to be missing, and the lights go uncorrected by it.
 pub fn choose(
     lights: &Taken,
+    samples: &[PathBuf],
     by_hand: (Option<Arc<MasterFrame>>, Option<Arc<MasterFlat>>),
     library: Option<&InUse>,
     cancel: &AtomicBool,
@@ -438,22 +579,42 @@ pub fn choose(
         chosen.used.push("flat: the master chosen by hand".into());
         chosen.flat = Some(flat);
     } else if let Some(in_use) = library {
-        match in_use.library.flat_for(lights) {
-            Ok(flats) => {
-                let label = flat_words(flats, &in_use.library, lights);
-                let flat_dark = in_use.library.dark_for_flats(&flats.taken);
-                let mut report = |done: usize, total: usize| {
-                    progress(format!("Making the master flat: {done} of {total}"));
-                };
-                match in_use.masters.flat(flats, flat_dark, cancel, &mut report) {
-                    Ok((master, _)) => {
-                        chosen.used.push(format!("flat: {label}"));
-                        chosen.flat = Some(Arc::new(master));
+        match in_use.library.flats_for(lights) {
+            Ok(candidates) => {
+                // Each in turn, until one is found to suit the frames: the
+                // best by date may have been taken with something in the way.
+                let mut rejected = Vec::new();
+                for flats in candidates {
+                    let label = flat_words(flats, &in_use.library, lights);
+                    let flat_dark = in_use.library.dark_for_flats(&flats.taken);
+                    let mut report = |done: usize, total: usize| {
+                        progress(format!("Making the master flat: {done} of {total}"));
+                    };
+                    let master = match in_use.masters.flat(flats, flat_dark, cancel, &mut report) {
+                        Ok((master, _)) => master,
+                        Err(Failed::Cancelled) => return Err(Failed::Cancelled),
+                        Err(Failed::Because(why)) => {
+                            rejected.push(format!("{label}: {why}"));
+                            continue;
+                        }
+                    };
+                    progress("Trying the flat on the frames".into());
+                    match try_flat(&master, chosen.dark.as_deref(), samples) {
+                        Some(trial) if !trial.suits() => rejected.push(trial.rejecting(&label)),
+                        trial => {
+                            let tried =
+                                trial.map_or_else(String::new, |t| format!(" ({})", t.words()));
+                            chosen.used.push(format!("flat: {label}{tried}"));
+                            chosen.flat = Some(Arc::new(master));
+                            break;
+                        }
                     }
-                    Err(Failed::Cancelled) => return Err(Failed::Cancelled),
-                    Err(Failed::Because(why)) => chosen
-                        .missing
-                        .push(format!("no flat: {why}; vignetting and dust will remain")),
+                }
+                if chosen.flat.is_none() {
+                    chosen.missing.push(format!(
+                        "no flat: {}; vignetting and dust will remain",
+                        none_suits(&rejected)
+                    ));
                 }
             }
             Err(why) => chosen
@@ -476,6 +637,31 @@ pub struct Group {
     /// Whether they were not all exposed for the same time, so that no one
     /// dark suits them all.
     pub mixed_exposures: bool,
+    /// The frames, in the order they came.
+    pub paths: Vec<PathBuf>,
+}
+
+impl Group {
+    /// A few of the frames to try a flat on: see [`samples_of`].
+    #[must_use]
+    pub fn samples(&self) -> Vec<PathBuf> {
+        samples_of(&self.paths)
+    }
+}
+
+/// The first, middle and last of `paths`: a few frames from across a night,
+/// to try a flat on without reading them all.
+#[must_use]
+pub fn samples_of(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut picked: Vec<PathBuf> = Vec::new();
+    if let (Some(first), Some(last)) = (paths.first(), paths.last()) {
+        for path in [first, &paths[paths.len() / 2], last] {
+            if !picked.contains(path) {
+                picked.push(path.clone());
+            }
+        }
+    }
+    picked
 }
 
 /// The lights among `paths`, grouped by filter from their headers alone, in
@@ -503,6 +689,7 @@ pub fn groups_of(paths: &[PathBuf]) -> Vec<Group> {
         match groups.iter_mut().find(|g| g.filter == filter) {
             Some(group) => {
                 group.frames += 1;
+                group.paths.push(path.clone());
                 if group.taken.exposure != taken.exposure {
                     group.mixed_exposures = true;
                 }
@@ -512,6 +699,7 @@ pub fn groups_of(paths: &[PathBuf]) -> Vec<Group> {
                 taken,
                 frames: 1,
                 mixed_exposures: false,
+                paths: vec![path.clone()],
             }),
         }
     }
@@ -553,6 +741,18 @@ mod tests {
     use crate::library::Library;
     use fits_core::testutil::{gaussian_background, write_synthetic, SyntheticSpec};
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_flat_is_tried_on_the_first_middle_and_last_frames() {
+        let paths: Vec<PathBuf> = (0..7).map(|i| PathBuf::from(format!("{i}.fits"))).collect();
+        let names = |picked: Vec<PathBuf>| -> Vec<String> {
+            picked.iter().map(|p| p.display().to_string()).collect()
+        };
+        assert_eq!(names(samples_of(&paths)), ["0.fits", "3.fits", "6.fits"]);
+        assert_eq!(names(samples_of(&paths[..2])), ["0.fits", "1.fits"]);
+        assert_eq!(names(samples_of(&paths[..1])), ["0.fits"]);
+        assert!(samples_of(&[]).is_empty());
+    }
 
     const W: usize = 48;
     const H: usize = 40;

@@ -3683,6 +3683,16 @@ quite matching, and some of it is the sky's own light-pollution gradient, which
 no flat can take out. Fresher flats would do more; the gradient of the sky needs
 background extraction.
 
+**Corrected in Phase 27: this measurement was wrong about the flat.** The L-Pro
+flats of 2024-10-04 were taken with something shadowing the bottom of the field:
+the master reads 0.32 along its bottom edge against 1.21 in the middle. Dividing
+by it multiplied the bottom of each frame about fourfold, and that brightened
+the two bottom corner boxes; the corners measured closer to the centre because
+half of them had been made too bright, not because vignetting was taken out.
+Measured over the whole sky, the flat left these frames less even than they
+were. The dark's part of the result — the hot pixels, and fewer samples rejected
+— stands.
+
 ### Acceptance criteria
 
 - [x] Frame types are read however capture programs write them.
@@ -3800,8 +3810,8 @@ from 2024-10-04, reads 0.33 along its bottom edge against 1.27 in the middle and
 1.26 along its top — something shadowed the bottom of the field when it was
 taken — so dividing January's frames by it multiplied their bottom edge
 fourfold. The library chose it because it was the only one; a flat that makes a
-frame's sky less even than it was is a flat that does not match, and saying so
-is the next thing to do.
+frame's sky less even than it was is a flat that does not match. Phase 27 tries
+each flat on the frames before using it.
 
 ### Acceptance criteria
 
@@ -3821,6 +3831,82 @@ is the next thing to do.
   61-megapixel colour frame. The loader thread could do it instead.
 - **Only for display.** A stack can be written with its gradient taken out once
   the display has shown it can be trusted.
+
+---
+
+## Phase 27 — A Flat Must Suit the Frames
+
+The library chose a flat by filter and date alone. A flat that was taken badly —
+a shadow across the field, a dew cap in the way, the camera turned since — was
+still chosen, and pressed its faults into every frame. Phase 26 found one: both
+flats of 2024-10-04, L-Pro and L-Ultimate, a third as bright along the bottom
+edge as in the middle.
+
+### How
+
+A flat is tried on the frames before it is used. `gradient::unevenness`
+measures how uneven a frame's sky is: the frame cut into boxes 32 across, as for
+background extraction, each box's sky taken with the stars clipped away, and the
+spread between the 5th and 95th percentile boxes divided by the median box.
+Three frames are sampled — the first, middle and last of the night — and each
+measured with the dark taken off, then again with the flat divided out as well.
+The flat is used if, on the median of the three, the sky is no more than 1.2
+times as uneven with it as without.
+
+A flat that suits evens the sky, or leaves it about as it was where vignetting
+is slight and the sky's own gradient dominates. A shadowed one leaves it far
+less even. On the real data, the ratio for the December L flat on its own
+nights was 0.37 to 1.03; for the October flats on January's frames, 1.19 to
+1.87, with a median of about 1.65. The 1.2 sits between them, nearer the good
+side, since one bad flat costs a whole stack while a flat passed over only
+leaves vignetting that background extraction can take out.
+
+The library offers every flat for the filter, best first; the first that suits
+is used. When none does, there is no flat, and the panel, the message and the
+stack's history all say why: "none of the flats suits these frames, so none is
+used", with the first choice's figures and how many others did no better. The
+figures go in the report either way — "sky 77% uneven without it, 78% with it"
+— so a flat that was used can be judged too.
+
+The panel tries flats whose masters are already kept, reading the three frames
+in the background; one not yet made is said to be tried when stacking. Stacking
+makes the master, tries it, and moves on to the next if it does not suit. Export
+tries flats on the frames taken alike — same filter, exposure, size, binning,
+gain, offset, temperature and camera — since those are what calibrate alike. A
+flat chosen by hand is never tried: it wins, as before.
+
+### What it measured
+
+| Frames | Flat | Sky uneven, without → with | Verdict |
+|---|---|---|---|
+| Barnard's Loop, L-Ultimate, 2025-01-15 | four of 2024-10-04/05 | 119 % → 154–169 % | none used |
+| IC 434, L | the December L flat | 77 % → 78 % | used |
+
+Trying the flats cost 2.3 s in the panel and 1.0 s in a stack, with the masters
+already kept. IC 434's sky barely changes on the median, though single frames
+measured earlier went from 66 % to 28 % and 65 % to 24 %: its sampled frames
+are dominated by a twilight gradient no flat can take out, which is why a flat
+is let through at a little worse, rather than required to be better.
+
+### Acceptance criteria
+
+- [x] Unevenness is near zero for an even sky and grows with a gradient or a
+      shadow; a frame too small to measure is not measured.
+- [x] Every flat for a filter is offered, best first.
+- [x] A flat that leaves the sky less even is passed over for an older one that
+      suits, in the stack and in the panel.
+- [x] With only an unsuitable flat there is none, and the panel, the message
+      and the file say why.
+- [x] Flats are tried on the first, middle and last frames.
+- [x] A flat chosen by hand is not tried.
+
+### Not done
+
+- **One test for the whole night.** A flat that suits the start of a night and
+  not its end — the camera turned halfway — is judged on the median of three.
+- **The threshold is set from one observer's data**, two filters and two
+  nights. It is a constant, `FLAT_MAY_WORSEN`, and the report gives the
+  figures, so a flat passed over wrongly can be seen and chosen by hand.
 
 ---
 

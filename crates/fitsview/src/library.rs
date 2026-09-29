@@ -394,6 +394,16 @@ impl Library {
     ///
     /// Says what was missing, and which filters there are flats for.
     pub fn flat_for(&self, lights: &Taken) -> Result<&Set, String> {
+        self.flats_for(lights).map(|flats| flats[0])
+    }
+
+    /// Every flat that could suit `lights`, best first, as [`Library::flat_for`]
+    /// ranks them: for trying in turn when the best proves not to match.
+    ///
+    /// # Errors
+    ///
+    /// As [`Library::flat_for`].
+    pub fn flats_for(&self, lights: &Taken) -> Result<Vec<&Set>, String> {
         let alike: Vec<&Set> = self
             .of_kind(Kind::Flat)
             .filter(|s| same_frame(&s.taken, lights))
@@ -420,7 +430,14 @@ impl Library {
                 )
             });
         }
-        Ok(best(through, lights, |_| 0.0, Order::DateFirst))
+        let mut ranked = Vec::with_capacity(through.len());
+        let mut left = through;
+        while !left.is_empty() {
+            let next = best(left.clone(), lights, |_| 0.0, Order::DateFirst);
+            left.retain(|set| !std::ptr::eq(*set, next));
+            ranked.push(next);
+        }
+        Ok(ranked)
     }
 
     /// What to take off a flat set before it is combined: flat darks of its
@@ -851,6 +868,29 @@ mod tests {
             folder_of(library.flat_for(&lights).unwrap()),
             "/astro/recent"
         );
+    }
+
+    #[test]
+    fn every_flat_for_a_filter_is_offered_best_first() {
+        let lights = frame(Kind::Light, |_| {});
+        let library = library(&[
+            (
+                "october",
+                frame(Kind::Flat, |t| t.day = day_of("2024-10-05")),
+            ),
+            (
+                "december",
+                frame(Kind::Flat, |t| t.day = day_of("2024-12-20")),
+            ),
+            ("l", frame(Kind::Flat, |t| t.filter = Some("L".into()))),
+        ]);
+        let order: Vec<String> = library
+            .flats_for(&lights)
+            .unwrap()
+            .into_iter()
+            .map(folder_of)
+            .collect();
+        assert_eq!(order, ["/astro/december", "/astro/october"]);
     }
 
     #[test]

@@ -1325,7 +1325,7 @@ impl Model {
                 let plan = masters::groups_of(&paths)
                     .into_iter()
                     .map(|group| {
-                        let plan = masters::plan(&group.taken, &library.library);
+                        let plan = masters::plan(&group, &library);
                         (group, plan)
                     })
                     .collect();
@@ -4906,6 +4906,18 @@ mod tests {
         filters: &[&str],
         cards: &[(&str, &str)],
     ) -> TempDir {
+        stackable_folder_lit(shifts, filters, cards, &|_, _| (1.0, 0.0))
+    }
+
+    /// The same, the sky at each pixel multiplied and then added to by what
+    /// `light` gives: vignetting, and the sensor's own signal, as a frame
+    /// straight off a camera has them.
+    fn stackable_folder_lit(
+        shifts: &[(f64, f64)],
+        filters: &[&str],
+        cards: &[(&str, &str)],
+        light: &dyn Fn(usize, usize) -> (f64, f64),
+    ) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (160usize, 160usize);
         let places = [
@@ -4920,6 +4932,10 @@ mod tests {
         for (index, ((dx, dy), filter)) in shifts.iter().zip(filters).enumerate() {
             let mut pixels =
                 fits_core::testutil::gaussian_background(w, h, 1000.0, 10.0, 80 + index as u64);
+            for (k, pixel) in pixels.iter_mut().enumerate() {
+                let (times, plus) = light(k % w, k / w);
+                *pixel = *pixel * times + plus;
+            }
             for (px, py) in places {
                 let (cx, cy) = (px + dx, py + dy);
                 for sy in -6i64..=6 {
@@ -5026,11 +5042,12 @@ mod tests {
     }
 
     /// Light frames that say how they were taken, as a capture program's do.
-    const LIGHT_CARDS: [(&str, &str); 4] = [
+    const LIGHT_CARDS: [(&str, &str); 5] = [
         ("IMAGETYP", "'LIGHT'"),
         ("EXPTIME", "180.0"),
         ("GAIN", "100"),
         ("SET-TEMP", "-14.0"),
+        ("DATE-OBS", "'2025-01-16T02:00:00'"),
     ];
 
     /// How much light a column gets in the test flats: a quarter more at the
@@ -5070,7 +5087,12 @@ mod tests {
             write(
                 "FLAT/L",
                 "FLAT",
-                &[("FILTER", "'L'"), ("EXPTIME", "2.0"), ("GAIN", "100")],
+                &[
+                    ("FILTER", "'L'"),
+                    ("EXPTIME", "2.0"),
+                    ("GAIN", "100"),
+                    ("DATE-OBS", "'2024-12-01T20:00:00'"),
+                ],
                 &|i| {
                     let noise = fits_core::testutil::gaussian_background(w, h, 0.0, 5.0, 950 + i);
                     (0..w * h)
@@ -5090,7 +5112,9 @@ mod tests {
 
     /// Lights of one filter, L, lined up by their stars.
     fn lights() -> TempDir {
-        stackable_folder_with(
+        // Vignetted as the flats record, and carrying the dark's 200 counts,
+        // as frames straight off the camera do.
+        stackable_folder_lit(
             &[
                 (0.0, 0.0),
                 (5.0, -3.0),
@@ -5101,6 +5125,7 @@ mod tests {
             ],
             &["L"; 6],
             &LIGHT_CARDS,
+            &|x, _| (flat_field(x, 160), 200.0),
         )
     }
 
@@ -5163,30 +5188,29 @@ mod tests {
 
         let (stacked, history) = stacked_l(folder.path());
         let (w, h) = (stacked.width, stacked.height);
-        // A sky of 1000 less the dark's 200, then the flat divided out: where
-        // the flat was brighter the sky comes out dimmer, by just as much.
+        // The frames came off the camera vignetted, a quarter brighter at the
+        // left, and 200 counts high with the sensor's own signal. With the dark
+        // taken off and the flat divided out, the sky is even from side to
+        // side, at the flat's average level.
         let median = |xs: std::ops::Range<usize>| {
             let mut v: Vec<f64> = (10..h - 10)
                 .flat_map(|y| xs.clone().map(move |x| (x, y)))
                 .map(|(x, y)| f64::from(stacked.data[y * w + x]))
-                .filter(|v| v.is_finite() && *v < 1_100.0)
+                .filter(|v| v.is_finite() && *v < 1_400.0)
                 .collect();
             let mid = v.len() / 2;
             *v.select_nth_unstable_by(mid, f64::total_cmp).1
         };
         let (left, right) = (median(10..20), median(140..150));
-        let expected = flat_field(15, w) / flat_field(145, w);
         assert!(
-            (right / left - expected).abs() < 0.02,
-            "left {left}, right {right}, expected {expected}"
+            (right / left - 1.0).abs() < 0.02,
+            "the vignetting is still there: left {left}, right {right}"
         );
-        // The gain map averages one, so the sky under it is where the dark
-        // left it.
         #[allow(clippy::cast_precision_loss)]
         let mean_gain = (0..w).map(|x| flat_field(x, w)).sum::<f64>() / w as f64;
-        let level = left * flat_field(15, w) / mean_gain;
+        let level = (left + right) / 2.0;
         assert!(
-            (level - 800.0).abs() < 15.0,
+            (level - 1000.0 * mean_gain).abs() < 15.0,
             "the dark was not taken off: sky {level}"
         );
 
@@ -5202,6 +5226,86 @@ mod tests {
             .calibration_report
             .iter()
             .any(|l| l.starts_with("L — dark:")));
+    }
+
+    /// Newer flats for the same filter, taken with something shadowing the
+    /// bottom of the field: a third as bright along the bottom edge.
+    fn add_shadowed_flats(library: &Path) {
+        let (w, h) = (160usize, 160usize);
+        let folder = library.join("FLAT/L-shadowed");
+        std::fs::create_dir_all(&folder).unwrap();
+        for i in 0..6u64 {
+            let noise = fits_core::testutil::gaussian_background(w, h, 0.0, 5.0, 990 + i);
+            let pixels: Vec<f64> = (0..w * h)
+                .map(|k| {
+                    let shadow = if k / w < h / 8 { 0.35 } else { 1.0 };
+                    500.0 + 20_000.0 * flat_field(k % w, w) * shadow + noise[k]
+                })
+                .collect();
+            let spec = SyntheticSpec::new(w, h, -32)
+                .with_card("IMAGETYP", "'FLAT'")
+                .with_card("FILTER", "'L'")
+                .with_card("EXPTIME", "2.0")
+                .with_card("GAIN", "100")
+                .with_card("DATE-OBS", "'2025-01-15T20:00:00'");
+            write_synthetic(&folder, &format!("FLAT{i}.fits"), &spec, &pixels).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_flat_that_leaves_the_sky_less_even_is_passed_over_for_one_that_suits() {
+        // The newest flat is the library's first choice by date, but it was
+        // taken with the bottom of the field shadowed. Tried on the frames, it
+        // leaves their sky less even than it was, so the older one is used.
+        let (folder, library) = (lights(), library_for_lights(true));
+        add_shadowed_flats(library.path());
+        let mut m = model_with_library(folder.path(), library.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        let flat = m
+            .calibration_report
+            .iter()
+            .find(|l| l.starts_with("L — flat:"))
+            .unwrap_or_else(|| panic!("{:?}", m.calibration_report));
+        assert!(
+            flat.contains("2024-12-01"),
+            "the older flat should be used: {flat}"
+        );
+        assert!(
+            flat.contains("uneven without it"),
+            "and say what trying it found: {flat}"
+        );
+
+        // Once the masters are kept, the panel tries them too, and plans the
+        // same flat the stack used.
+        let reopened = model_with_library(folder.path(), library.path());
+        let planned = reopened.library_plan[0].1.flat.as_ref().unwrap();
+        assert!(planned.contains("2024-12-01"), "{planned}");
+        assert!(planned.contains("uneven without it"), "{planned}");
+
+        // With only the shadowed one, there is no flat, and it says why.
+        let (folder, library) = (lights(), library_for_lights(false));
+        add_shadowed_flats(library.path());
+        let mut m = model_with_library(folder.path(), library.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let missing = m
+            .calibration_report
+            .iter()
+            .find(|l| l.contains("— no flat:"))
+            .unwrap_or_else(|| panic!("{:?}", m.calibration_report));
+        assert!(
+            missing.contains("none of the flats suits these frames"),
+            "{missing}"
+        );
+        assert!(missing.contains("leaves the sky less even"), "{missing}");
+        let reopened = model_with_library(folder.path(), library.path());
+        let why = reopened.library_plan[0].1.flat.as_ref().unwrap_err();
+        assert!(
+            why.contains("none of the flats suits these frames"),
+            "{why}"
+        );
     }
 
     #[test]

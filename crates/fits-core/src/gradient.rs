@@ -323,6 +323,62 @@ pub fn remove(image: &FitsImage, model: &Model) -> FitsImage {
     }
 }
 
+/// How uneven a frame's sky is: the spread between the brightest and faintest
+/// twentieth of its boxes' skies, as a fraction of the typical sky, averaged
+/// over its channels. `None` for a frame too small to measure, or without sky.
+///
+/// The fifth and ninety-fifth percentiles rather than the extremes, so that a
+/// bright nebula a few boxes across does not count; a band of light or shadow
+/// across a tenth of the frame does. Used to tell whether a flat suits a frame:
+/// divided by a flat that matches it, a frame's sky comes out more even, since
+/// the vignetting the flat recorded goes; divided by one that does not, less.
+#[must_use]
+pub fn unevenness(image: &FitsImage) -> Option<f64> {
+    let (width, height) = (image.width, image.height);
+    let side = (width.max(height) / 32).max(4);
+    let (across_x, down_y) = (width / side, height / side);
+    if across_x * down_y < 20 {
+        return None;
+    }
+    let plane = width * height;
+    let mut total = 0.0;
+    for channel in 0..image.channels {
+        let data = &image.data[channel * plane..(channel + 1) * plane];
+        let mut skies: Vec<f64> = (0..across_x * down_y)
+            .into_par_iter()
+            .filter_map(|k| {
+                box_sky(
+                    data,
+                    width,
+                    (k % across_x) * side,
+                    (k / across_x) * side,
+                    side,
+                )
+            })
+            .collect();
+        if skies.len() < 20 {
+            return None;
+        }
+        skies.sort_by(f64::total_cmp);
+        let at = |fraction: f64| {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let i = ((skies.len() - 1) as f64 * fraction).round() as usize;
+            skies[i]
+        };
+        let typical = at(0.5);
+        if typical.is_nan() || typical <= 0.0 {
+            return None;
+        }
+        total += (at(0.95) - at(0.05)) / typical;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some(total / image.channels as f64)
+}
+
 /// `image` with its gradient taken out, or unchanged if none could be measured.
 #[must_use]
 pub fn flatten(image: &FitsImage, settings: &Settings) -> FitsImage {
@@ -440,6 +496,68 @@ mod tests {
             star(&after),
             star(&before)
         );
+    }
+
+    #[test]
+    fn unevenness_grows_with_a_gradient_or_a_shadow() {
+        let noise = gaussian_background(W, H, 0.0, 5.0, 11);
+        let even = unevenness(&image(1, |_, x, y| 1000.0 + noise[y * W + x])).unwrap();
+        assert!(even < 0.02, "an even sky: {even}");
+
+        // A ramp from 900 to 1100 across the frame: about 180 between the
+        // 5th and 95th percentile boxes, on a typical 1000.
+        let ramp = |x: usize| 900.0 + 200.0 * x as f64 / (W - 1) as f64;
+        let tilted = unevenness(&image(1, |_, x, y| ramp(x) + noise[y * W + x])).unwrap();
+        assert!((0.15..0.2).contains(&tilted), "a tilt: {tilted}");
+
+        // The bottom eighth a third as bright, as behind a shadowed flat.
+        let shadow = |y: usize| if y < H / 8 { 0.35 } else { 1.0 };
+        let shadowed =
+            unevenness(&image(1, |_, x, y| 1000.0 * shadow(y) + noise[y * W + x])).unwrap();
+        assert!(shadowed > 0.6, "a shadow: {shadowed}");
+
+        // A bright nebula a few boxes across barely counts.
+        let nebula = |x: usize, y: usize| {
+            let r2 = (x as f64 - 150.0).powi(2) + (y as f64 - 100.0).powi(2);
+            500.0 * (-r2 / (2.0 * 12.0f64.powi(2))).exp()
+        };
+        let with_nebula = unevenness(&image(1, |_, x, y| {
+            1000.0 + nebula(x, y) + noise[y * W + x]
+        }))
+        .unwrap();
+        assert!(with_nebula < 0.05, "a small nebula: {with_nebula}");
+    }
+
+    #[test]
+    fn unevenness_is_the_mean_over_colours() {
+        let noise = gaussian_background(W, H, 0.0, 5.0, 13);
+        let ramp = |x: usize| 900.0 + 200.0 * x as f64 / (W - 1) as f64;
+        let one = unevenness(&image(1, |_, x, y| ramp(x) + noise[y * W + x])).unwrap();
+        let colour = unevenness(&image(3, |c, x, y| {
+            if c == 1 {
+                ramp(x) + noise[y * W + x]
+            } else {
+                1000.0 + noise[y * W + x]
+            }
+        }))
+        .unwrap();
+        assert!((colour - one / 3.0).abs() < 0.01, "{colour} against {one}");
+    }
+
+    #[test]
+    fn a_frame_too_small_or_without_sky_is_not_measured() {
+        let tiny = FitsImage {
+            width: 12,
+            height: 12,
+            channels: 1,
+            data: vec![1000.0; 144],
+            header: FitsHeader::default(),
+            min: 1000.0,
+            max: 1000.0,
+        };
+        assert_eq!(unevenness(&tiny), None);
+        assert_eq!(unevenness(&image(1, |_, _, _| 0.0)), None);
+        assert_eq!(unevenness(&image(1, |_, _, _| f64::NAN)), None);
     }
 
     #[test]

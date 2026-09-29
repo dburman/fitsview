@@ -495,7 +495,14 @@ fn stack_worker(
                         item,
                     });
                 };
-                match masters::choose(&lights, by_hand, library.as_deref(), cancel, &mut report) {
+                match masters::choose(
+                    &lights,
+                    &masters::samples_of(group),
+                    by_hand,
+                    library.as_deref(),
+                    cancel,
+                    &mut report,
+                ) {
                     Ok(chosen) => chosen,
                     Err(_) => {
                         let _ = tx.send(Update::Cancelled);
@@ -957,6 +964,19 @@ fn export_worker(
         std::collections::HashMap::new();
     let mut missing: Vec<String> = Vec::new();
     let mut written = 0usize;
+    // The frames taken each way, from their headers, so that each way has a
+    // few frames to try its flat on.
+    let mut alike: std::collections::HashMap<String, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for path in paths {
+        let key = read_fits_header(path)
+            .ok()
+            .as_ref()
+            .and_then(Taken::of_light)
+            .as_ref()
+            .map_or_else(String::new, taken_key);
+        alike.entry(key).or_default().push(path.clone());
+    }
 
     for (index, path) in paths.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -978,19 +998,7 @@ fn export_worker(
         };
 
         let taken = Taken::of_light(&light.header);
-        let key = taken.as_ref().map_or_else(String::new, |t| {
-            format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
-                t.filter,
-                t.exposure,
-                t.size,
-                t.binning,
-                t.gain,
-                t.offset,
-                t.set_temperature,
-                t.camera
-            )
-        });
+        let key = taken.as_ref().map_or_else(String::new, taken_key);
         if !chosen.contains_key(&key) {
             let this = match &taken {
                 Some(taken) => {
@@ -1001,7 +1009,14 @@ fn export_worker(
                             item,
                         });
                     };
-                    match masters::choose(taken, by_hand.clone(), library, cancel, &mut report) {
+                    match masters::choose(
+                        taken,
+                        &masters::samples_of(&alike[&key]),
+                        by_hand.clone(),
+                        library,
+                        cancel,
+                        &mut report,
+                    ) {
                         Ok(this) => this,
                         Err(_) => {
                             let _ = tx.send(Update::Cancelled);
@@ -1054,6 +1069,14 @@ fn export_worker(
         directory: directory.to_path_buf(),
         missing,
     }));
+}
+
+/// A key for the way a frame was taken, as far as its calibration goes.
+fn taken_key(t: &Taken) -> String {
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        t.filter, t.exposure, t.size, t.binning, t.gain, t.offset, t.set_temperature, t.camera
+    )
 }
 
 /// A line of what was said about calibration, as a `HISTORY` card holds it.
