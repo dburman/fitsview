@@ -16,6 +16,7 @@
 //! - [`jobs`] runs slow work, such as combining darks or exporting a folder,
 //!   on a background thread with progress and cancellation.
 //! - [`library`] finds the darks and flats that suit a night.
+//! - [`masters`] makes master darks and flats from the library, and keeps them.
 //! - [`loader`] decodes images on a worker thread and caches the results.
 //! - [`natsort`] orders file names so `light_2` comes before `light_10`.
 //! - [`view`] is the zoom and pan arithmetic.
@@ -40,6 +41,7 @@ pub mod icon;
 pub mod jobs;
 pub mod library;
 pub mod loader;
+pub mod masters;
 pub mod measurements;
 pub mod memory;
 pub mod natsort;

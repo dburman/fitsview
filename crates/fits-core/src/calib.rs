@@ -309,8 +309,22 @@ pub fn build_master_flat(
     flats: &[Arc<FitsImage>],
     flat_dark: Option<&MasterFrame>,
 ) -> Result<MasterFlat, CalibError> {
-    let combined = build_master_median(flats)?;
+    flat_from_combined(build_master_median(flats)?, flat_dark)
+}
 
+/// Turns flat frames already combined into a gain map: `flat_dark` taken off,
+/// then normalised as [`build_master_flat`] does.
+///
+/// For flats combined some other way than by the median, such as a frame at a
+/// time with outliers left out, which a library of full-frame flats needs.
+///
+/// # Errors
+///
+/// As [`build_master_flat`], less the errors of combining.
+pub fn flat_from_combined(
+    combined: MasterFrame,
+    flat_dark: Option<&MasterFrame>,
+) -> Result<MasterFlat, CalibError> {
     let mut data = combined.data;
     if let Some(dark) = flat_dark {
         if dark.width != combined.width
