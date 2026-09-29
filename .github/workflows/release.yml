@@ -1,8 +1,8 @@
 name: Release
 
-# Building a release is expensive on a private repository, where macOS minutes
-# bill at 10x and Windows at 2x, so this runs only when a version tag is
-# pushed rather than on every commit.
+# Runs when a version tag is pushed, building and testing each download on its
+# own operating system. Started by hand it only builds: the downloads are kept
+# with the run, and no release is touched.
 on:
   push:
     tags:
@@ -55,7 +55,8 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/release/${{ matrix.binary }}" dist/
-          cp README.md dist/
+          # The licence travels with every copy, as it asks to.
+          cp README.md LICENSE dist/
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then
             7z a "../fitsview-${{ matrix.name }}.zip" .
