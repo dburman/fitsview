@@ -26,12 +26,16 @@ jobs:
           - os: ubuntu-latest
             name: linux-x86_64
             binary: fitsview
+            # Built for an older C library than the runner's own: see below.
+            built: target/x86_64-unknown-linux-gnu/release
           - os: macos-latest
             name: macos-arm64
             binary: fitsview
+            built: target/release
           - os: windows-latest
             name: windows-x86_64
             binary: fitsview.exe
+            built: target/release
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -47,14 +51,42 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features
 
+      # A Linux program built on the runner's Ubuntu 24.04 needs its C library,
+      # 2.39, and will not start on Debian 12, Ubuntu 22.04 or anything older.
+      # Linked by Zig against 2.28 instead, the same download starts on Rocky 8,
+      # Debian 11 and 12, and Ubuntu 24.04. The tests above still run natively.
+      - name: Install the Zig linker
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.4
+
       - name: cargo build --release
-        run: cargo build --release
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+          else
+            cargo build --release
+          fi
+
+      # So that a dependency needing a newer C library fails the release here
+      # rather than on someone's older machine.
+      - name: Check the Linux build starts on an older distribution
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD/${{ matrix.built }}:/out:ro" rockylinux:8 /out/fitsview --version
 
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.binary }}" dist/
+          cp "${{ matrix.built }}/${{ matrix.binary }}" dist/
           # The licence travels with every copy, as it asks to.
           cp README.md LICENSE dist/
           cd dist
