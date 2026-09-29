@@ -21,6 +21,7 @@ use fits_core::calib::{flat_from_combined, MasterFlat, MasterFrame};
 use fits_core::stack::{Alignment, Stack, DEFAULT_CLIP};
 use fits_core::{read_fits, write_fits, FitsHeader};
 
+use crate::ahead;
 use crate::library::{Kind, Library, Set, Taken};
 use crate::measurements::Stamp;
 
@@ -82,28 +83,40 @@ pub fn combine(set: &Set, cancel: &AtomicBool, progress: Progress) -> Result<Mas
     let steps = total * passes;
     let mut done = 0;
 
+    // Each frame is read a frame ahead, while the one before is added: making
+    // a master is mostly reading.
     let mut stack: Option<Stack> = None;
-    let mut used: Vec<&Path> = Vec::new();
-    for path in &set.frames {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Failed::Cancelled);
-        }
-        progress(done, steps);
-        done += 1;
-        let Ok(image) = read_fits(path) else {
-            log::warn!("passing over {}: it cannot be read", path.display());
-            continue;
-        };
-        let stack = stack
-            .get_or_insert_with(|| Stack::rejecting(image.width, image.height, image.channels));
-        if stack.add(&image, Alignment::still()) {
-            used.push(path);
-        } else {
-            log::warn!(
-                "passing over {}: it is not the size of the rest",
-                path.display()
-            );
-        }
+    let mut used: Vec<PathBuf> = Vec::new();
+    let mut stopped = false;
+    ahead::each(
+        &set.frames,
+        |path| read_fits(path).ok(),
+        |path, image| {
+            if cancel.load(Ordering::Relaxed) {
+                stopped = true;
+                return false;
+            }
+            progress(done, steps);
+            done += 1;
+            let Some(image) = image else {
+                log::warn!("passing over {}: it cannot be read", path.display());
+                return true;
+            };
+            let stack = stack
+                .get_or_insert_with(|| Stack::rejecting(image.width, image.height, image.channels));
+            if stack.add(&image, Alignment::still()) {
+                used.push(path.clone());
+            } else {
+                log::warn!(
+                    "passing over {}: it is not the size of the rest",
+                    path.display()
+                );
+            }
+            true
+        },
+    );
+    if stopped {
+        return Err(Failed::Cancelled);
     }
     let Some(stack) = stack.filter(|s| s.frames() > 0) else {
         return Err(Failed::Because(format!(
@@ -115,15 +128,24 @@ pub fn combine(set: &Set, cancel: &AtomicBool, progress: Progress) -> Result<Mas
 
     let image = match stack.into_rejecting(DEFAULT_CLIP) {
         Ok(mut second) => {
-            for path in &used {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(Failed::Cancelled);
-                }
-                progress(done, steps);
-                done += 1;
-                if let Ok(image) = read_fits(path) {
-                    second.add(&image, Alignment::still());
-                }
+            ahead::each(
+                &used,
+                |path| read_fits(path).ok(),
+                |_, image| {
+                    if cancel.load(Ordering::Relaxed) {
+                        stopped = true;
+                        return false;
+                    }
+                    progress(done, steps);
+                    done += 1;
+                    if let Some(image) = image {
+                        second.add(&image, Alignment::still());
+                    }
+                    true
+                },
+            );
+            if stopped {
+                return Err(Failed::Cancelled);
             }
             second.finish(FitsHeader::default())
         }

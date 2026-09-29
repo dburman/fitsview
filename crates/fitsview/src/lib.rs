@@ -4,6 +4,7 @@
 //! opening a window:
 //!
 //! - [`app`] holds the state and every rule that changes it.
+//! - [`ahead`] gets the next frame ready while this one is worked on.
 //! - [`actions`] deletes, renames and flags files, behind a trait so tests
 //!   never touch the real trash.
 //! - [`crash`] turns a panic into a message the user can act on.
@@ -34,6 +35,7 @@
 
 pub mod actions;
 pub mod adapter;
+pub mod ahead;
 pub mod app;
 pub mod crash;
 pub mod folder;

@@ -61,11 +61,13 @@ const REJECTING_SAMPLE: u64 = 30;
 /// Bytes a plain stack keeps for every sample: its running totals.
 const PLAIN_SAMPLE: u64 = 8;
 
-/// Bytes a pixel of the frame being worked on takes while it is: raw, as
-/// calibrated, in colour, half placed, and what finding its stars needs. The
-/// stand-alone stack of the Barnard's Loop night measured 7.46 GB resident,
-/// which this and the figures above account for.
-const WORKING_PIXEL: u64 = 32;
+/// Bytes a pixel of the frames being worked on take while they are: the frame
+/// being added — raw, as calibrated, in colour, half placed, and what finding
+/// its stars needs — the next one, already prepared on the thread ahead, and
+/// the master dark and flat. Ten Barnard's Loop frames stacked by the job
+/// alone, calibrated from the library, measured 9.36 GB resident: 63 bytes a
+/// pixel beside the figures above.
+const WORKING_PIXEL: u64 = 64;
 
 /// What a stack of `channels` at a time needs, in bytes.
 #[must_use]
@@ -125,15 +127,16 @@ mod tests {
 
     #[test]
     fn what_a_stack_needs_matches_what_one_was_measured_to_take() {
-        // 7.46 GB resident, stand-alone, for that night rejecting in colour.
+        // 9.36 GB resident, the job alone, for that night rejecting in colour
+        // and calibrated from the library.
         let need = stack_needs(FRAME.0, FRAME.1, 3, true);
         #[allow(clippy::cast_precision_loss)]
         let gb = need as f64 / GB as f64;
-        assert!((7.2..7.7).contains(&gb), "{gb:.2} GB");
+        assert!((9.1..9.7).contains(&gb), "{gb:.2} GB");
         // A colour at a time, a third of the figures.
         #[allow(clippy::cast_precision_loss)]
         let apart = stack_needs(FRAME.0, FRAME.1, 1, true) as f64 / GB as f64;
-        assert!(apart < 4.0, "{apart:.2} GB");
+        assert!(apart < 6.0, "{apart:.2} GB");
     }
 
     #[test]

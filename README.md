@@ -140,10 +140,11 @@ The calibration and colour settings in force are applied on the way in, and the
 stacks are written beside the frames. Ten 61-megapixel frames take about four
 seconds, or ten with outliers rejected, which reads every frame a second time
 and judges every sample of it against the others. Rejecting against colour
-frames that size needs about 8.5 GB of memory at its peak, however many frames
-there are; on a machine without that to spare it stacks a colour at a time
-instead, in about 5.5 GB, reading every frame three times as often, to exactly
-the same result.
+frames that size, calibrated from a library, needs about 10.5 GB of memory at
+its peak, however many frames there are; on a machine without that to spare it
+stacks a colour at a time instead, in about 7 GB, reading every frame three
+times as often, to exactly the same result. The next frame is always read and
+prepared while the one before is being added.
 
 **Knowing what you are looking at.** The metadata panel shows the FITS header,
 with the keywords that identify a frame pinned to the top and a filter for
@@ -152,7 +153,7 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 813 automated tests, run on macOS, Linux and Windows on every change, and
+by 817 automated tests, run on macOS, Linux and Windows on every change, and
 again on each system before its download is built.
 
 ---
@@ -450,7 +451,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in twenty-four phases, each with its own acceptance criteria
+`fitsview` was built in twenty-five phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in

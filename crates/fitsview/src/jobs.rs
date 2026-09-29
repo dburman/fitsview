@@ -17,6 +17,7 @@ use fits_core::stack::{align, Alignment, PierSide, Stack};
 use fits_core::stars::{self, DetectionParams, StarField};
 use fits_core::{quality, read_fits, read_fits_header, write_fits, FitsHeader, FitsImage, Quality};
 
+use crate::ahead;
 use crate::folder::StarMeasure;
 use crate::library::Taken;
 use crate::masters;
@@ -530,10 +531,35 @@ fn stack_worker(
         // cheaper the second time round.
         let mut placed: Vec<(PathBuf, Alignment)> = Vec::new();
 
-        for path in group {
+        // Everything about a frame that does not depend on the others — read,
+        // calibrated, measured and searched for stars — is done a frame ahead
+        // on a thread of its own, while this one is lined up and added. The
+        // frame as it came off the disk is let go of there, once it has been
+        // measured, so only the prepared one waits.
+        let first_pass = |path: &PathBuf| -> Option<Arrived> {
+            let light = read_fits(path).ok()?;
+            let prepared = calib::calibrate_and_debayer(&light, dark, flat, pattern).ok()?;
+            // What this frame is worth against the others: quiet and sharp
+            // counts for more than noisy and soft.
+            let measured = quality::measure(&light);
+            let found = match pattern {
+                // Detection wants the mosaic, not the reconstruction.
+                Some(p) if light.channels == 1 => stars::detect_mosaic(&light, p, params),
+                _ => stars::detect(&prepared, params),
+            };
+            Some(Arrived {
+                side: PierSide::from_header(&light.header),
+                header: light.header,
+                prepared,
+                measured,
+                found,
+            })
+        };
+        let mut stopped = false;
+        ahead::each(group, first_pass, |path, arrived| {
             if cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(Update::Cancelled);
-                return;
+                stopped = true;
+                return false;
             }
             let _ = tx.send(Update::Progress {
                 done,
@@ -542,21 +568,17 @@ fn stack_worker(
             });
             done += 1;
 
-            let Ok(light) = read_fits(path) else { continue };
-            let side = PierSide::from_header(&light.header);
-            let Ok(prepared) = calib::calibrate_and_debayer(&light, dark, flat, pattern) else {
-                continue;
+            let Some(Arrived {
+                side,
+                header: light_header,
+                prepared,
+                measured,
+                found,
+            }) = arrived
+            else {
+                return true;
             };
-
-            // What this frame is worth against the others: quiet and sharp
-            // counts for more than noisy and soft.
-            let measured = quality::measure(&light);
             let size = (prepared.width, prepared.height);
-            let found = match pattern {
-                // Detection wants the mosaic, not the reconstruction.
-                Some(p) if light.channels == 1 => stars::detect_mosaic(&light, p, params),
-                _ => stars::detect(&prepared, params),
-            };
 
             match &reference {
                 None => {
@@ -581,7 +603,7 @@ fn stack_worker(
                     };
                     fresh.add_channels(&prepared, 0, placing);
                     placed.push((path.clone(), placing));
-                    header = Some(light.header.clone());
+                    header = Some(light_header);
                     sky = Some(fits_core::stack::sky_level(&prepared));
                     reference = Some((found, side, size));
                     stack = Some(fresh);
@@ -616,6 +638,11 @@ fn stack_worker(
                     }
                 }
             }
+            true
+        });
+        if stopped {
+            let _ = tx.send(Update::Cancelled);
+            return;
         }
 
         let (Some(stack), Some(header), Some((_, _, size))) = (stack, header, reference) else {
@@ -643,20 +670,30 @@ fn stack_worker(
                 Some(stack) => stack,
                 None => {
                     let mut stack = new_stack(size, per_stack);
-                    for (path, alignment) in &placed {
-                        if cancel.load(Ordering::Relaxed) {
-                            let _ = tx.send(Update::Cancelled);
-                            return;
-                        }
-                        let _ = tx.send(Update::Progress {
-                            done,
-                            total: steps,
-                            item: file_name_of(path),
-                        });
-                        done += 1;
-                        if let Some(prepared) = prepare(path, dark, flat) {
-                            stack.add_channels(&prepared, first, *alignment);
-                        }
+                    let mut stopped = false;
+                    ahead::each(
+                        &placed,
+                        |(path, _)| prepare(path, dark, flat),
+                        |(path, alignment), prepared| {
+                            if cancel.load(Ordering::Relaxed) {
+                                stopped = true;
+                                return false;
+                            }
+                            let _ = tx.send(Update::Progress {
+                                done,
+                                total: steps,
+                                item: file_name_of(path),
+                            });
+                            done += 1;
+                            if let Some(prepared) = prepared {
+                                stack.add_channels(&prepared, first, *alignment);
+                            }
+                            true
+                        },
+                    );
+                    if stopped {
+                        let _ = tx.send(Update::Cancelled);
+                        return;
                     }
                     stack
                 }
@@ -672,20 +709,30 @@ fn stack_worker(
             };
             let finished = match part {
                 Ok(mut second) => {
-                    for (path, alignment) in &placed {
-                        if cancel.load(Ordering::Relaxed) {
-                            let _ = tx.send(Update::Cancelled);
-                            return;
-                        }
-                        let _ = tx.send(Update::Progress {
-                            done,
-                            total: steps,
-                            item: file_name_of(path),
-                        });
-                        done += 1;
-                        if let Some(prepared) = prepare(path, dark, flat) {
-                            second.add_channels(&prepared, first, *alignment);
-                        }
+                    let mut stopped = false;
+                    ahead::each(
+                        &placed,
+                        |(path, _)| prepare(path, dark, flat),
+                        |(path, alignment), prepared| {
+                            if cancel.load(Ordering::Relaxed) {
+                                stopped = true;
+                                return false;
+                            }
+                            let _ = tx.send(Update::Progress {
+                                done,
+                                total: steps,
+                                item: file_name_of(path),
+                            });
+                            done += 1;
+                            if let Some(prepared) = prepared {
+                                second.add_channels(&prepared, first, *alignment);
+                            }
+                            true
+                        },
+                    );
+                    if stopped {
+                        let _ = tx.send(Update::Cancelled);
+                        return;
                     }
                     judged = true;
                     group_rejected += second.rejected();
@@ -739,6 +786,21 @@ fn stack_worker(
         calibration,
         missing,
     }));
+}
+
+/// A frame of a stack's first pass, got ready on the thread ahead: everything
+/// about it that does not depend on the other frames.
+struct Arrived {
+    /// Which side of the pier it was taken from.
+    side: PierSide,
+    /// Its header, which the first frame's becomes the stack's.
+    header: FitsHeader,
+    /// Calibrated and in colour, ready to add.
+    prepared: FitsImage,
+    /// Its sky and noise.
+    measured: Quality,
+    /// Its stars, to line it up by.
+    found: StarField,
 }
 
 /// The filter a frame was taken through, or a stand-in when it does not say.

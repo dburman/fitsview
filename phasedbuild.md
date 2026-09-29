@@ -3711,6 +3711,53 @@ background extraction.
 
 ---
 
+## Phase 25 — Reading Ahead
+
+Stacking and making masters read and prepared each frame, then added it, one
+after the other: while a frame came off the disk the processors waited, and
+while it was added the disk did. Measuring a folder had been changed to read a
+frame ahead in Phase 19, for a third of its time; these had not.
+
+### What changed
+
+A small helper, `ahead::each`, runs the work on a thread of its own exactly one
+item ahead of the consumer, in order, and stops making items as soon as the
+consumer stops taking them. Its tests hold the order, the stopping, the overlap
+— ten items of 20 ms making and 20 ms using take about 220 ms rather than 400 —
+and that no more than two items ever exist at once.
+
+- **A stack's first pass** does everything about a frame that does not depend
+  on the others on the thread ahead: read, calibrated, reconstructed, measured,
+  and searched for stars. Choosing the reference, lining up and adding stay on
+  the consumer, in order, which is what keeps the result the same. The frame as
+  it came off the disk is let go of on the thread ahead once it is measured.
+- **A stack's later passes**, and each further colour, prepare a frame ahead.
+- **Making a master** reads a frame ahead in both passes.
+
+### What it measured
+
+Ten Barnard's Loop frames, calibrated from the library with its masters kept,
+the released build and this one interleaved:
+
+| | Before | After |
+|---|---|---|
+| Stacking | 11.7–12.4 s | 10.2–11.6 s |
+| Master of 128 biases | 16.1–16.5 s | 13.5–13.7 s |
+| Master of 40 darks | 5.4 s | 4.4 s |
+| Stack, masters: bit for bit | | **the same** |
+
+Masters gain the most, being mostly reading. Stacking gains about a tenth: its
+adding already keeps every core busy, and the thread ahead competes for them.
+
+The price is the frame waiting: a prepared colour frame, about a gigabyte on
+61 megapixels. Measuring for it showed the estimate that decides when to stack
+a colour at a time had also never counted the library's master dark and flat.
+The stacking job alone now peaks at 9.36 GB all at once and 5.81 GB a colour at
+a time, and the estimate was set from that: 63 bytes a pixel of working memory
+beside the stack's own figures, where it had assumed 32.
+
+---
+
 ## 9. Performance Checklist (apply throughout)
 
 - Read files with a single `std::fs::read`; do not use `BufReader` per-element reads, and do not use `mmap` (unsafe).
