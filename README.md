@@ -79,6 +79,13 @@ midtone stretch that puts the sky background at a sensible brightness and brings
 the faint signal into view. Zoom with the wheel about the pointer, drag to pan,
 `F` to fit, `1` for actual size.
 
+**Extract background** (`E`) takes a smooth gradient out of what is shown —
+light pollution, the moon, vignetting a flat did not remove — so that faint dust
+and nebulosity hidden under it can be judged. It fits a gentle surface through
+the sky between the stars, passing over anything that stands above it, and
+takes that away; the file is never changed. A cloud of gas that fills the whole
+field is as smooth as a gradient, and some of it goes too.
+
 **Calibration.** Combine dark frames into a master, using the median so a cosmic
 ray on one frame is discarded rather than smeared across every result, and
 subtract it with `D`. Do the same with flats to remove vignetting and dust
@@ -153,7 +160,7 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 817 automated tests, run on macOS, Linux and Windows on every change, and
+by 826 automated tests, run on macOS, Linux and Windows on every change, and
 again on each system before its download is built.
 
 ---
@@ -451,7 +458,7 @@ cargo check --target x86_64-pc-windows-msvc --workspace --all-features
 
 ## How it was built
 
-`fitsview` was built in twenty-five phases, each with its own acceptance criteria
+`fitsview` was built in twenty-six phases, each with its own acceptance criteria
 and a write-up of what it produced and what went wrong along the way. That plan,
 along with the architecture, the reasoning behind each library choice, a primer
 on the FITS format, and the per-module test plan, is in

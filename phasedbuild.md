@@ -3758,6 +3758,72 @@ beside the stack's own figures, where it had assumed 32.
 
 ---
 
+## Phase 26 — Background Extraction
+
+A toggle, `E`, that takes a smooth gradient out of what is displayed: light
+pollution, the moon, vignetting a flat did not remove. For judging a frame or a
+stack by eye, and never written to a file.
+
+### How
+
+`fits-core/src/gradient.rs`. The frame is cut into boxes, 32 across its longer
+side, and each box's sky taken as the median of its pixels once the stars are
+clipped away. A polynomial surface of order 2 is fitted through those by least
+squares, over coordinates from −1 to 1 so that it stays well conditioned; boxes
+more than two deviations *above* the surface — nebulosity, a galaxy, the glow
+round a bright star — are dropped and the surface fitted again until none are,
+while boxes below it must be twice as far out to go, since what is darker than
+the sky is rarer. The surface is taken off each colour separately and that
+colour's typical sky put back, so the stretch still has a sky to set and the
+colour balance is unchanged. Along a row the surface is a polynomial in x alone,
+found once for the row, so a pixel costs a few multiplications.
+
+### What it did to a real stack
+
+Ten L-Ultimate frames of the Barnard's Loop night, which takes in M42, stacked
+without calibration: extraction evened the sky and brought out dust and faint
+nebulosity across the whole field that the gradient had hidden, with M42 kept
+whole. 89 ms on the 61-megapixel colour stack; about 100 ms more to show each
+new colour frame while it is on.
+
+A background mesh — boxes judged against their neighbours, median-filtered,
+interpolated — was tried in a prototype as a more flexible alternative. It
+followed nothing the polynomial missed and left a dark ring below M42, where the
+nebula's outer light lifted the boxes around it. The polynomial stayed.
+
+### What it found on the way
+
+The same frames stacked **with** the calibration library came out with a bright
+glow along the bottom edge that no gradient model removed. It was not in the
+sky: the stack without calibration had none. The library's only L-Ultimate flat,
+from 2024-10-04, reads 0.33 along its bottom edge against 1.27 in the middle and
+1.26 along its top — something shadowed the bottom of the field when it was
+taken — so dividing January's frames by it multiplied their bottom edge
+fourfold. The library chose it because it was the only one; a flat that makes a
+frame's sky less even than it was is a flat that does not match, and saying so
+is the next thing to do.
+
+### Acceptance criteria
+
+- [x] A tilt and a bowl come out, and stars keep their height above the sky.
+- [x] A nebula an eighth of the frame across keeps more than 80 per cent of its
+      brightness.
+- [x] An even sky is left alone.
+- [x] Each colour loses its own gradient and keeps its own level.
+- [x] Undefined pixels stay undefined; a frame too small to measure is left.
+- [x] The displayed sky evens out with the toggle on, and is exactly as it was
+      with it off; the file is never changed.
+- [x] `E` toggles it, and the setting is remembered.
+
+### Not done
+
+- **It runs as each frame is shown**, on the interface's own thread: 100 ms on a
+  61-megapixel colour frame. The loader thread could do it instead.
+- **Only for display.** A stack can be written with its gradient taken out once
+  the display has shown it can be trusted.
+
+---
+
 ## 9. Performance Checklist (apply throughout)
 
 - Read files with a single `std::fs::read`; do not use `BufReader` per-element reads, and do not use `mmap` (unsafe).

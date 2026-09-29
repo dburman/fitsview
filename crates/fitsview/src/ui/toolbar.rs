@@ -161,6 +161,22 @@ pub fn show(ui: &mut Ui, model: &Model) -> Vec<Action> {
             }
             actions.extend(stretch_settings(ui, model));
 
+            let mut extract = model.extract_background;
+            if ui
+                .checkbox(&mut extract, "Extract background")
+                .on_hover_text(
+                    "Take a smooth gradient out of what is shown (E): light pollution, \
+                     the moon, vignetting a flat did not remove.\n\
+                     Nebulosity smaller than a good part of the frame is kept, but a \
+                     cloud of gas that fills the field is as smooth as a gradient and \
+                     some of it goes too.\n\
+                     Affects the display only; the files are untouched.",
+                )
+                .changed()
+            {
+                actions.push(Action::ToggleBackgroundExtraction);
+            }
+
             // Beside the stretch, because both are decisions about what the
             // display shows rather than about the file.
             let mut stars = model.stars_enabled;

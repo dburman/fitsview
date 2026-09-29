@@ -35,6 +35,7 @@ use crate::texture::{self, DetailRegion, Mapping};
 
 /// Storage keys for settings that outlive a session.
 const KEY_STRETCH_ENABLED: &str = "stretch_enabled";
+const KEY_EXTRACT_BACKGROUND: &str = "extract_background";
 const KEY_STRETCH_SHADOWS: &str = "stretch_shadows_clip";
 const KEY_STRETCH_TARGET: &str = "stretch_target_bg";
 const KEY_STRETCH_LINKED: &str = "stretch_linked";
@@ -111,6 +112,8 @@ impl FitsViewApp {
         let defaults = StretchParams::default();
         app.model.stretch_enabled =
             eframe::get_value(storage, KEY_STRETCH_ENABLED).unwrap_or(false);
+        app.model.extract_background =
+            eframe::get_value(storage, KEY_EXTRACT_BACKGROUND).unwrap_or(false);
         app.model.stretch_params = StretchParams {
             shadows_clip: eframe::get_value(storage, KEY_STRETCH_SHADOWS)
                 .unwrap_or(defaults.shadows_clip),
@@ -317,6 +320,11 @@ impl FitsViewApp {
 impl eframe::App for FitsViewApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, KEY_STRETCH_ENABLED, &self.model.stretch_enabled);
+        eframe::set_value(
+            storage,
+            KEY_EXTRACT_BACKGROUND,
+            &self.model.extract_background,
+        );
         let library = self
             .model
             .library_root
@@ -762,6 +770,17 @@ mod tests {
             app.model.error.is_none(),
             "a missing folder is not an error"
         );
+    }
+
+    #[test]
+    fn background_extraction_is_remembered() {
+        let mut storage = MemoryStorage::default();
+        let mut app = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(!app.model.extract_background, "off until asked for");
+        app.model.extract_background = true;
+        eframe::App::save(&mut app, &mut storage);
+        let restored = FitsViewApp::with_storage(None, Some(&storage));
+        assert!(restored.model.extract_background);
     }
 
     #[test]

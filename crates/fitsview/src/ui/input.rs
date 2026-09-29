@@ -90,6 +90,7 @@ pub fn actions_for(frame: &Frame) -> Vec<Action> {
             Key::S => out.push(Action::ToggleStretch),
             Key::D => out.push(Action::ToggleApplyDark),
             Key::B => out.push(Action::ToggleDebayer),
+            Key::E => out.push(Action::ToggleBackgroundExtraction),
             Key::I => out.push(Action::ToggleHeader),
             Key::G => out.push(Action::ToggleHistogram),
             Key::L => out.push(Action::ToggleFileList),
@@ -307,6 +308,15 @@ mod tests {
             ..frame()
         };
         assert_eq!(actions_for(&f), vec![Action::ToggleFileList]);
+    }
+
+    #[test]
+    fn e_toggles_background_extraction() {
+        let f = Frame {
+            keys: key(Key::E),
+            ..frame()
+        };
+        assert_eq!(actions_for(&f), vec![Action::ToggleBackgroundExtraction]);
     }
 
     #[test]

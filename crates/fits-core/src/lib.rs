@@ -15,6 +15,7 @@ pub mod calib;
 pub mod debayer;
 pub mod error;
 pub mod filter;
+pub mod gradient;
 pub mod header;
 pub mod histogram;
 pub mod image;

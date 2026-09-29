@@ -198,6 +198,8 @@ pub enum Action {
     ToggleStars,
     /// Turn the automatic screen stretch on or off.
     ToggleStretch,
+    /// Take a smooth gradient out of what is displayed, or stop.
+    ToggleBackgroundExtraction,
     /// Change the stretch settings.
     SetStretchParams(StretchParams),
     /// Return the stretch settings to their defaults.
@@ -603,6 +605,10 @@ pub struct Model {
     measuring_fresh: HashSet<PathBuf>,
     /// Whether the stretch is applied to every image shown.
     pub stretch_enabled: bool,
+    /// Whether a smooth gradient — light pollution, the moon, vignetting a
+    /// flat did not remove — is taken out of what is displayed. The files are
+    /// never changed.
+    pub extract_background: bool,
     /// How the stretch is chosen.
     pub stretch_params: StretchParams,
     /// The most recent transient message.
@@ -690,6 +696,7 @@ impl Model {
             fresh: HashSet::new(),
             measuring_fresh: HashSet::new(),
             stretch_enabled: false,
+            extract_background: false,
             stretch_params: StretchParams::default(),
             toast: None,
             loader: Loader::default(),
@@ -951,6 +958,19 @@ impl Model {
             Action::ToggleFileList => self.show_filelist = !self.show_filelist,
             Action::SetFileListVisible(visible) => self.show_filelist = visible,
             Action::ToggleHistogram => self.show_histogram = !self.show_histogram,
+            Action::ToggleBackgroundExtraction => {
+                self.extract_background = !self.extract_background;
+                // The frames kept ready for display were made with the old
+                // setting.
+                self.calibrated.clear();
+                self.show_selection();
+                self.invalidate_texture();
+                self.toast = Some(Toast::new(if self.extract_background {
+                    "Background extraction on"
+                } else {
+                    "Background extraction off"
+                }));
+            }
             Action::ToggleHeader => self.show_header = !self.show_header,
             Action::SetHeaderFilter(text) => self.header_filter = text,
             Action::ToggleHelp => self.show_help = !self.show_help,
@@ -2150,13 +2170,15 @@ impl Model {
 
     /// The image as it should be displayed: calibrated, or the original.
     fn calibrated_version(&mut self, path: &Path, image: &Arc<FitsImage>) -> Arc<FitsImage> {
-        if !self.calibration.is_active() && self.bayer.active().is_none() {
+        let extract = self.extract_background;
+        if !self.calibration.is_active() && self.bayer.active().is_none() && !extract {
             return Arc::clone(image);
         }
         let dark = self.calibration.active_dark().filter(|d| d.matches(image));
         let flat = self.calibration.active_flat().filter(|f| f.matches(image));
         let pattern = self.bayer.active();
-        if dark.is_none() && flat.is_none() && pattern.is_none() {
+        let calibrating = dark.is_some() || flat.is_some() || pattern.is_some();
+        if !calibrating && !extract {
             // Reported through `blocked`; showing the raw image beats showing
             // nothing.
             return Arc::clone(image);
@@ -2164,18 +2186,33 @@ impl Model {
         if let Some(cached) = self.calibrated.get(path) {
             return cached;
         }
-        match calib::calibrate_and_debayer(image, dark, flat, pattern) {
-            Ok(result) => {
-                let result = Arc::new(result);
-                self.calibrated
-                    .insert(path.to_path_buf(), Arc::clone(&result));
-                result
+        let calibrated = if calibrating {
+            match calib::calibrate_and_debayer(image, dark, flat, pattern) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    log::warn!("could not calibrate {}: {e}", path.display());
+                    return Arc::clone(image);
+                }
             }
-            Err(e) => {
-                log::warn!("could not calibrate {}: {e}", path.display());
-                Arc::clone(image)
+        } else {
+            None
+        };
+        // The gradient is taken out last, from the frame as it will be seen:
+        // calibrated, and in colour where it has colour, so that each colour
+        // loses its own.
+        let result = match (calibrated, extract) {
+            (Some(frame), false) => frame,
+            (Some(frame), true) => {
+                fits_core::gradient::flatten(&frame, &fits_core::gradient::Settings::default())
             }
-        }
+            (None, _) => {
+                fits_core::gradient::flatten(image, &fits_core::gradient::Settings::default())
+            }
+        };
+        let result = Arc::new(result);
+        self.calibrated
+            .insert(path.to_path_buf(), Arc::clone(&result));
+        result
     }
 
     /// Records the viewport and, if an image has just arrived, fits it.
@@ -5796,6 +5833,81 @@ mod tests {
             folder.measured_stars(measurements::settings_of(&m.star_params)),
             0,
             "the expensive one is not"
+        );
+    }
+
+    /// A folder of one frame whose sky is lifted along one side and dimmed in
+    /// the corners, as light pollution and vignetting leave it.
+    fn uneven_sky() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (240usize, 160usize);
+        let noise = fits_core::testutil::gaussian_background(w, h, 0.0, 4.0, 77);
+        let pixels: Vec<f64> = (0..w * h)
+            .map(|k| {
+                #[allow(clippy::cast_precision_loss)]
+                let (u, v) = (
+                    2.0 * (k % w) as f64 / (w - 1) as f64 - 1.0,
+                    2.0 * (k / w) as f64 / (h - 1) as f64 - 1.0,
+                );
+                1000.0 + 150.0 * u - 120.0 * (u * u + v * v) + noise[k]
+            })
+            .collect();
+        write_synthetic(
+            dir.path(),
+            "light.fits",
+            &SyntheticSpec::new(w, h, -32),
+            &pixels,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// How far apart the brightest and faintest 20-pixel blocks of the
+    /// displayed image are.
+    fn displayed_unevenness(m: &Model) -> f64 {
+        let image = &m.loaded.as_ref().unwrap().image;
+        let (w, h) = (image.width, image.height);
+        let mut blocks = Vec::new();
+        for by in 0..h / 20 {
+            for bx in 0..w / 20 {
+                let mut v: Vec<f32> = (0..20)
+                    .flat_map(|y| (0..20).map(move |x| (bx * 20 + x, by * 20 + y)))
+                    .map(|(x, y)| image.data[y * w + x])
+                    .collect();
+                let mid = v.len() / 2;
+                blocks.push(f64::from(*v.select_nth_unstable_by(mid, f32::total_cmp).1));
+            }
+        }
+        let lo = blocks.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = blocks.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        hi - lo
+    }
+
+    #[test]
+    fn background_extraction_evens_the_displayed_sky_and_comes_off_again() {
+        let dir = uneven_sky();
+        let file = dir.path().join("light.fits");
+        let before_on_disk = std::fs::read(&file).unwrap();
+        let (mut m, _spy) = model_over(dir.path());
+        let uneven = displayed_unevenness(&m);
+        assert!(uneven > 200.0, "the test needs a gradient: {uneven:.0}");
+
+        m.handle(Action::ToggleBackgroundExtraction);
+        settle(&mut m);
+        assert!(m.extract_background);
+        let even = displayed_unevenness(&m);
+        assert!(even < uneven / 10.0, "still {even:.0} of {uneven:.0}");
+
+        m.handle(Action::ToggleBackgroundExtraction);
+        settle(&mut m);
+        assert!(
+            (displayed_unevenness(&m) - uneven).abs() < 1.0,
+            "off again, as it was"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before_on_disk,
+            "the file is never changed"
         );
     }
 

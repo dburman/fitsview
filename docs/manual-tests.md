@@ -530,3 +530,16 @@ one at a time does nearly as well.
 - [ ] With the library on an external drive that is unplugged, the panel says
       it is not found, and stacking goes ahead without it.
 - [ ] Add frames to the library and press **Read again**: they are found.
+
+## Background extraction
+
+- [ ] Open a stack with a gradient across it and press `E`: the sky evens out,
+      and faint nebulosity that was hidden under the gradient shows.
+- [ ] A bright nebula in the frame keeps its shape and brightness; there is no
+      dark ring around it.
+- [ ] Press `E` again: the frame is exactly as it was. The file on disk is never
+      changed.
+- [ ] The checkbox beside Stretch follows the key, and the setting is
+      remembered after a restart.
+- [ ] Stepping through colour frames with it on is a little slower, but does
+      not stall.
