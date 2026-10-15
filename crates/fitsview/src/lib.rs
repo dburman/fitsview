@@ -47,6 +47,7 @@ pub mod masters;
 pub mod measurements;
 pub mod memory;
 pub mod natsort;
+pub mod prepare;
 pub mod shortcuts;
 pub mod sidecar;
 pub mod stardetect;

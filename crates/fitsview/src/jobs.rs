@@ -8,6 +8,7 @@
 //! stops at the next boundary rather than mid-write. That is the point at which
 //! stopping leaves nothing half-written.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -19,7 +20,6 @@ use fits_core::{quality, read_fits, read_fits_header, write_fits, FitsHeader, Fi
 
 use crate::ahead;
 use crate::folder::StarMeasure;
-use crate::library::Taken;
 use crate::masters;
 use crate::memory::{self, Memory};
 
@@ -38,6 +38,9 @@ pub enum Outcome {
         unaligned: usize,
         /// Samples left out as outliers, across every stack.
         rejected: usize,
+        /// Frames that went in as they came off the camera, because nothing
+        /// in the library suited their night.
+        uncalibrated: usize,
         /// Whether a stack was made a colour at a time, to fit in memory.
         colour_at_a_time: bool,
         /// Each filter's calibration, a line each: `L-Pro — dark: …`.
@@ -53,6 +56,11 @@ pub enum Outcome {
         written: usize,
         /// Where they went.
         directory: PathBuf,
+        /// Files left out because they are calibrated copies already.
+        already: usize,
+        /// Copies written under a numbered name, because a file the export
+        /// did not write, or another frame's copy, had the usual one.
+        renamed: usize,
         /// What each filter lacked, a line each, saying what it costs.
         missing: Vec<String>,
     },
@@ -198,13 +206,15 @@ impl Job {
         }
     }
 
-    /// Writes a calibrated copy of every file in `paths` into `directory`.
+    /// Writes a calibrated copy of every file in `paths` into `directory`,
+    /// each in the subfolder it sits in below `root`, the folder that is open.
     #[must_use]
     pub fn export(
         paths: Vec<PathBuf>,
         dark: Option<Arc<MasterFrame>>,
         flat: Option<Arc<MasterFlat>>,
         library: Option<Arc<masters::InUse>>,
+        root: PathBuf,
         directory: PathBuf,
     ) -> Self {
         let (tx, updates) = mpsc::channel();
@@ -219,7 +229,7 @@ impl Job {
                     &paths,
                     (dark, flat),
                     library.as_deref(),
-                    &directory,
+                    (&root, &directory),
                     &tx,
                     &worker_cancel,
                 );
@@ -366,6 +376,46 @@ fn measure_stars(image: &fits_core::FitsImage, params: &DetectionParams) -> Star
 /// What a stack's own output is called, and what marks it as not a frame.
 pub const STACK_PREFIX: &str = "stack_";
 
+/// The card that marks a calibrated copy an export wrote.
+///
+/// Such a copy is found again whenever it is written below the open folder,
+/// and looks like any other frame. Without the mark it is calibrated a second
+/// time, and stacked beside the frame it was made from.
+pub const EXPORTED_CARD: &str = "FITSVCAL";
+
+/// Whether a header is that of a calibrated copy an export wrote.
+#[must_use]
+pub fn is_exported(header: &FitsHeader) -> bool {
+    header.get_bool(EXPORTED_CARD) == Some(true)
+}
+
+/// The frames among `paths` that a stack is made from, with their headers,
+/// and whether they are calibrated copies an export wrote.
+///
+/// A stack this program wrote is not a frame, and nor is anything whose header
+/// cannot be read. Calibrated copies are left out while there are frames that
+/// are not: the copies are those same frames over again. A folder holding
+/// nothing but copies is stacked from them, and they are not calibrated again.
+#[must_use]
+pub fn frames_to_stack(paths: &[PathBuf]) -> (Vec<(PathBuf, FitsHeader)>, bool) {
+    let (copies, frames): (Vec<_>, Vec<_>) = paths
+        .iter()
+        // Without this, stacking a second time folds the first result back
+        // into the new one.
+        .filter(|path| !file_name_of(path).starts_with(STACK_PREFIX))
+        .filter_map(|path| Some((path.clone(), read_fits_header(path).ok()?)))
+        .partition(|(_, header)| is_exported(header));
+    if frames.is_empty() {
+        let calibrated = !copies.is_empty();
+        (copies, calibrated)
+    } else {
+        (frames, false)
+    }
+}
+
+/// What is said of the calibration of a stack made from calibrated copies.
+const CALIBRATED_WHEN_EXPORTED: &str = "calibrated when exported, and not again";
+
 /// What a frame counts for, or one when frames are not being weighted.
 fn frame_weight(weighted: bool, noise: f64, fwhm: Option<f64>) -> f64 {
     if !weighted {
@@ -392,8 +442,8 @@ pub struct StackRecipe {
     /// Bytes the stack may take, or `None` to ask the system when it starts.
     /// A colour stack that would take more is stacked a colour at a time.
     pub room: Option<u64>,
-    /// The calibration library, if one is set: each filter's dark and flat
-    /// come from it, unless chosen by hand.
+    /// The calibration library, if one is set: each night's dark and flat
+    /// come from it, filter by filter, unless chosen by hand.
     pub library: Option<Arc<masters::InUse>>,
 }
 
@@ -403,6 +453,12 @@ pub struct StackRecipe {
 /// averages away the thing the filters were for. Within a group the first
 /// readable frame is the reference and the rest are lined up with it by their
 /// stars, turning any that were taken on the other side of the pier.
+///
+/// A filter taken over several nights is still one stack, but each night's
+/// frames are calibrated with the dark and flat that suit that night: dust
+/// moves between one evening and the next, and a flat from the wrong one
+/// divides it in where there is none. A night the library has nothing for goes
+/// in as it came off the camera, and the result says so.
 ///
 /// Only one frame is held at a time beyond the running totals, because a
 /// night of full-frame captures does not fit in memory otherwise. When even the
@@ -428,32 +484,50 @@ fn stack_worker(
     } = recipe;
     let (pattern, reject, weighted) = (*pattern, *reject, *weighted);
     let room = room.unwrap_or_else(|| memory::room(Memory::now(), 0));
-    // Which filter each frame belongs to, read from the header alone so that
-    // grouping costs a few kilobytes a frame rather than a decode. A frame
-    // whose pixels turn out to be unreadable is passed over when it is
-    // stacked, as one that will not line up is.
-    let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
-    for path in paths {
-        // A stack this job wrote earlier is not a frame. Without this, running
-        // it a second time folds the first result back into the new one.
-        if file_name_of(path).starts_with(STACK_PREFIX) {
+    // Which filter each frame belongs to, and which night's calibration it
+    // wants, read from the header alone so that grouping costs a few kilobytes
+    // a frame rather than a decode. A frame whose pixels turn out to be
+    // unreadable is passed over when it is stacked, as one that will not line
+    // up is.
+    let (frames, calibrated_already) = frames_to_stack(paths);
+    let groups = masters::groups_from(&frames);
+    let group_of: HashMap<&Path, usize> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, group)| group.paths.iter().map(move |path| (path.as_path(), index)))
+        .collect();
+    // Each filter's frames in the order they came, the first of them being
+    // what the rest are lined up with, and the group each is of.
+    let mut filters: Vec<(&str, Vec<(PathBuf, usize)>)> = Vec::new();
+    for (path, _) in &frames {
+        let Some(&index) = group_of.get(path.as_path()) else {
             continue;
-        }
-        let filter = match read_fits_header(path) {
-            Ok(header) => filter_of(&header),
-            Err(_) => continue,
         };
-        match groups.iter_mut().find(|(name, _)| *name == filter) {
-            Some((_, list)) => list.push(path.clone()),
-            None => groups.push((filter, vec![path.clone()])),
+        let filter = groups[index].filter.as_str();
+        match filters.iter_mut().find(|(name, _)| *name == filter) {
+            Some((_, list)) => list.push((path.clone(), index)),
+            None => filters.push((filter, vec![(path.clone(), index)])),
         }
     }
+    // When every frame gets the same whatever its night: copies an export
+    // calibrated get nothing more, chosen by hand or not, since the dark has
+    // come off them once already; and without a library, or with both masters
+    // chosen by hand, there is nothing to choose between.
+    let same_for_all = calibrated_already
+        || library.is_none()
+        || (dark_by_hand.is_some() && flat_by_hand.is_some());
 
     // A frame calibrated and in colour, ready to add, or `None` if it cannot
     // be read.
-    let prepare = |path: &Path, dark: Option<&MasterFrame>, flat: Option<&MasterFlat>| {
+    let prepare = |path: &Path, chosen: &masters::Chosen| {
         let light = read_fits(path).ok()?;
-        calib::calibrate_and_debayer(&light, dark, flat, pattern).ok()
+        calib::calibrate_and_debayer(
+            &light,
+            chosen.dark.as_deref(),
+            chosen.flat.as_deref(),
+            pattern,
+        )
+        .ok()
     };
     let new_stack = |(width, height): (usize, usize), channels: usize| {
         if reject {
@@ -464,30 +538,51 @@ fn stack_worker(
     };
 
     let mut stacks = Vec::new();
+    // Each stack's name, so that two filters whose names come out the same
+    // once made safe — `Ha 7nm` and `Ha-7nm` — do not write over each other.
+    let mut names = HashSet::new();
     let mut unaligned = 0usize;
     let mut rejected = 0usize;
+    let mut uncalibrated = 0usize;
     let mut colour_at_a_time = false;
     let mut calibration: Vec<String> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    let mut made = masters::Made::default();
     let mut done = 0usize;
     // Rejecting means reading every frame a second time, to measure it against
     // what the first pass found ordinary. A colour at a time means reading it
     // again for each further colour, in each pass; that is added when it is
     // decided.
     let passes = if reject { 2 } else { 1 };
-    let mut steps = paths.len() * passes;
+    let mut steps = filters.iter().map(|(_, list)| list.len()).sum::<usize>() * passes;
 
-    for (filter, group) in &groups {
-        // This filter's dark and flat: chosen by hand, or found in the
-        // library by how its first frame was taken.
-        let lights = group
-            .first()
-            .and_then(|path| read_fits_header(path).ok())
-            .as_ref()
-            .and_then(Taken::of_light);
+    for (filter, members) in &filters {
+        let filter = *filter;
+        // The last filter's flats are no use to this one.
+        made.forget_flats();
+        // What each part of this filter gets, and what to call the part: the
+        // whole of it, or each night of it with the dark and flat that night
+        // wants, chosen by hand or found in the library by how its first
+        // frame was taken.
+        let mut within: Vec<usize> = Vec::new();
+        for (_, index) in members {
+            if !within.contains(index) {
+                within.push(*index);
+            }
+        }
         let by_hand = (dark_by_hand.clone(), flat_by_hand.clone());
-        let chosen = match lights {
-            Some(lights) => {
+        let mut parts: Vec<(String, masters::Chosen)> = Vec::new();
+        for &index in &within {
+            if same_for_all && !parts.is_empty() {
+                break;
+            }
+            let group = &groups[index];
+            let chosen = if calibrated_already {
+                masters::Chosen {
+                    used: vec![CALIBRATED_WHEN_EXPORTED.into()],
+                    ..masters::Chosen::default()
+                }
+            } else {
                 let mut report = |item: String| {
                     let _ = tx.send(Update::Progress {
                         done,
@@ -495,35 +590,44 @@ fn stack_worker(
                         item,
                     });
                 };
-                match masters::choose(
-                    &lights,
-                    &masters::samples_of(group),
-                    by_hand,
+                let Ok(chosen) = masters::choose(
+                    &group.taken,
+                    &group.samples(),
+                    by_hand.clone(),
                     library.as_deref(),
+                    &mut made,
                     cancel,
                     &mut report,
-                ) {
-                    Ok(chosen) => chosen,
-                    Err(_) => {
-                        let _ = tx.send(Update::Cancelled);
-                        return;
-                    }
-                }
-            }
-            None => masters::Chosen {
-                dark: by_hand.0,
-                flat: by_hand.1,
-                ..masters::Chosen::default()
-            },
-        };
-        calibration.extend(chosen.used.iter().map(|line| format!("{filter} — {line}")));
-        missing.extend(
-            chosen
-                .missing
-                .iter()
-                .map(|line| format!("{filter} — {line}")),
-        );
-        let (dark, flat) = (chosen.dark.as_deref(), chosen.flat.as_deref());
+                ) else {
+                    let _ = tx.send(Update::Cancelled);
+                    return;
+                };
+                chosen
+            };
+            let name = if same_for_all {
+                filter.to_string()
+            } else {
+                group.name()
+            };
+            calibration.extend(chosen.used.iter().map(|line| format!("{name} — {line}")));
+            missing.extend(chosen.missing.iter().map(|line| format!("{name} — {line}")));
+            parts.push((name, chosen));
+        }
+        // Each frame with the part it is of.
+        let group: Vec<(PathBuf, usize)> = members
+            .iter()
+            .map(|(path, index)| {
+                let part = if same_for_all {
+                    0
+                } else {
+                    within.iter().position(|i| i == index).unwrap_or(0)
+                };
+                (path.clone(), part)
+            })
+            .collect();
+        let group = &group;
+        let parts = &parts;
+        let masters_held = masters_held(parts);
 
         let mut stack: Option<Stack> = None;
         let mut reference: Option<(StarField, PierSide, (usize, usize))> = None;
@@ -536,16 +640,23 @@ fn stack_worker(
         // Where each frame ended up, so that later passes do not have to find
         // its stars all over again. That is most of what makes rejection
         // cheaper the second time round.
-        let mut placed: Vec<(PathBuf, Alignment)> = Vec::new();
+        let mut placed: Vec<(PathBuf, usize, Alignment)> = Vec::new();
 
         // Everything about a frame that does not depend on the others — read,
         // calibrated, measured and searched for stars — is done a frame ahead
         // on a thread of its own, while this one is lined up and added. The
         // frame as it came off the disk is let go of there, once it has been
         // measured, so only the prepared one waits.
-        let first_pass = |path: &PathBuf| -> Option<Arrived> {
+        let first_pass = |(path, part): &(PathBuf, usize)| -> Option<Arrived> {
+            let chosen = &parts[*part].1;
             let light = read_fits(path).ok()?;
-            let prepared = calib::calibrate_and_debayer(&light, dark, flat, pattern).ok()?;
+            let prepared = calib::calibrate_and_debayer(
+                &light,
+                chosen.dark.as_deref(),
+                chosen.flat.as_deref(),
+                pattern,
+            )
+            .ok()?;
             // What this frame is worth against the others: quiet and sharp
             // counts for more than noisy and soft.
             let measured = quality::measure(&light);
@@ -563,7 +674,7 @@ fn stack_worker(
             })
         };
         let mut stopped = false;
-        ahead::each(group, first_pass, |path, arrived| {
+        ahead::each(group, first_pass, |(path, part), arrived| {
             if cancel.load(Ordering::Relaxed) {
                 stopped = true;
                 return false;
@@ -593,6 +704,7 @@ fn stack_worker(
                     // reference for the rest of it, its sky included, and says
                     // how big the stack will be.
                     channels = prepared.channels;
+                    let room = memory::room_beside(room, masters_held, size.0, size.1);
                     per_stack = if memory::together_fits(size.0, size.1, channels, reject, room) {
                         channels
                     } else {
@@ -609,7 +721,7 @@ fn stack_worker(
                         ..Alignment::still()
                     };
                     fresh.add_channels(&prepared, 0, placing);
-                    placed.push((path.clone(), placing));
+                    placed.push((path.clone(), *part, placing));
                     header = Some(light_header);
                     sky = Some(fits_core::stack::sky_level(&prepared));
                     reference = Some((found, side, size));
@@ -632,7 +744,7 @@ fn stack_worker(
                                 if prepared.channels == channels
                                     && stack.add_channels(&prepared, 0, alignment)
                                 {
-                                    placed.push((path.clone(), alignment));
+                                    placed.push((path.clone(), *part, alignment));
                                 } else {
                                     unaligned += 1;
                                 }
@@ -660,10 +772,18 @@ fn stack_worker(
         }
 
         let frames = stack.frames();
-        let Some(directory) = group.first().and_then(|p| p.parent()) else {
+        let Some(directory) = group.first().and_then(|(path, _)| path.parent()) else {
             continue;
         };
-        let out = directory.join(format!("{STACK_PREFIX}{}.fits", safe_name(filter)));
+        let wanted = directory.join(format!("{STACK_PREFIX}{}.fits", safe_name(filter)));
+        // A stack an earlier run wrote is replaced, as it always has been.
+        let Some(out) = first_free(&wanted, &mut names, |_| true) else {
+            let _ = tx.send(Update::Failed(format!(
+                "{}: no free name for the stack",
+                file_name_of(&wanted)
+            )));
+            return;
+        };
 
         // Each stack's channels in turn: all of them at once, or a colour after
         // another, each further colour reading the frames again and adding
@@ -680,8 +800,8 @@ fn stack_worker(
                     let mut stopped = false;
                     ahead::each(
                         &placed,
-                        |(path, _)| prepare(path, dark, flat),
-                        |(path, alignment), prepared| {
+                        |(path, part, _)| prepare(path, &parts[*part].1),
+                        |(path, _, alignment), prepared| {
                             if cancel.load(Ordering::Relaxed) {
                                 stopped = true;
                                 return false;
@@ -719,8 +839,8 @@ fn stack_worker(
                     let mut stopped = false;
                     ahead::each(
                         &placed,
-                        |(path, _)| prepare(path, dark, flat),
-                        |(path, alignment), prepared| {
+                        |(path, part, _)| prepare(path, &parts[*part].1),
+                        |(path, _, alignment), prepared| {
                             if cancel.load(Ordering::Relaxed) {
                                 stopped = true;
                                 return false;
@@ -768,11 +888,27 @@ fn stack_worker(
         if per_stack < channels {
             history.push_str(", a colour at a time");
         }
-        // How it was calibrated, and what it was not, travels with the file.
+        // How it was calibrated, and what it was not, travels with the file:
+        // a night at a time, when the nights were not calibrated alike.
         let mut history = vec![history];
-        history.extend(calib::history_for(dark, flat));
-        history.extend(chosen.used.iter().map(|line| history_line(line)));
-        history.extend(chosen.missing.iter().map(|line| history_line(line)));
+        for (index, (name, chosen)) in parts.iter().enumerate() {
+            let of_part = placed.iter().filter(|(_, part, _)| *part == index).count();
+            if chosen.leaves_uncalibrated() {
+                uncalibrated += of_part;
+            }
+            if parts.len() > 1 {
+                history.push(history_line(&format!(
+                    "{name}, {of_part} frame{}:",
+                    if of_part == 1 { "" } else { "s" }
+                )));
+            }
+            history.extend(calib::history_for(
+                chosen.dark.as_deref(),
+                chosen.flat.as_deref(),
+            ));
+            history.extend(chosen.used.iter().map(|line| history_line(line)));
+            history.extend(chosen.missing.iter().map(|line| history_line(line)));
+        }
         if let Err(e) = write_fits(&out, &result, &history) {
             let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(&out))));
             return;
@@ -789,10 +925,33 @@ fn stack_worker(
         stacks,
         unaligned,
         rejected,
+        uncalibrated,
         colour_at_a_time,
         calibration,
         missing,
     }));
+}
+
+/// The bytes of every master `parts` hold between them, one that several
+/// share counted once.
+fn masters_held(parts: &[(String, masters::Chosen)]) -> u64 {
+    let mut darks: Vec<&Arc<MasterFrame>> = Vec::new();
+    let mut flats: Vec<&Arc<MasterFlat>> = Vec::new();
+    for (_, chosen) in parts {
+        if let Some(dark) = &chosen.dark {
+            if !darks.iter().any(|known| Arc::ptr_eq(known, dark)) {
+                darks.push(dark);
+            }
+        }
+        if let Some(flat) = &chosen.flat {
+            if !flats.iter().any(|known| Arc::ptr_eq(known, flat)) {
+                flats.push(flat);
+            }
+        }
+    }
+    let samples = darks.iter().map(|dark| dark.data.len()).sum::<usize>()
+        + flats.iter().map(|flat| flat.gain.len()).sum::<usize>();
+    4 * samples as u64
 }
 
 /// A frame of a stack's first pass, got ready on the thread ahead: everything
@@ -808,15 +967,6 @@ struct Arrived {
     measured: Quality,
     /// Its stars, to line it up by.
     found: StarField,
-}
-
-/// The filter a frame was taken through, or a stand-in when it does not say.
-fn filter_of(header: &FitsHeader) -> String {
-    header
-        .get("FILTER")
-        .map(|v| v.trim().trim_matches('\'').trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "unfiltered".to_string())
 }
 
 /// A filter name reduced to something safe to put in a file name.
@@ -949,7 +1099,7 @@ fn export_worker(
     paths: &[PathBuf],
     by_hand: (Option<Arc<MasterFrame>>, Option<Arc<MasterFlat>>),
     library: Option<&masters::InUse>,
-    directory: &Path,
+    (root, directory): (&Path, &Path),
     tx: &mpsc::Sender<Update>,
     cancel: &AtomicBool,
 ) {
@@ -958,25 +1108,30 @@ fn export_worker(
         return;
     }
 
-    // Each way the frames were taken is worked out once: a folder holds a few
-    // filters and exposures, not a few hundred.
-    let mut chosen: std::collections::HashMap<String, masters::Chosen> =
-        std::collections::HashMap::new();
+    // Each night of each way the frames were taken is worked out once, from
+    // the headers: a folder holds a few filters, exposures and nights, not a
+    // few hundred. The slot after the last group's is for a frame that does
+    // not say enough to be matched, which gets what was chosen by hand.
+    let headers: Vec<(PathBuf, FitsHeader)> = paths
+        .iter()
+        .filter_map(|path| Some((path.clone(), read_fits_header(path).ok()?)))
+        .filter(|(_, header)| !is_exported(header))
+        .collect();
+    let groups = masters::groups_from(&headers);
+    let group_of: HashMap<&Path, usize> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, group)| group.paths.iter().map(move |path| (path.as_path(), index)))
+        .collect();
+    let mut chosen: Vec<Option<masters::Chosen>> = vec![None; groups.len() + 1];
+    let mut made = masters::Made::default();
     let mut missing: Vec<String> = Vec::new();
     let mut written = 0usize;
-    // The frames taken each way, from their headers, so that each way has a
-    // few frames to try its flat on.
-    let mut alike: std::collections::HashMap<String, Vec<PathBuf>> =
-        std::collections::HashMap::new();
-    for path in paths {
-        let key = read_fits_header(path)
-            .ok()
-            .as_ref()
-            .and_then(Taken::of_light)
-            .as_ref()
-            .map_or_else(String::new, taken_key);
-        alike.entry(key).or_default().push(path.clone());
-    }
+    let mut already = 0usize;
+    let mut renamed = 0usize;
+    // Every copy written so far, so that `a.fit` and `a.fits` do not both
+    // become one `a_cal.fits`.
+    let mut names = HashSet::new();
 
     for (index, path) in paths.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -996,12 +1151,20 @@ fn export_worker(
                 return;
             }
         };
+        // A copy an earlier export wrote, found again because it was written
+        // below the folder that is open: the dark has come off it once.
+        if is_exported(&light.header) {
+            already += 1;
+            continue;
+        }
 
-        let taken = Taken::of_light(&light.header);
-        let key = taken.as_ref().map_or_else(String::new, taken_key);
-        if !chosen.contains_key(&key) {
-            let this = match &taken {
-                Some(taken) => {
+        let slot = group_of
+            .get(path.as_path())
+            .copied()
+            .unwrap_or(groups.len());
+        if chosen[slot].is_none() {
+            let this = match groups.get(slot) {
+                Some(group) => {
                     let mut report = |item: String| {
                         let _ = tx.send(Update::Progress {
                             done: index,
@@ -1009,20 +1172,21 @@ fn export_worker(
                             item,
                         });
                     };
-                    match masters::choose(
-                        taken,
-                        &masters::samples_of(&alike[&key]),
+                    let Ok(this) = masters::choose(
+                        &group.taken,
+                        &group.samples(),
                         by_hand.clone(),
                         library,
+                        &mut made,
                         cancel,
                         &mut report,
-                    ) {
-                        Ok(this) => this,
-                        Err(_) => {
-                            let _ = tx.send(Update::Cancelled);
-                            return;
-                        }
-                    }
+                    ) else {
+                        let _ = tx.send(Update::Cancelled);
+                        return;
+                    };
+                    let name = group.name();
+                    missing.extend(this.missing.iter().map(|line| format!("{name} — {line}")));
+                    this
                 }
                 None => masters::Chosen {
                     dark: by_hand.0.clone(),
@@ -1030,17 +1194,14 @@ fn export_worker(
                     ..masters::Chosen::default()
                 },
             };
-            let filter = taken
-                .as_ref()
-                .and_then(|t| t.filter.clone())
-                .unwrap_or_else(|| "unfiltered".into());
-            missing.extend(this.missing.iter().map(|line| format!("{filter} — {line}")));
-            chosen.insert(key.clone(), this);
+            chosen[slot] = Some(this);
         }
-        let this = &chosen[&key];
+        let Some(this) = chosen[slot].as_ref() else {
+            continue;
+        };
         let (dark, flat) = (this.dark.as_deref(), this.flat.as_deref());
 
-        let calibrated = match calib::calibrate(&light, dark, flat) {
+        let mut calibrated = match calib::calibrate(&light, dark, flat) {
             Ok(image) => image,
             Err(e) => {
                 let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(path))));
@@ -1051,7 +1212,31 @@ fn export_worker(
         let mut history = calib::history_for(dark, flat);
         history.extend(this.used.iter().map(|line| history_line(line)));
         history.extend(this.missing.iter().map(|line| history_line(line)));
-        let out = directory.join(output_name_for(path));
+        calibrated
+            .header
+            .cards
+            .push((EXPORTED_CARD.to_string(), "T".to_string()));
+        let wanted = output_path_for(path, root, directory);
+        if let Some(Err(e)) = wanted.parent().map(std::fs::create_dir_all) {
+            let _ = tx.send(Update::Failed(format!("{}: {e}", wanted.display())));
+            return;
+        }
+        let Some(out) = first_free(&wanted, &mut names, may_replace_with_copy) else {
+            let _ = tx.send(Update::Failed(format!(
+                "{}: no free name for its calibrated copy",
+                file_name_of(path)
+            )));
+            return;
+        };
+        if out != wanted {
+            log::info!(
+                "{} is already there, so the copy of {} is {}",
+                file_name_of(&wanted),
+                file_name_of(path),
+                file_name_of(&out)
+            );
+            renamed += 1;
+        }
         if let Err(e) = write_fits(&out, &calibrated, &history) {
             let _ = tx.send(Update::Failed(format!("{}: {e}", file_name_of(&out))));
             return;
@@ -1067,16 +1252,10 @@ fn export_worker(
     let _ = tx.send(Update::Finished(Outcome::Exported {
         written,
         directory: directory.to_path_buf(),
+        already,
+        renamed,
         missing,
     }));
-}
-
-/// A key for the way a frame was taken, as far as its calibration goes.
-fn taken_key(t: &Taken) -> String {
-    format!(
-        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
-        t.filter, t.exposure, t.size, t.binning, t.gain, t.offset, t.set_temperature, t.camera
-    )
 }
 
 /// A line of what was said about calibration, as a `HISTORY` card holds it.
@@ -1103,6 +1282,64 @@ pub fn output_name_for(path: &Path) -> String {
         .file_stem()
         .map_or_else(|| "image".to_string(), |s| s.to_string_lossy().into_owned());
     format!("{stem}_cal.fits")
+}
+
+/// Where the calibrated copy of `path` is written: below `directory` as
+/// `path` is below `root`.
+///
+/// Two nights each holding `light_0001.fits` are both in the list when the
+/// folder above them is open, and written side by side one would replace the
+/// other. A file that is not below `root` goes straight into `directory`.
+#[must_use]
+pub fn output_path_for(path: &Path, root: &Path, directory: &Path) -> PathBuf {
+    let below = path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .unwrap_or(Path::new(""));
+    directory.join(below).join(output_name_for(path))
+}
+
+/// How many numbered names are tried beside the one wanted before giving up.
+const NUMBERED_NAMES: usize = 999;
+
+/// Where to write what would be written at `wanted`: there, or else the first
+/// of `name_2.fits`, `name_3.fits`… beside it that is neither in `taken` nor
+/// a file `may_replace` refuses. The one chosen is added to `taken`.
+///
+/// `taken` holds what this run has written already. The names are compared
+/// ignoring case, because on the file systems macOS and Windows use, `A.fits`
+/// and `a.fits` are one file.
+fn first_free(
+    wanted: &Path,
+    taken: &mut HashSet<String>,
+    may_replace: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let stem = wanted.file_stem()?.to_string_lossy().into_owned();
+    (1..=NUMBERED_NAMES)
+        .map(|n| match n {
+            1 => wanted.to_path_buf(),
+            n => wanted.with_file_name(format!("{stem}_{n}.fits")),
+        })
+        .find(|candidate| {
+            !taken.contains(&name_key(candidate))
+                && (candidate.symlink_metadata().is_err() || may_replace(candidate))
+        })
+        .inspect(|chosen| {
+            taken.insert(name_key(chosen));
+        })
+}
+
+/// A path as `first_free` compares it.
+fn name_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+/// Whether an export may write its copy over the file at `path`: only when an
+/// earlier export wrote it. Anything else there — a frame, another program's
+/// output, something that is not FITS at all — is the user's, and an export
+/// never destroys what it did not make.
+fn may_replace_with_copy(path: &Path) -> bool {
+    read_fits_header(path).is_ok_and(|header| is_exported(&header))
 }
 
 /// A path's file name, for messages.
@@ -1206,6 +1443,18 @@ mod tests {
         }
     }
 
+    /// An export of `paths`, which sit below `root`, with nothing applied.
+    fn export_of(paths: Vec<PathBuf>, root: &Path, directory: &Path) -> Job {
+        Job::export(
+            paths,
+            None,
+            None,
+            None,
+            root.to_path_buf(),
+            directory.to_path_buf(),
+        )
+    }
+
     #[test]
     fn exporting_writes_a_calibrated_copy_of_every_file() {
         let (dir, paths) = frames(3, 500.0);
@@ -1220,6 +1469,7 @@ mod tests {
             Some(Arc::new(dark)),
             None,
             None,
+            dir.path().to_path_buf(),
             out_dir.path().to_path_buf(),
         );
         let updates = run(&mut job);
@@ -1247,10 +1497,10 @@ mod tests {
 
     #[test]
     fn exporting_without_a_dark_copies_the_values_through() {
-        let (_dir, paths) = frames(2, 42.0);
+        let (dir, paths) = frames(2, 42.0);
         let out_dir = tempfile::tempdir().unwrap();
 
-        let mut job = Job::export(paths, None, None, None, out_dir.path().to_path_buf());
+        let mut job = export_of(paths, dir.path(), out_dir.path());
         run(&mut job);
 
         let image = fits_core::read_fits(&out_dir.path().join("f0_cal.fits")).unwrap();
@@ -1259,7 +1509,7 @@ mod tests {
 
     #[test]
     fn exporting_records_what_was_applied_in_the_file() {
-        let (_dir, paths) = frames(1, 100.0);
+        let (dir, paths) = frames(1, 100.0);
         let out_dir = tempfile::tempdir().unwrap();
         let dark =
             calib::build_master_median(&[Arc::new(fits_core::read_fits(&paths[0]).unwrap())])
@@ -1270,6 +1520,7 @@ mod tests {
             Some(Arc::new(dark)),
             None,
             None,
+            dir.path().to_path_buf(),
             out_dir.path().to_path_buf(),
         );
         run(&mut job);
@@ -1284,7 +1535,7 @@ mod tests {
         // The output name always differs from the input name, so exporting in
         // place is safe rather than destructive.
         let (dir, paths) = frames(2, 77.0);
-        let mut job = Job::export(paths.clone(), None, None, None, dir.path().to_path_buf());
+        let mut job = export_of(paths.clone(), dir.path(), dir.path());
         run(&mut job);
 
         for path in &paths {
@@ -1298,12 +1549,140 @@ mod tests {
         assert!(dir.path().join("f0_cal.fits").exists());
     }
 
+    /// What an export reported: files written, and how many of them were
+    /// given a numbered name.
+    fn written_and_renamed(updates: Vec<Update>) -> (usize, usize) {
+        match updates.into_iter().next() {
+            Some(Update::Finished(Outcome::Exported {
+                written, renamed, ..
+            })) => (written, renamed),
+            other => panic!("expected an export, got {other:?}"),
+        }
+    }
+
+    /// The first sample of the FITS file at `path`.
+    fn first_sample(path: &Path) -> f32 {
+        fits_core::read_fits(path).unwrap().data[0]
+    }
+
     #[test]
-    fn a_cancelled_export_stops_and_reports_it() {
-        let (_dir, paths) = frames(40, 100.0);
+    fn an_export_never_writes_over_a_file_it_did_not_write() {
+        // `f0_cal.fits` here is the user's, from some other program. Exported
+        // in place, the copy of `f0.fits` was renamed over it and it was gone,
+        // not even in the trash.
+        let (dir, mut paths) = frames(1, 77.0);
+        let theirs = write_synthetic(
+            dir.path(),
+            "f0_cal.fits",
+            &SyntheticSpec::new(8, 8, -32),
+            &[5.0; 64],
+        )
+        .unwrap();
+        paths.push(theirs.clone());
+
+        let (written, renamed) =
+            written_and_renamed(run(&mut export_of(paths, dir.path(), dir.path())));
+        assert_eq!((written, renamed), (2, 1));
+
+        assert_eq!(
+            first_sample(&theirs),
+            5.0,
+            "the file that was there is kept"
+        );
+        assert!(!is_exported(&read_fits_header(&theirs).unwrap()));
+        let copy = dir.path().join("f0_cal_2.fits");
+        assert_eq!(first_sample(&copy), 77.0);
+        assert!(is_exported(&read_fits_header(&copy).unwrap()));
+        // Theirs is a frame like any other, and is exported in its turn.
+        assert_eq!(first_sample(&dir.path().join("f0_cal_cal.fits")), 5.0);
+    }
+
+    #[test]
+    fn something_that_is_not_fits_is_not_written_over_either() {
+        let (dir, paths) = frames(1, 77.0);
+        let notes = dir.path().join("f0_cal.fits");
+        std::fs::write(&notes, "my notes").unwrap();
+        let folder = dir.path().join("f0_cal_2.fits");
+        std::fs::create_dir(&folder).unwrap();
+
+        let (written, renamed) =
+            written_and_renamed(run(&mut export_of(paths, dir.path(), dir.path())));
+        assert_eq!((written, renamed), (1, 1));
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "my notes");
+        assert!(folder.is_dir());
+        assert_eq!(first_sample(&dir.path().join("f0_cal_3.fits")), 77.0);
+    }
+
+    #[test]
+    fn two_frames_whose_copies_share_a_name_are_both_kept() {
+        // `a.fit` and `a.fits` both make `a_cal.fits`, and the second copy
+        // replaced the first while the count still said two.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(8, 8, -32);
+        let paths = vec![
+            write_synthetic(dir.path(), "a.fit", &spec, &[1.0; 64]).unwrap(),
+            write_synthetic(dir.path(), "a.fits", &spec, &[2.0; 64]).unwrap(),
+        ];
         let out_dir = tempfile::tempdir().unwrap();
 
-        let mut job = Job::export(paths, None, None, None, out_dir.path().to_path_buf());
+        let (written, renamed) =
+            written_and_renamed(run(&mut export_of(paths, dir.path(), out_dir.path())));
+        assert_eq!((written, renamed), (2, 1));
+        assert_eq!(first_sample(&out_dir.path().join("a_cal.fits")), 1.0);
+        assert_eq!(first_sample(&out_dir.path().join("a_cal_2.fits")), 2.0);
+    }
+
+    #[test]
+    fn exporting_again_replaces_the_copies_it_wrote_before() {
+        // Its own copies are the export's to replace, so a second run writes
+        // the same names rather than a numbered set beside them.
+        let (dir, paths) = frames(2, 40.0);
+        let out_dir = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            let (written, renamed) = written_and_renamed(run(&mut export_of(
+                paths.clone(),
+                dir.path(),
+                out_dir.path(),
+            )));
+            assert_eq!((written, renamed), (2, 0));
+        }
+        let mut names: Vec<String> = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["f0_cal.fits", "f1_cal.fits"]);
+    }
+
+    #[test]
+    fn a_name_taken_in_this_run_is_taken_whatever_its_case() {
+        // On macOS and Windows `A_cal.fits` and `a_cal.fits` are one file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut taken = HashSet::new();
+        let first = first_free(&dir.path().join("a_cal.fits"), &mut taken, |_| true).unwrap();
+        let second = first_free(&dir.path().join("A_cal.fits"), &mut taken, |_| true).unwrap();
+        assert_eq!(first, dir.path().join("a_cal.fits"));
+        assert_eq!(second, dir.path().join("A_cal_2.fits"));
+    }
+
+    #[test]
+    fn when_every_name_is_taken_there_is_none_rather_than_one_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let wanted = dir.path().join("a_cal.fits");
+        std::fs::write(&wanted, "x").unwrap();
+        for n in 2..=NUMBERED_NAMES {
+            std::fs::write(dir.path().join(format!("a_cal_{n}.fits")), "x").unwrap();
+        }
+        assert_eq!(first_free(&wanted, &mut HashSet::new(), |_| false), None);
+    }
+
+    #[test]
+    fn a_cancelled_export_stops_and_reports_it() {
+        let (dir, paths) = frames(40, 100.0);
+        let out_dir = tempfile::tempdir().unwrap();
+
+        let mut job = export_of(paths, dir.path(), out_dir.path());
         job.cancel();
         let updates = run(&mut job);
 
@@ -1320,13 +1699,122 @@ mod tests {
 
     #[test]
     fn exporting_to_a_folder_that_does_not_exist_creates_it() {
-        let (_dir, paths) = frames(1, 5.0);
+        let (dir, paths) = frames(1, 5.0);
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("new").join("nested");
 
-        let mut job = Job::export(paths, None, None, None, target.clone());
+        let mut job = export_of(paths, dir.path(), &target);
         run(&mut job);
         assert!(target.join("f0_cal.fits").exists());
+    }
+
+    #[test]
+    fn frames_of_the_same_name_in_two_subfolders_are_both_exported() {
+        // Two nights of one target, opened together, each with its own
+        // `light_0001.fits`. Written side by side, the second replaced the
+        // first and the count still said two.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SyntheticSpec::new(8, 8, 16);
+        let mut paths = Vec::new();
+        for (night, level) in [("night1", 100.0), ("night2", 200.0)] {
+            let folder = dir.path().join(night);
+            std::fs::create_dir_all(&folder).unwrap();
+            paths.push(write_synthetic(&folder, "light_0001.fits", &spec, &[level; 64]).unwrap());
+        }
+        let out_dir = tempfile::tempdir().unwrap();
+
+        let mut job = export_of(paths, dir.path(), out_dir.path());
+        let updates = run(&mut job);
+        match updates.into_iter().next() {
+            Some(Update::Finished(Outcome::Exported { written, .. })) => assert_eq!(written, 2),
+            other => panic!("expected an export, got {other:?}"),
+        }
+
+        for (night, level) in [("night1", 100.0), ("night2", 200.0)] {
+            let copy = out_dir.path().join(night).join("light_0001_cal.fits");
+            let image = fits_core::read_fits(&copy).unwrap();
+            assert!((image.data[0] - level).abs() < 0.001, "{night} was lost");
+        }
+    }
+
+    #[test]
+    fn a_file_outside_the_open_folder_is_written_straight_into_the_output() {
+        assert_eq!(
+            output_path_for(
+                Path::new("/a/night/l.fits"),
+                Path::new("/a"),
+                Path::new("/out")
+            ),
+            Path::new("/out/night/l_cal.fits")
+        );
+        assert_eq!(
+            output_path_for(
+                Path::new("/elsewhere/l.fits"),
+                Path::new("/a"),
+                Path::new("/out")
+            ),
+            Path::new("/out/l_cal.fits")
+        );
+    }
+
+    #[test]
+    fn an_exported_copy_is_marked_and_not_exported_again() {
+        // Exported into the folder that is open, the copies are in the list
+        // the next time, and were calibrated again as `_cal_cal.fits`.
+        let (dir, mut paths) = frames(2, 300.0);
+        let dark =
+            calib::build_master_median(&[Arc::new(fits_core::read_fits(&paths[0]).unwrap())])
+                .unwrap();
+        let export = |paths: Vec<PathBuf>| {
+            let mut job = Job::export(
+                paths,
+                Some(Arc::new(dark.clone())),
+                None,
+                None,
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(),
+            );
+            run(&mut job)
+        };
+        export(paths.clone());
+        let copy = dir.path().join("f0_cal.fits");
+        assert!(is_exported(&read_fits_header(&copy).unwrap()));
+        assert!(!is_exported(&read_fits_header(&paths[0]).unwrap()));
+
+        paths.push(copy);
+        paths.push(dir.path().join("f1_cal.fits"));
+        match export(paths).into_iter().next() {
+            Some(Update::Finished(Outcome::Exported {
+                written, already, ..
+            })) => assert_eq!((written, already), (2, 2)),
+            other => panic!("expected an export, got {other:?}"),
+        }
+        assert!(!dir.path().join("f0_cal_cal.fits").exists());
+    }
+
+    #[test]
+    fn calibrated_copies_are_left_out_of_a_stack_beside_their_frames() {
+        let (dir, mut paths) = frames(3, 50.0);
+        run(&mut export_of(
+            paths.clone(),
+            dir.path(),
+            &dir.path().join("calibrated"),
+        ));
+        let copies: Vec<PathBuf> = (0..3)
+            .map(|i| dir.path().join("calibrated").join(format!("f{i}_cal.fits")))
+            .collect();
+        let originals = paths.clone();
+        paths.extend(copies.clone());
+
+        let (chosen, calibrated) = frames_to_stack(&paths);
+        let chosen: Vec<PathBuf> = chosen.into_iter().map(|(path, _)| path).collect();
+        assert_eq!(chosen, originals);
+        assert!(!calibrated);
+
+        // Nothing but copies: they are what there is to stack.
+        let (chosen, calibrated) = frames_to_stack(&copies);
+        assert_eq!(chosen.len(), 3);
+        assert!(calibrated);
     }
 
     #[test]

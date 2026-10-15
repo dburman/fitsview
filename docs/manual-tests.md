@@ -177,10 +177,30 @@ Use real darks matching a real light if you have them. Work on a copy.
       an original's modification time afterwards.
 - [ ] Exporting into the source folder is safe: originals keep their names and
       contents.
+- [ ] Open a folder holding two subfolders that each have a frame of the same
+      name, and export: both copies are written, each in a subfolder of its
+      own, and the count says two.
+- [ ] Export into a new subfolder of the open folder, press Rescan so the
+      copies are listed, and stack: the message counts the original frames
+      only. Export again: the copies are reported as already calibrated and
+      nothing called `_cal_cal.fits` is written.
+- [ ] Load a master dark, press `Clear`, and open the folder again: the dark
+      does not come back. The same for a flat. Clearing the dark leaves the
+      flat in place.
 - [ ] Cancelling an export stops promptly and leaves no half-written file. Open
       the last file written and confirm it reads.
 - [ ] The window stays responsive during a long export: panning and stepping
       through files still work.
+- [ ] Put a file of your own called `<frame>_cal.fits` in the export folder,
+      and export: your file is unchanged, the copy is `<frame>_cal_2.fits`, and
+      the message says one was given a numbered name. Export again: the same
+      `_2` copy is replaced, and no `_3` appears.
+- [ ] A folder holding `a.fit` and `a.fits` exports both, as `a_cal.fits` and
+      `a_cal_2.fits`.
+- [ ] With a dark and flat on, step quickly through a folder of large colour
+      frames: the window keeps drawing and answering, the frame on screen
+      stays until the next is ready, and the one finally shown is the one
+      selected. Step back: the frame before appears at once.
 
 ---
 
@@ -537,6 +557,19 @@ one at a time does nearly as well.
       one: the stack uses the older flat, and says what the newer one did.
 - [ ] With only that bad flat, the panel and the stack say none of the flats
       suits the frames, and the stack's history says so too.
+- [ ] Open a target's folder holding two or more nights of one filter: the
+      panel lists each night apart, by the date it began, each with its own
+      dark and flat. A night that ran across midnight is listed once.
+- [ ] Stack it: one stack for the filter, of every night's frames. The panel's
+      last-stack lines and the stack's header history name each night's dark
+      and flat, and dust that moved between the nights leaves no rings or
+      shadows.
+- [ ] With one of those nights taken at a gain or exposure the library has no
+      darks for, and no flat that suits it: the stack is still made and opens,
+      the message says how many frames went in uncalibrated, and the panel
+      names the night and what it lacked in warning colour.
+- [ ] Export the same folder: each night's copies carry that night's dark and
+      flat in their history.
 
 ## Background extraction
 

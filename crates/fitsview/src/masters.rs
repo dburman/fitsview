@@ -23,7 +23,7 @@ use fits_core::stack::{Alignment, Stack, DEFAULT_CLIP};
 use fits_core::{read_fits, write_fits, FitsHeader};
 
 use crate::ahead;
-use crate::library::{Kind, Library, Set, Taken};
+use crate::library::{date_of, moment_of, seconds, Kind, Library, Set, Taken};
 use crate::measurements::Stamp;
 
 /// The hidden folder masters are kept in, inside the library.
@@ -334,6 +334,70 @@ impl InUse {
     }
 }
 
+/// Masters read or made already in one stack or export, by the file each is
+/// kept in, so that groups the same dark suits share the one copy of it: a
+/// 61-megapixel master is a quarter of a gigabyte. One that could not be made
+/// is remembered with why, rather than every group reading its frames again to
+/// find that out.
+#[derive(Debug, Default)]
+pub struct Made {
+    darks: Vec<(PathBuf, Result<Arc<MasterFrame>, String>)>,
+    flats: Vec<(PathBuf, Result<Arc<MasterFlat>, String>)>,
+}
+
+impl Made {
+    /// Lets go of the flats, which the next filter has no use for. The darks
+    /// are kept: filters share them.
+    pub fn forget_flats(&mut self) {
+        self.flats.clear();
+    }
+
+    /// The master dark of `set`, as [`Masters::dark`] gives it, the first time
+    /// from the library and after that from here.
+    fn dark(
+        &mut self,
+        in_use: &InUse,
+        set: &Set,
+        cancel: &AtomicBool,
+        progress: Progress,
+    ) -> Result<Arc<MasterFrame>, Failed> {
+        let file = in_use.masters.file_for(set, None);
+        if let Some((_, made)) = self.darks.iter().find(|(kept, _)| *kept == file) {
+            return made.clone().map_err(Failed::Because);
+        }
+        let made = match in_use.masters.dark(set, cancel, progress) {
+            Ok((master, _)) => Ok(Arc::new(master)),
+            Err(Failed::Because(why)) => Err(why),
+            Err(Failed::Cancelled) => return Err(Failed::Cancelled),
+        };
+        self.darks.push((file, made.clone()));
+        made.map_err(Failed::Because)
+    }
+
+    /// The master flat of `flats` less `flat_dark`, as [`Masters::flat`] gives
+    /// it, the first time from the library and after that from here.
+    fn flat(
+        &mut self,
+        in_use: &InUse,
+        flats: &Set,
+        flat_dark: Option<&Set>,
+        cancel: &AtomicBool,
+        progress: Progress,
+    ) -> Result<Arc<MasterFlat>, Failed> {
+        let file = in_use.masters.file_for(flats, flat_dark);
+        if let Some((_, made)) = self.flats.iter().find(|(kept, _)| *kept == file) {
+            return made.clone().map_err(Failed::Because);
+        }
+        let made = match in_use.masters.flat(flats, flat_dark, cancel, progress) {
+            Ok((master, _)) => Ok(Arc::new(master)),
+            Err(Failed::Because(why)) => Err(why),
+            Err(Failed::Cancelled) => return Err(Failed::Cancelled),
+        };
+        self.flats.push((file, made.clone()));
+        made.map_err(Failed::Because)
+    }
+}
+
 /// The calibration a group of lights gets, and what is worth saying about it.
 #[derive(Debug, Clone, Default)]
 pub struct Chosen {
@@ -345,6 +409,15 @@ pub struct Chosen {
     pub used: Vec<String>,
     /// What was wanted and not found, a line each, saying what it costs.
     pub missing: Vec<String>,
+}
+
+impl Chosen {
+    /// Whether something was wanted for these lights and they got neither a
+    /// dark nor a flat: they go into the stack as they came off the camera.
+    #[must_use]
+    pub fn leaves_uncalibrated(&self) -> bool {
+        self.dark.is_none() && self.flat.is_none() && !self.missing.is_empty()
+    }
 }
 
 /// The dark and the flat for a group of lights, as the panel shows them
@@ -537,6 +610,8 @@ pub const FLAT_AGE_WORTH_SAYING: i64 = 30;
 /// frames, in the order the library ranks them, and the first that does not
 /// leave their sky less even is used. See [`try_flat`].
 ///
+/// `made` holds the masters other groups have had already, and is added to.
+///
 /// # Errors
 ///
 /// [`Failed::Cancelled`] if asked to stop. A master that cannot be made is not
@@ -546,6 +621,7 @@ pub fn choose(
     samples: &[PathBuf],
     by_hand: (Option<Arc<MasterFrame>>, Option<Arc<MasterFlat>>),
     library: Option<&InUse>,
+    made: &mut Made,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(String),
 ) -> Result<Chosen, Failed> {
@@ -562,10 +638,10 @@ pub fn choose(
                 let mut report = |done: usize, total: usize| {
                     progress(format!("Making the master dark: {done} of {total}"));
                 };
-                match in_use.masters.dark(set, cancel, &mut report) {
-                    Ok((master, _)) => {
+                match made.dark(in_use, set, cancel, &mut report) {
+                    Ok(master) => {
                         chosen.used.push(format!("dark: {label}"));
-                        chosen.dark = Some(Arc::new(master));
+                        chosen.dark = Some(master);
                     }
                     Err(Failed::Cancelled) => return Err(Failed::Cancelled),
                     Err(Failed::Because(why)) => chosen.missing.push(format!("no dark: {why}")),
@@ -590,8 +666,8 @@ pub fn choose(
                     let mut report = |done: usize, total: usize| {
                         progress(format!("Making the master flat: {done} of {total}"));
                     };
-                    let master = match in_use.masters.flat(flats, flat_dark, cancel, &mut report) {
-                        Ok((master, _)) => master,
+                    let master = match made.flat(in_use, flats, flat_dark, cancel, &mut report) {
+                        Ok(master) => master,
                         Err(Failed::Cancelled) => return Err(Failed::Cancelled),
                         Err(Failed::Because(why)) => {
                             rejected.push(format!("{label}: {why}"));
@@ -605,7 +681,7 @@ pub fn choose(
                             let tried =
                                 trial.map_or_else(String::new, |t| format!(" ({})", t.words()));
                             chosen.used.push(format!("flat: {label}{tried}"));
-                            chosen.flat = Some(Arc::new(master));
+                            chosen.flat = Some(master);
                             break;
                         }
                     }
@@ -625,7 +701,9 @@ pub fn choose(
     Ok(chosen)
 }
 
-/// A group of lights, as a stack groups them: by filter.
+/// Lights that one dark and one flat suit: of one filter, taken the same way
+/// on the same night. A stack is of a whole filter, and each group that goes
+/// into it is calibrated as its own night was.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Group {
     /// The filter, or `unfiltered`.
@@ -634,11 +712,15 @@ pub struct Group {
     pub taken: Taken,
     /// How many there are.
     pub frames: usize,
-    /// Whether they were not all exposed for the same time, so that no one
-    /// dark suits them all.
-    pub mixed_exposures: bool,
     /// The frames, in the order they came.
     pub paths: Vec<PathBuf>,
+    /// The night they were taken, by the date it began, if they say when.
+    pub night: Option<String>,
+    /// What sets them apart from the other groups of their filter, beyond the
+    /// exposure: the night, the gain and so on. Nothing, when they are alone.
+    pub apart: Vec<String>,
+    /// Whether the exposure sets them apart too.
+    pub by_exposure: bool,
 }
 
 impl Group {
@@ -646,6 +728,35 @@ impl Group {
     #[must_use]
     pub fn samples(&self) -> Vec<PathBuf> {
         samples_of(&self.paths)
+    }
+
+    /// What to call them among the others: the filter alone when they are all
+    /// there is of it, or `L-Pro, 2025-01-16` when there is more than a night.
+    #[must_use]
+    pub fn name(&self) -> String {
+        let mut parts = vec![self.filter.clone()];
+        if let (true, Some(exposure)) = (self.by_exposure, self.taken.exposure) {
+            parts.push(seconds(exposure));
+        }
+        parts.extend(self.apart.iter().cloned());
+        parts.join(", ")
+    }
+
+    /// The same with the exposure always said and how many there are, as the
+    /// panel heads them: `L-Pro, 180 s, 2025-01-16, 12 frames`.
+    #[must_use]
+    pub fn heading(&self) -> String {
+        let mut parts = vec![self.filter.clone()];
+        if let Some(exposure) = self.taken.exposure {
+            parts.push(seconds(exposure));
+        }
+        parts.extend(self.apart.iter().cloned());
+        parts.push(format!(
+            "{} frame{}",
+            self.frames,
+            if self.frames == 1 { "" } else { "s" }
+        ));
+        parts.join(", ")
     }
 }
 
@@ -664,46 +775,184 @@ pub fn samples_of(paths: &[PathBuf]) -> Vec<PathBuf> {
     picked
 }
 
-/// The lights among `paths`, grouped by filter from their headers alone, in
-/// the order their filters first appear. Stacks this program wrote are left
-/// out, as stacking leaves them out.
+/// How long nothing may be taken before what follows is another night, in
+/// seconds: six hours. Cloud passing or a meridian flip is shorter, and the
+/// day between two nights is longer, even at midwinter far from the equator.
+pub const NIGHT_APART: i64 = 6 * 3_600;
+
+/// The nights a folder's frames were taken on, from when each was.
+///
+/// By the gaps between frames and not by the date, because `DATE-OBS` is in
+/// universal time: a night in Europe runs across its midnight, and by the date
+/// would be two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Nights {
+    /// When each began, earliest first.
+    began: Vec<i64>,
+}
+
+impl Nights {
+    /// The nights that `moments`, in seconds since 1970, fall into.
+    fn of(moments: impl Iterator<Item = i64>) -> Self {
+        let mut moments: Vec<i64> = moments.collect();
+        moments.sort_unstable();
+        let mut began = Vec::new();
+        let mut last: Option<i64> = None;
+        for moment in moments {
+            if last.is_none_or(|last| moment - last > NIGHT_APART) {
+                began.push(moment);
+            }
+            last = Some(moment);
+        }
+        Self { began }
+    }
+
+    /// Which night `moment` is in, counting from the earliest.
+    fn holding(&self, moment: i64) -> usize {
+        self.began
+            .partition_point(|began| *began <= moment)
+            .saturating_sub(1)
+    }
+
+    /// What to call a night: the date it began, and the time as well if
+    /// another began on that date.
+    fn name(&self, night: usize) -> String {
+        let Some(&began) = self.began.get(night) else {
+            return String::new();
+        };
+        let day = began.div_euclid(86_400);
+        let date = date_of(day);
+        if self
+            .began
+            .iter()
+            .filter(|b| b.div_euclid(86_400) == day)
+            .count()
+            < 2
+        {
+            return date;
+        }
+        let of_day = began.rem_euclid(86_400);
+        format!("{date} {:02}:{:02}", of_day / 3_600, of_day % 3_600 / 60)
+    }
+}
+
+/// A key for the way a light was taken, as far as its calibration goes.
+fn way_of(filter: &str, taken: &Taken) -> String {
+    format!(
+        "{filter}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        taken.exposure,
+        taken.size,
+        taken.binning,
+        taken.gain,
+        taken.offset,
+        taken.set_temperature,
+        taken.camera
+    )
+}
+
+/// The lights among `paths`, in groups one dark and one flat suit, from their
+/// headers alone: see [`groups_from`]. Stacks this program wrote are left out,
+/// as stacking leaves them out, and so are calibrated copies an export wrote:
+/// beside their frames they are not stacked, and on their own they are
+/// calibrated already and want nothing from the library.
 #[must_use]
 pub fn groups_of(paths: &[PathBuf]) -> Vec<Group> {
-    let mut groups: Vec<Group> = Vec::new();
-    for path in paths {
-        let is_stack = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(crate::jobs::STACK_PREFIX));
-        if is_stack {
-            continue;
-        }
-        let Some(taken) = fits_core::read_fits_header(path)
-            .ok()
-            .as_ref()
-            .and_then(Taken::of_light)
-        else {
-            continue;
-        };
+    let (frames, calibrated_already) = crate::jobs::frames_to_stack(paths);
+    if calibrated_already {
+        return Vec::new();
+    }
+    groups_from(&frames)
+}
+
+/// `frames` in groups one dark and one flat suit: by filter, by how they were
+/// taken, and by night. In the order each group's first frame comes.
+///
+/// A folder of several nights used to be calibrated as its first frame's night
+/// was, so every other night was divided by a flat showing dust where it had
+/// been on another evening. A frame that does not say when it was taken is
+/// grouped with the others that do not.
+#[must_use]
+pub fn groups_from(frames: &[(PathBuf, FitsHeader)]) -> Vec<Group> {
+    let lights: Vec<(&PathBuf, Taken, Option<i64>)> = frames
+        .iter()
+        .filter_map(|(path, header)| {
+            let taken = Taken::of_light(header)?;
+            let moment = header.get("DATE-OBS").and_then(moment_of);
+            Some((path, taken, moment))
+        })
+        .collect();
+    let nights = Nights::of(lights.iter().filter_map(|(_, _, moment)| *moment));
+
+    let mut groups: Vec<(String, Group)> = Vec::new();
+    for (path, taken, moment) in lights {
         let filter = taken.filter.clone().unwrap_or_else(|| "unfiltered".into());
-        match groups.iter_mut().find(|g| g.filter == filter) {
-            Some(group) => {
+        let night = moment.map(|moment| nights.holding(moment));
+        let key = format!("{}|{night:?}", way_of(&filter, &taken));
+        match groups.iter_mut().find(|(known, _)| *known == key) {
+            Some((_, group)) => {
                 group.frames += 1;
                 group.paths.push(path.clone());
-                if group.taken.exposure != taken.exposure {
-                    group.mixed_exposures = true;
-                }
             }
-            None => groups.push(Group {
-                filter,
-                taken,
-                frames: 1,
-                mixed_exposures: false,
-                paths: vec![path.clone()],
-            }),
+            None => groups.push((
+                key,
+                Group {
+                    filter,
+                    taken,
+                    frames: 1,
+                    paths: vec![path.clone()],
+                    night: night.map(|night| nights.name(night)),
+                    apart: Vec::new(),
+                    by_exposure: false,
+                },
+            )),
         }
     }
+    let mut groups: Vec<Group> = groups.into_iter().map(|(_, group)| group).collect();
+    say_apart(&mut groups);
     groups
+}
+
+/// Works out what sets each group apart from the others of its filter, so
+/// that each can be named by that and no more.
+fn say_apart(groups: &mut [Group]) {
+    let known: Vec<Group> = groups.to_vec();
+    for group in groups.iter_mut() {
+        let others: Vec<&Group> = known.iter().filter(|g| g.filter == group.filter).collect();
+        let differs = |same: &dyn Fn(&Group) -> bool| !others.iter().all(|g| same(g));
+        let said = |value: Option<f64>, what: &str| {
+            value.map_or_else(|| format!("no {what}"), |v| format!("{what} {v}"))
+        };
+        let taken = &group.taken;
+
+        let mut apart = Vec::new();
+        if differs(&|g| g.night == group.night) {
+            apart.push(group.night.clone().unwrap_or_else(|| "no date".into()));
+        }
+        if differs(&|g| g.taken.gain == taken.gain) {
+            apart.push(said(taken.gain, "gain"));
+        }
+        if differs(&|g| g.taken.offset == taken.offset) {
+            apart.push(said(taken.offset, "offset"));
+        }
+        if differs(&|g| g.taken.set_temperature == taken.set_temperature) {
+            apart.push(
+                taken
+                    .set_temperature
+                    .map_or_else(|| "no set temperature".into(), |t| format!("{t:.0} °C")),
+            );
+        }
+        if differs(&|g| g.taken.binning == taken.binning) {
+            apart.push(format!("{}×{} binning", taken.binning.0, taken.binning.1));
+        }
+        if differs(&|g| g.taken.size == taken.size) {
+            apart.push(format!("{}×{} pixels", taken.size.0, taken.size.1));
+        }
+        if differs(&|g| g.taken.camera == taken.camera) {
+            apart.push(taken.camera.clone().unwrap_or_else(|| "no camera".into()));
+        }
+        group.by_exposure = differs(&|g| g.taken.exposure == taken.exposure);
+        group.apart = apart;
+    }
 }
 
 /// FNV-1a over what a master was made from.
@@ -752,6 +1001,231 @@ mod tests {
         assert_eq!(names(samples_of(&paths[..2])), ["0.fits", "1.fits"]);
         assert_eq!(names(samples_of(&paths[..1])), ["0.fits"]);
         assert!(samples_of(&[]).is_empty());
+    }
+
+    /// A moment of 16 January 2025, universal time.
+    fn at(day: i64, hour: i64, minute: i64) -> i64 {
+        moment_of("2025-01-16T00:00:00").unwrap() + day * 86_400 + hour * 3_600 + minute * 60
+    }
+
+    #[test]
+    fn a_night_is_told_by_the_gap_before_it_and_not_by_the_date() {
+        // A night in Europe: from nine in the evening, across midnight, to
+        // four. Then the next evening, and the one after.
+        let moments = [
+            at(0, 21, 0),
+            at(0, 23, 30),
+            at(1, 2, 0),
+            at(1, 4, 0),
+            at(1, 21, 15),
+            at(2, 1, 0),
+            at(2, 20, 0),
+        ];
+        let nights = Nights::of(moments.into_iter().rev());
+        assert_eq!(nights.began.len(), 3);
+        let held: Vec<usize> = moments.iter().map(|m| nights.holding(*m)).collect();
+        assert_eq!(held, [0, 0, 0, 0, 1, 1, 2]);
+        assert_eq!(nights.name(0), "2025-01-16");
+        assert_eq!(nights.name(1), "2025-01-17");
+        assert_eq!(nights.name(2), "2025-01-18");
+    }
+
+    #[test]
+    fn cloud_for_a_few_hours_does_not_make_two_nights_of_one() {
+        let nights = Nights::of([at(0, 20, 0), at(1, 1, 30), at(1, 2, 0)].into_iter());
+        assert_eq!(nights.began.len(), 1);
+        // Just over the gap is another night.
+        let apart = Nights::of([at(0, 20, 0), at(0, 20, 0) + NIGHT_APART + 1].into_iter());
+        assert_eq!(apart.began.len(), 2);
+        assert_eq!(Nights::of(std::iter::empty()).began.len(), 0);
+    }
+
+    #[test]
+    fn two_nights_begun_on_one_date_are_told_apart_by_the_time() {
+        // Before dawn, and again that evening: both begin on the 16th.
+        let nights = Nights::of([at(0, 1, 5), at(0, 2, 0), at(0, 22, 40)].into_iter());
+        assert_eq!(nights.name(0), "2025-01-16 01:05");
+        assert_eq!(nights.name(1), "2025-01-16 22:40");
+    }
+
+    /// A light's header: its filter, when it was taken, and any other cards.
+    fn light(
+        name: &str,
+        filter: &str,
+        date: Option<&str>,
+        more: &[(&str, &str)],
+    ) -> (PathBuf, FitsHeader) {
+        let mut cards: Vec<(String, String)> = [
+            ("NAXIS1", "48"),
+            ("NAXIS2", "40"),
+            ("EXPTIME", "180.0"),
+            ("GAIN", "100"),
+        ]
+        .iter()
+        .filter(|(key, _)| !more.iter().any(|(k, _)| k == key))
+        .chain(more)
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        cards.push(("FILTER".into(), filter.into()));
+        if let Some(date) = date {
+            cards.push(("DATE-OBS".into(), date.into()));
+        }
+        (PathBuf::from(name), FitsHeader { cards })
+    }
+
+    #[test]
+    fn one_night_of_a_filter_is_one_group_named_for_the_filter() {
+        let frames = [
+            light("a.fits", "L", Some("2025-01-16T22:00:00"), &[]),
+            light("b.fits", "L", Some("2025-01-17T01:00:00"), &[]),
+            light("c.fits", "Ha", Some("2025-01-17T02:00:00"), &[]),
+        ];
+        let groups = groups_from(&frames);
+        assert_eq!(groups.len(), 2);
+        assert_eq!((groups[0].name().as_str(), groups[0].frames), ("L", 2));
+        assert_eq!(groups[0].night.as_deref(), Some("2025-01-16"));
+        assert_eq!(groups[0].heading(), "L, 180 s, 2 frames");
+        assert_eq!(groups[1].heading(), "Ha, 180 s, 1 frame");
+    }
+
+    #[test]
+    fn each_night_of_a_filter_is_a_group_of_its_own() {
+        // Interleaved as a list sorted by name might have them.
+        let frames = [
+            light("a.fits", "L", Some("2025-01-16T22:00:00"), &[]),
+            light("b.fits", "L", Some("2025-02-03T21:00:00"), &[]),
+            light("c.fits", "L", Some("2025-01-17T01:00:00"), &[]),
+            light("d.fits", "Ha", Some("2025-02-03T23:00:00"), &[]),
+        ];
+        let groups = groups_from(&frames);
+        let said: Vec<(String, usize)> = groups.iter().map(|g| (g.name(), g.frames)).collect();
+        assert_eq!(
+            said,
+            [
+                ("L, 2025-01-16".to_string(), 2),
+                ("L, 2025-02-03".to_string(), 1),
+                // The only night of its filter needs no date to tell it by.
+                ("Ha".to_string(), 1),
+            ]
+        );
+        assert_eq!(groups[0].paths, [PathBuf::from("a.fits"), "c.fits".into()]);
+        assert_eq!(groups[0].heading(), "L, 180 s, 2025-01-16, 2 frames");
+        // Each is matched by its own night's date.
+        assert_ne!(groups[0].taken.day, groups[1].taken.day);
+    }
+
+    #[test]
+    fn frames_taken_differently_on_one_night_are_groups_named_by_the_difference() {
+        let night = Some("2025-01-16T22:00:00");
+        let frames = [
+            light("a.fits", "L", night, &[]),
+            light("b.fits", "L", night, &[("EXPTIME", "60.0")]),
+            light("c.fits", "L", night, &[("GAIN", "300")]),
+            light("d.fits", "L", None, &[]),
+        ];
+        let names: Vec<String> = groups_from(&frames).iter().map(Group::name).collect();
+        assert_eq!(
+            names,
+            [
+                "L, 180 s, 2025-01-16, gain 100",
+                "L, 60 s, 2025-01-16, gain 100",
+                "L, 180 s, 2025-01-16, gain 300",
+                "L, 180 s, no date, gain 100",
+            ]
+        );
+    }
+
+    #[test]
+    fn frames_that_do_not_say_when_are_one_group() {
+        let frames = [
+            light("a.fits", "L", None, &[]),
+            light("b.fits", "L", None, &[]),
+        ];
+        let groups = groups_from(&frames);
+        assert_eq!(groups.len(), 1);
+        assert_eq!((groups[0].name().as_str(), groups[0].frames), ("L", 2));
+        assert_eq!(groups[0].night, None);
+    }
+
+    #[test]
+    fn groups_the_same_dark_suits_share_the_one_copy_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        darks(dir.path(), 4);
+        let in_use = InUse::read(dir.path());
+        let frames = [
+            light(
+                "a.fits",
+                "L",
+                Some("2025-01-16T22:00:00"),
+                &[("SET-TEMP", "-14.0")],
+            ),
+            light(
+                "b.fits",
+                "L",
+                Some("2025-02-03T21:00:00"),
+                &[("SET-TEMP", "-14.0")],
+            ),
+        ];
+        let groups = groups_from(&frames);
+        assert_eq!(groups.len(), 2);
+
+        let mut made = Made::default();
+        let mut choose_for = |group: &Group| {
+            choose(
+                &group.taken,
+                &[],
+                (None, None),
+                Some(&in_use),
+                &mut made,
+                &never(),
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        let (first, second) = (choose_for(&groups[0]), choose_for(&groups[1]));
+        let (a, b) = (first.dark.unwrap(), second.dark.unwrap());
+        assert!(Arc::ptr_eq(&a, &b), "the dark was read twice");
+        // Neither has a flat, and each is told so.
+        assert!(
+            first.missing[0].starts_with("no flat"),
+            "{:?}",
+            first.missing
+        );
+        assert!(second.missing[0].starts_with("no flat"));
+    }
+
+    #[test]
+    fn a_master_that_cannot_be_made_is_not_tried_again_for_the_next_group() {
+        let dir = tempfile::tempdir().unwrap();
+        darks(dir.path(), 3);
+        let in_use = InUse::read(dir.path());
+        // The frames go once the library has been read.
+        for frame in &only(&in_use.library, Kind::Dark).frames {
+            std::fs::remove_file(frame).unwrap();
+        }
+        let (_, header) = light("a.fits", "L", None, &[("SET-TEMP", "-14.0")]);
+        let lights = Taken::of_light(&header).unwrap();
+        let mut made = Made::default();
+        let mut told = 0;
+        for _ in 0..2 {
+            let chosen = choose(
+                &lights,
+                &[],
+                (None, None),
+                Some(&in_use),
+                &mut made,
+                &never(),
+                &mut |_| told += 1,
+            )
+            .unwrap();
+            assert!(chosen.dark.is_none());
+            assert!(
+                chosen.missing[0].contains("none of the 3 darks could be read"),
+                "{:?}",
+                chosen.missing
+            );
+        }
+        assert_eq!(made.darks.len(), 1, "remembered once, with why");
     }
 
     const W: usize = 48;

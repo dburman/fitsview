@@ -89,6 +89,17 @@ pub fn room(memory: Memory, held: u64) -> u64 {
     memory.budget().saturating_sub(held)
 }
 
+/// The room left once the masters a stack holds are allowed for.
+///
+/// What a stack needs already counts one dark and one flat. A folder of
+/// several nights holds a flat for each of them, and `masters` — the bytes of
+/// every master held — beyond that pair comes out of the room.
+#[must_use]
+pub fn room_beside(room: u64, masters: u64, width: usize, height: usize) -> u64 {
+    let counted = 2 * 4 * (width as u64) * (height as u64);
+    room.saturating_sub(masters.saturating_sub(counted))
+}
+
 /// Whether a frame's `channels` can be stacked together in `room` bytes.
 ///
 /// A frame of one channel always can: there is nothing to split.
@@ -123,6 +134,21 @@ mod tests {
     /// night: the frame on screen, in colour, and a neighbour.
     fn room_on(total: u64, available: u64) -> u64 {
         room(machine(total, available), 1_200_000_000)
+    }
+
+    #[test]
+    fn masters_for_further_nights_come_out_of_the_room() {
+        let frame = 4 * (FRAME.0 * FRAME.1) as u64;
+        // One night's dark and flat are in what a stack needs already.
+        assert_eq!(room_beside(8 * GB, 2 * frame, FRAME.0, FRAME.1), 8 * GB);
+        assert_eq!(room_beside(8 * GB, 0, FRAME.0, FRAME.1), 8 * GB);
+        // Three further nights' flats are not.
+        assert_eq!(
+            room_beside(8 * GB, 5 * frame, FRAME.0, FRAME.1),
+            8 * GB - 3 * frame
+        );
+        // And more masters than there is room leaves none, not a wrapped sum.
+        assert_eq!(room_beside(frame, 9 * frame, FRAME.0, FRAME.1), 0);
     }
 
     #[test]

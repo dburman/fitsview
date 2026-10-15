@@ -163,21 +163,10 @@ fn library_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
         }
     });
 
-    // What each filter of the open folder will get.
+    // What each filter of the open folder will get, a night at a time.
     for (group, plan) in &model.library_plan {
         ui.add_space(4.0);
-        let exposure = group
-            .taken
-            .exposure
-            .map_or_else(String::new, |e| format!(", {e:.0} s"));
-        ui.label(
-            RichText::new(format!(
-                "{}{exposure}, {} frames",
-                group.filter, group.frames
-            ))
-            .small()
-            .strong(),
-        );
+        ui.label(RichText::new(group.heading()).small().strong());
         let line = |ui: &mut Ui, what: &str, by_hand: bool, found: &Result<String, String>| match (
             by_hand, found,
         ) {
@@ -201,15 +190,6 @@ fn library_section(ui: &mut Ui, model: &Model) -> Vec<Action> {
         };
         line(ui, "Dark", model.calibration.dark.is_some(), &plan.dark);
         line(ui, "Flat", model.calibration.flat.is_some(), &plan.flat);
-        if group.mixed_exposures {
-            ui.label(
-                RichText::new(
-                    "Not all of these are the same exposure; one dark suits only one of them.",
-                )
-                .color(warn)
-                .small(),
-            );
-        }
     }
 
     if !model.calibration_report.is_empty() {

@@ -91,7 +91,12 @@ ray on one frame is discarded rather than smeared across every result, and
 subtract it with `D`. Do the same with flats to remove vignetting and dust
 shadows, applied with `Shift+F`. Both can be saved and reused, and each folder
 remembers which were used with it. Export writes calibrated copies of a whole
-folder in the background, never touching the originals.
+folder in the background, never touching the originals. The copies are laid
+out in the subfolders the frames were in, so two nights' frames of the same
+name do not replace each other, and each is marked as calibrated: it is not
+calibrated a second time, nor stacked beside the frame it was made from. A
+file that already has a copy's name, and is not an earlier copy, is never
+written over: the copy takes a numbered name beside it.
 
 **A calibration library.** Point fitsview once at the folder holding your darks,
 flats and biases, and it finds the right ones for every night by reading how
@@ -105,6 +110,14 @@ few of the night's frames first, and one that would leave the sky less even —
 taken with something shadowing the field, or with the camera turned since — is
 passed over for one that suits, or left out, and the panel says why. A master
 you choose by hand always wins.
+
+A target taken over several nights is still one stack per filter, but each
+night's frames are calibrated with that night's own dark and flat, and the
+panel lists the nights apart. A night the library has nothing for goes into the
+stack as it came off the camera: the stack is still made, the message counts
+the frames that went in uncalibrated, and the panel and the file's history name
+the night. Nights are told apart by the gaps between frames, not by the date,
+so a night that runs across midnight is one night.
 
 **One-shot colour.** A raw frame from a colour camera is a mosaic behind a grid
 of filters and displays as grey. `B` reconstructs the colour, automatically when
@@ -163,7 +176,7 @@ figures. The histogram shows where the stretch is putting things.
 
 **Throughout.** Everything is reachable from the keyboard; press `?` for the
 list. No `unsafe` code anywhere in the project, enforced by the compiler. Tested
-by 832 automated tests, run on macOS, Linux and Windows on every change, and
+by 873 automated tests, run on macOS, Linux and Windows on every change, and
 again on each system before its download is built.
 
 ---

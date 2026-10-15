@@ -167,6 +167,25 @@ fn day_of(text: &str) -> Option<i64> {
     Some(era * 146_097 + of_era_days - 719_468)
 }
 
+/// Seconds since 1970 of a `DATE-OBS` value such as `2025-01-16T02:13:04.5`.
+/// A date with no time of day is taken as its midnight.
+#[must_use]
+pub fn moment_of(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let day = day_of(text)?;
+    let mut clock = text.get(11..).unwrap_or_default().split(':');
+    let mut part = |below: i64| {
+        clock
+            .next()
+            .and_then(|digits| digits.get(..2))
+            .and_then(|digits| digits.parse::<i64>().ok())
+            .filter(|value| (0..below).contains(value))
+            .unwrap_or(0)
+    };
+    let (hours, minutes, seconds) = (part(24), part(60), part(61));
+    Some(day * 86_400 + hours * 3_600 + minutes * 60 + seconds)
+}
+
 /// Frames taken the same way, in the same folder: what a master is made from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Set {
@@ -221,7 +240,8 @@ impl Set {
 }
 
 /// An exposure for reading: `180 s`, `0.069 s`.
-fn seconds(exposure: f64) -> String {
+#[must_use]
+pub fn seconds(exposure: f64) -> String {
     if exposure >= 10.0 {
         format!("{exposure:.0} s")
     } else {
@@ -230,7 +250,8 @@ fn seconds(exposure: f64) -> String {
 }
 
 /// A day since 1970 as `2024-12-22`.
-fn date_of(days: i64) -> String {
+#[must_use]
+pub fn date_of(days: i64) -> String {
     let days = days + 719_468;
     let era = days.div_euclid(146_097);
     let of_era = days - era * 146_097;
@@ -687,6 +708,18 @@ mod tests {
         }
         assert_eq!(day_of("2025-13-01"), None);
         assert_eq!(day_of("yesterday"), None);
+    }
+
+    #[test]
+    fn a_moment_is_read_to_the_second_whatever_follows_it() {
+        assert_eq!(moment_of("1970-01-01T00:00:00"), Some(0));
+        assert_eq!(moment_of("1970-01-02T01:02:03"), Some(86_400 + 3_723));
+        // Fractions of a second are let go of, and a date alone is midnight.
+        assert_eq!(moment_of("1970-01-01T00:00:59.875"), Some(59));
+        assert_eq!(moment_of(" 2000-03-01 "), Some(11_017 * 86_400));
+        // A time of day that makes no sense is no reason to lose the date.
+        assert_eq!(moment_of("1970-01-01T99:00:00"), Some(0));
+        assert_eq!(moment_of("yesterday"), None);
     }
 
     #[test]

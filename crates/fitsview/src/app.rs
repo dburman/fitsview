@@ -27,6 +27,7 @@ use crate::jobs::{self, Job};
 use crate::loader::{Cache, Loader};
 use crate::masters;
 use crate::measurements;
+use crate::prepare::{Prepared, Preparer, Recipe};
 use crate::sidecar;
 use crate::stardetect::StarDetector;
 use crate::view::ViewState;
@@ -152,7 +153,7 @@ pub enum Action {
     LoadMasterDark(PathBuf),
     /// Write the current master dark to disk.
     SaveMasterDark(PathBuf),
-    /// Forget the collected darks and the master.
+    /// Forget the collected darks and the master dark.
     ClearDarks,
     /// Turn dark subtraction on or off.
     ToggleApplyDark,
@@ -419,6 +420,17 @@ const CALIBRATED_CACHE_ENTRIES: usize = 3;
 /// count instead.
 const CALIBRATED_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
+/// A frame that has come off the disk and is being made ready to show.
+#[derive(Debug)]
+struct Preparing {
+    /// Which file it is.
+    path: PathBuf,
+    /// The frame as the file holds it.
+    raw: Arc<FitsImage>,
+    /// How long it took to read, in milliseconds, when it was read just now.
+    millis: Option<f64>,
+}
+
 /// The pixel under the pointer, and what it holds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PixelReadout {
@@ -573,6 +585,15 @@ pub struct Model {
     /// becomes three planes of floats, 288 MB, so a budget sized for mono holds
     /// fewer than two and re-debayers almost every step.
     calibrated: Cache,
+    /// Calibrates, reconstructs and flattens frames for display, away from
+    /// the thread that draws them.
+    preparer: Preparer,
+    /// The frame waiting on the preparer to be shown, if any. What was on
+    /// screen stays there until it is ready.
+    preparing: Option<Preparing>,
+    /// Bumped whenever what is done to a frame for display changes, so that
+    /// a frame made ready the old way is known for what it is.
+    prepared_generation: u64,
     /// Notices frames added to the open folder while it is open.
     watcher: Option<Watcher>,
     /// Where the calibration library is: the folder whose darks and flats are
@@ -684,6 +705,9 @@ impl Model {
             bayer: Bayer::default(),
             job: None,
             calibrated: Cache::new(CALIBRATED_CACHE_ENTRIES, CALIBRATED_CACHE_BYTES),
+            preparer: Preparer::new(),
+            preparing: None,
+            prepared_generation: 0,
             watcher: None,
             stack_room: None,
             library_root: None,
@@ -791,10 +815,15 @@ impl Model {
             Action::LoadMasterDark(path) => self.load_master_dark(&path),
             Action::SaveMasterDark(path) => self.save_master_dark(&path),
             Action::ClearDarks => {
-                self.calibration = Calibration::default();
-                self.calibrated.clear();
+                self.calibration.dark = None;
+                self.calibration.dark_sources.clear();
+                self.calibration.dark_path = None;
+                self.calibration.apply_dark = false;
                 self.refresh_after_calibration_change();
-                self.toast = Some(Toast::new("Calibration cleared"));
+                // Or the folder brings the master back the next time it is
+                // opened.
+                self.remember_calibration();
+                self.toast = Some(Toast::new("Darks cleared"));
             }
             Action::ToggleApplyDark => {
                 if !self.calibration.has_dark() {
@@ -835,8 +864,10 @@ impl Model {
                 self.calibration.flat = None;
                 self.calibration.flat_sources.clear();
                 self.calibration.flat_dark_sources.clear();
+                self.calibration.flat_path = None;
                 self.calibration.apply_flat = false;
                 self.refresh_after_calibration_change();
+                self.remember_calibration();
                 self.toast = Some(Toast::new("Flats cleared"));
             }
             Action::ToggleApplyFlat => {
@@ -962,7 +993,7 @@ impl Model {
                 self.extract_background = !self.extract_background;
                 // The frames kept ready for display were made with the old
                 // setting.
-                self.calibrated.clear();
+                self.forget_prepared();
                 self.show_selection();
                 self.invalidate_texture();
                 self.toast = Some(Toast::new(if self.extract_background {
@@ -1237,7 +1268,6 @@ impl Model {
                 self.calibration.dark_sources = vec![path.to_path_buf()];
                 self.calibration.dark_path = Some(path.to_path_buf());
                 self.calibration.apply_dark = true;
-                self.calibrated.clear();
                 self.refresh_after_calibration_change();
                 self.remember_calibration();
                 self.toast = Some(Toast::new("Master dark loaded"));
@@ -1374,6 +1404,7 @@ impl Model {
             self.calibration.dark.clone(),
             self.calibration.flat.clone(),
             self.library_in_use(),
+            folder.dir.clone(),
             directory,
         ));
     }
@@ -1514,7 +1545,6 @@ impl Model {
                 jobs::Update::Finished(jobs::Outcome::Master(master)) => {
                     self.calibration.dark = Some(Arc::new(*master));
                     self.calibration.apply_dark = true;
-                    self.calibrated.clear();
                     self.refresh_after_calibration_change();
                     self.toast = Some(Toast::new(self.calibration.summary()));
                 }
@@ -1559,6 +1589,7 @@ impl Model {
                     stacks,
                     unaligned,
                     rejected,
+                    uncalibrated,
                     colour_at_a_time,
                     calibration,
                     missing,
@@ -1578,6 +1609,9 @@ impl Model {
                             }
                             if colour_at_a_time {
                                 skipped.push_str(", a colour at a time to fit in memory");
+                            }
+                            if uncalibrated > 0 {
+                                skipped.push_str(&format!("; {uncalibrated} went in uncalibrated"));
                             }
                             if lacking > 0 {
                                 skipped.push_str(&format!(
@@ -1599,8 +1633,23 @@ impl Model {
                 jobs::Update::Finished(jobs::Outcome::Exported {
                     written,
                     directory,
+                    already,
+                    renamed,
                     missing,
                 }) => {
+                    let left_out = if already == 0 {
+                        String::new()
+                    } else {
+                        format!("; {already} already calibrated left out")
+                    };
+                    let numbered = if renamed == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            "; {renamed} given a numbered name, as a file of the usual \
+                             name was there already"
+                        )
+                    };
                     let lacking = if missing.is_empty() {
                         String::new()
                     } else {
@@ -1612,7 +1661,7 @@ impl Model {
                     };
                     self.calibration_report = missing;
                     self.toast = Some(Toast::new(format!(
-                        "Wrote {written} file{} to {}{lacking}",
+                        "Wrote {written} file{} to {}{left_out}{numbered}{lacking}",
                         if written == 1 { "" } else { "s" },
                         directory.display()
                     )));
@@ -1701,7 +1750,7 @@ impl Model {
 
     /// Re-examines whether the master suits the current image, and redisplays.
     fn refresh_after_calibration_change(&mut self) {
-        self.calibrated.clear();
+        self.forget_prepared();
         self.update_calibration_warnings();
         self.show_selection();
         self.invalidate_texture();
@@ -1815,6 +1864,7 @@ impl Model {
                     ));
                 }
                 self.loader.reset();
+                self.forget_prepared();
                 self.fresh.clear();
                 self.watcher = Some(Watcher::start(
                     dir.clone(),
@@ -2022,12 +2072,19 @@ impl Model {
         if let Some((_, at)) = self.arriving.as_mut() {
             *at = Instant::now() + RETRY_ARRIVING;
         }
+        // Nor is a frame being made ready for display wanted any more once
+        // another is selected. It is still kept when it is ready.
+        if self.preparing.as_ref().is_some_and(|p| p.path != path) {
+            self.preparing = None;
+        }
 
         // A cached image is shown at once, so stepping back and forth through
         // a folder never flickers.
         if let Some(image) = self.loader.cache_mut().get(&path) {
-            self.display(path, image, None);
+            // Before, not after: making it ready may take long enough that
+            // it is loading again.
             self.loading = false;
+            self.display(path, image, None);
         } else {
             self.loading = true;
         }
@@ -2056,6 +2113,7 @@ impl Model {
             self.stars = Some(field);
             job_changed = true;
         }
+        job_changed |= self.poll_prepared();
         let arrivals = self.loader.poll();
         if arrivals.is_empty() {
             return job_changed;
@@ -2080,8 +2138,8 @@ impl Model {
                 Ok(image) => {
                     if is_selected {
                         self.arriving = None;
-                        self.display(arrival.path, image, Some(arrival.millis));
                         self.loading = false;
+                        self.display(arrival.path, image, Some(arrival.millis));
                         changed = true;
                     }
                 }
@@ -2131,11 +2189,42 @@ impl Model {
     /// The calibrated result is cached, so stepping back to a file already
     /// visited does not subtract the dark a second time.
     fn display(&mut self, path: PathBuf, image: Arc<FitsImage>, millis: Option<f64>) {
-        let load_ms = millis.unwrap_or(0.0);
         self.adopt_bayer_pattern(&image);
 
-        let shown = self.calibrated_version(&path, &image);
-        let image = Arc::clone(&image);
+        let Some(recipe) = self.recipe_for(&image) else {
+            self.preparing = None;
+            self.show(path, Arc::clone(&image), image, millis);
+            return;
+        };
+        if let Some(ready) = self.calibrated.get(&path) {
+            self.preparing = None;
+            self.show(path, ready, image, millis);
+            return;
+        }
+        // Asked for already, and still coming: asking again would make it
+        // twice.
+        let asked = self.preparing.as_ref().is_some_and(|p| p.path == path);
+        if !asked {
+            self.preparer
+                .request(self.prepared_generation, &path, Arc::clone(&image), recipe);
+        }
+        self.preparing = Some(Preparing {
+            path,
+            raw: image,
+            millis,
+        });
+        self.loading = true;
+    }
+
+    /// Puts `shown`, made ready from `raw`, the frame at `path`, on screen.
+    fn show(
+        &mut self,
+        path: PathBuf,
+        shown: Arc<FitsImage>,
+        raw: Arc<FitsImage>,
+        millis: Option<f64>,
+    ) {
+        let load_ms = millis.unwrap_or(0.0);
 
         // Stepping through a folder keeps the zoom and the pan, so that
         // comparing the same corner of one frame with the next — which is what
@@ -2149,13 +2238,13 @@ impl Model {
         // A raw colour frame and a mono one both have a single plane, so the
         // header is asked first and the pixels only when it says nothing.
         self.is_mosaic = self.bayer.pattern.is_some()
-            || image.channels == 3
-            || fits_core::debayer::looks_like_mosaic(&image);
+            || raw.channels == 3
+            || fits_core::debayer::looks_like_mosaic(&raw);
 
         self.loaded = Some(Loaded {
             path,
             image: shown,
-            raw: image,
+            raw,
             load_ms,
         });
         self.error = None;
@@ -2168,51 +2257,82 @@ impl Model {
         self.request_stars();
     }
 
-    /// The image as it should be displayed: calibrated, or the original.
-    fn calibrated_version(&mut self, path: &Path, image: &Arc<FitsImage>) -> Arc<FitsImage> {
+    /// What is done to `image` before it is shown, or `None` when it is shown
+    /// as it came.
+    fn recipe_for(&self, image: &FitsImage) -> Option<Recipe> {
         let extract = self.extract_background;
         if !self.calibration.is_active() && self.bayer.active().is_none() && !extract {
-            return Arc::clone(image);
+            return None;
         }
-        let dark = self.calibration.active_dark().filter(|d| d.matches(image));
-        let flat = self.calibration.active_flat().filter(|f| f.matches(image));
-        let pattern = self.bayer.active();
-        let calibrating = dark.is_some() || flat.is_some() || pattern.is_some();
-        if !calibrating && !extract {
-            // Reported through `blocked`; showing the raw image beats showing
-            // nothing.
-            return Arc::clone(image);
-        }
-        if let Some(cached) = self.calibrated.get(path) {
-            return cached;
-        }
-        let calibrated = if calibrating {
-            match calib::calibrate_and_debayer(image, dark, flat, pattern) {
-                Ok(result) => Some(result),
-                Err(e) => {
-                    log::warn!("could not calibrate {}: {e}", path.display());
-                    return Arc::clone(image);
-                }
-            }
-        } else {
-            None
+        let dark = self
+            .calibration
+            .dark
+            .as_ref()
+            .filter(|_| self.calibration.active_dark().is_some())
+            .filter(|d| d.matches(image))
+            .cloned();
+        let flat = self
+            .calibration
+            .flat
+            .as_ref()
+            .filter(|_| self.calibration.active_flat().is_some())
+            .filter(|f| f.matches(image))
+            .cloned();
+        let recipe = Recipe {
+            dark,
+            flat,
+            pattern: self.bayer.active(),
+            extract,
         };
-        // The gradient is taken out last, from the frame as it will be seen:
-        // calibrated, and in colour where it has colour, so that each colour
-        // loses its own.
-        let result = match (calibrated, extract) {
-            (Some(frame), false) => frame,
-            (Some(frame), true) => {
-                fits_core::gradient::flatten(&frame, &fits_core::gradient::Settings::default())
+        // A master that does not suit the frame is reported through
+        // `blocked`; showing the raw image beats showing nothing.
+        recipe.does_anything().then_some(recipe)
+    }
+
+    /// Forgets every frame made ready for display, and any being made, since
+    /// what is done to them has changed.
+    fn forget_prepared(&mut self) {
+        self.calibrated.clear();
+        self.preparing = None;
+        self.prepared_generation = self.prepared_generation.wrapping_add(1);
+    }
+
+    /// Collects the frames the preparer has made ready: each one kept, and
+    /// the one waiting to be shown, shown.
+    ///
+    /// Returns true if the screen changed.
+    fn poll_prepared(&mut self) -> bool {
+        let mut changed = false;
+        for Prepared {
+            generation,
+            path,
+            result,
+        } in self.preparer.poll()
+        {
+            if generation != self.prepared_generation {
+                log::debug!("dropping {} made ready the old way", path.display());
+                continue;
             }
-            (None, _) => {
-                fits_core::gradient::flatten(image, &fits_core::gradient::Settings::default())
+            // One passed over is kept all the same: stepping back to it is
+            // then free.
+            if let Ok(ready) = &result {
+                self.calibrated.insert(path.clone(), Arc::clone(ready));
             }
-        };
-        let result = Arc::new(result);
-        self.calibrated
-            .insert(path.to_path_buf(), Arc::clone(&result));
-        result
+            if !self.preparing.as_ref().is_some_and(|p| p.path == path) {
+                continue;
+            }
+            let Some(Preparing { raw, millis, .. }) = self.preparing.take() else {
+                continue;
+            };
+            let shown = result.unwrap_or_else(|e| {
+                log::warn!("could not calibrate {}: {e}", path.display());
+                Arc::clone(&raw)
+            });
+            self.loading = false;
+            self.show(path, shown, raw, millis);
+            changed = true;
+        }
+        changed
     }
 
     /// Records the viewport and, if an image has just arrived, fits it.
@@ -2330,6 +2450,7 @@ impl Model {
     #[must_use]
     pub fn busy(&self) -> bool {
         self.loading
+            || self.preparer.is_busy()
             || self.detector.is_busy()
             || self.library_reading.is_some()
             || self.plan_reading.is_some()
@@ -3328,6 +3449,9 @@ mod tests {
         while Instant::now() < deadline {
             model.poll();
             if model.job.is_none() {
+                // And for the frame on screen to be made ready again, since
+                // what the job made is usually a master that changes it.
+                settle(model);
                 return;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -3492,6 +3616,61 @@ mod tests {
         assert!(!m.calibration.has_dark());
         assert!(m.calibration.dark_sources.is_empty());
         assert_eq!(m.loaded.as_ref().unwrap().image.data[0], 900.0);
+    }
+
+    #[test]
+    fn clearing_the_darks_leaves_the_flat_alone() {
+        let dir = folder_of(1, 12, 12);
+        let (_darks_dir, dark_paths) = darks(2, 12, 12, 40.0);
+        let (_flats_dir, flat_paths) = flats(2, 12, 12, 0.6);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+
+        m.handle(Action::ClearDarks);
+        assert!(!m.calibration.has_dark());
+        assert!(
+            m.calibration.has_flat(),
+            "the flat was not what was cleared"
+        );
+        assert!(m.calibration.apply_flat);
+        assert_eq!(m.calibration.flat_sources.len(), 2);
+    }
+
+    #[test]
+    fn a_cleared_master_stays_cleared_when_the_folder_is_reopened() {
+        // The folder remembers which masters were used with it, and went on
+        // remembering one that had been cleared: it came back, applied.
+        let dir = folder_of(2, 12, 12);
+        let library = tempfile::tempdir().unwrap();
+        let (_darks_dir, dark_paths) = darks(2, 12, 12, 40.0);
+        let (_flats_dir, flat_paths) = flats(2, 12, 12, 0.6);
+
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        finish_job(&mut m);
+        m.handle(Action::SaveMasterDark(library.path().join("dark.fits")));
+        m.handle(Action::AddFlats(flat_paths));
+        m.handle(Action::BuildMasterFlat);
+        finish_job(&mut m);
+        m.handle(Action::SaveMasterFlat(library.path().join("flat.fits")));
+
+        m.handle(Action::ClearDarks);
+        let (mut m2, _spy2) = model_over(dir.path());
+        assert!(!m2.calibration.has_dark(), "the dark came back");
+        assert!(m2.calibration.has_flat(), "the flat should still be there");
+
+        m2.handle(Action::ClearFlats);
+        // Something else recorded afterwards must not put it back either.
+        m2.handle(Action::ToggleBayerFlip);
+        let (m3, _spy3) = model_over(dir.path());
+        assert!(!m3.calibration.has_dark());
+        assert!(!m3.calibration.has_flat(), "the flat came back");
     }
 
     #[test]
@@ -4081,6 +4260,7 @@ mod tests {
         assert_eq!(m.loaded.as_ref().unwrap().image.channels, 3);
 
         m.handle(Action::ToggleDebayer);
+        settle(&mut m);
         assert!(!m.bayer.enabled);
         assert_eq!(
             m.loaded.as_ref().unwrap().image.channels,
@@ -4089,6 +4269,7 @@ mod tests {
         );
 
         m.handle(Action::ToggleDebayer);
+        settle(&mut m);
         assert_eq!(m.loaded.as_ref().unwrap().image.channels, 3);
     }
 
@@ -4101,6 +4282,7 @@ mod tests {
         assert!((red_of(&m) - 2000.0).abs() < 1.0);
 
         m.handle(Action::SetBayerPattern(BayerPattern::Bggr));
+        settle(&mut m);
         assert!(!m.bayer.from_header, "the user has overridden the file");
         assert!(
             (red_of(&m) - 300.0).abs() < 1.0,
@@ -4116,12 +4298,91 @@ mod tests {
         let before = m.loaded.as_ref().unwrap().image.data.clone();
 
         m.handle(Action::ToggleBayerFlip);
+        settle(&mut m);
         assert!(m.bayer.flip_rows);
         let after = &m.loaded.as_ref().unwrap().image.data;
         assert_ne!(&before, after, "the flip should do something visible");
 
         m.handle(Action::ToggleBayerFlip);
+        settle(&mut m);
         assert_eq!(&before, &m.loaded.as_ref().unwrap().image.data);
+    }
+
+    #[test]
+    fn a_frame_is_made_ready_without_the_interface_waiting_for_it() {
+        // Calibrating, reconstructing and flattening a full colour frame took
+        // a quarter of a second, and was done where the window is drawn.
+        let dir = folder_of(1, 40, 30);
+        let (mut m, _spy) = model_over(dir.path());
+        let before = Arc::clone(&m.loaded.as_ref().unwrap().image);
+
+        m.handle(Action::ToggleBackgroundExtraction);
+        // Nothing has been polled, so whatever the worker has done by now,
+        // the frame on screen is still the one that was.
+        assert!(m.loading);
+        assert!(m.busy(), "the window must keep asking for the answer");
+        assert!(Arc::ptr_eq(&before, &m.loaded.as_ref().unwrap().image));
+
+        settle(&mut m);
+        let after = &m.loaded.as_ref().unwrap().image;
+        assert!(!Arc::ptr_eq(&before, after));
+        assert_ne!(before.data, after.data, "the gradient should have come out");
+    }
+
+    #[test]
+    fn a_frame_made_ready_the_old_way_is_never_shown() {
+        // Flipped and flipped back before either answer is collected: the
+        // first answer describes a setting no longer in force.
+        let dir = osc_folder([2000.0, 800.0, 300.0], "RGGB");
+        let (mut m, _spy) = model_over(dir.path());
+        let before = m.loaded.as_ref().unwrap().image.data.clone();
+
+        m.handle(Action::ToggleBayerFlip);
+        m.handle(Action::ToggleBayerFlip);
+        settle(&mut m);
+        // Whatever arrives late must not replace it either.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            m.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(before, m.loaded.as_ref().unwrap().image.data);
+    }
+
+    #[test]
+    fn moving_on_while_a_frame_is_made_ready_shows_the_one_moved_to() {
+        let dir = folder_of(3, 40, 30);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleBackgroundExtraction);
+        settle(&mut m);
+
+        m.handle(Action::NextFile);
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        let selected = m
+            .folder
+            .as_ref()
+            .unwrap()
+            .selected_path()
+            .unwrap()
+            .to_path_buf();
+        assert!(selected.ends_with("light_3.fits"));
+        assert_eq!(m.loaded.as_ref().unwrap().path, selected);
+    }
+
+    #[test]
+    fn a_frame_made_ready_once_is_shown_at_once_when_stepped_back_to() {
+        let dir = folder_of(2, 40, 30);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::ToggleBackgroundExtraction);
+        settle(&mut m);
+        let first = Arc::clone(&m.loaded.as_ref().unwrap().image);
+
+        m.handle(Action::NextFile);
+        settle(&mut m);
+        m.handle(Action::PreviousFile);
+        assert!(!m.loading, "it should not have to be made again");
+        assert!(Arc::ptr_eq(&first, &m.loaded.as_ref().unwrap().image));
     }
 
     #[test]
@@ -5382,6 +5643,274 @@ mod tests {
         assert!(header.contains("fitsview: flat: 6 flats"));
     }
 
+    /// The vignetting of a second night's frames and flats: the other way
+    /// round, a quarter brighter at the right than the left, as it is with the
+    /// camera turned.
+    fn other_flat_field(x: usize, w: usize) -> f64 {
+        flat_field(w - 1 - x, w)
+    }
+
+    /// Lights of filter L from two nights, a subfolder each. The first night's
+    /// are as [`lights`] makes them; the second's were taken in November 2024
+    /// with the vignetting the other way round, and carry `more` as well.
+    fn two_nights(more: &[(&str, &str)]) -> TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let mut second: Vec<(&str, &str)> = LIGHT_CARDS
+            .iter()
+            .filter(|(key, _)| *key != "DATE-OBS" && !more.iter().any(|(k, _)| k == key))
+            .copied()
+            .collect();
+        second.push(("DATE-OBS", "'2024-11-10T03:00:00'"));
+        second.extend(more);
+        let shifts = [
+            (0.0, 0.0),
+            (5.0, -3.0),
+            (-4.0, 6.0),
+            (3.0, 2.0),
+            (-2.0, -4.0),
+            (1.0, 3.0),
+        ];
+        let first_light = |x: usize, _: usize| (flat_field(x, 160), 200.0);
+        let second_light = |x: usize, _: usize| (other_flat_field(x, 160), 200.0);
+        let put =
+            |name: &str, cards: &[(&str, &str)], light: &dyn Fn(usize, usize) -> (f64, f64)| {
+                let made = stackable_folder_lit(&shifts, &["L"; 6], cards, light);
+                let into = root.path().join(name);
+                std::fs::create_dir(&into).unwrap();
+                for entry in std::fs::read_dir(made.path()).unwrap() {
+                    let entry = entry.unwrap();
+                    std::fs::copy(entry.path(), into.join(entry.file_name())).unwrap();
+                }
+            };
+        put("night-1", &LIGHT_CARDS, &first_light);
+        put("night-2", &second, &second_light);
+        root
+    }
+
+    /// Flats for the second night, taken the evening before it, vignetted the
+    /// way its frames are.
+    fn add_second_night_flats(library: &Path) {
+        let (w, h) = (160usize, 160usize);
+        let folder = library.join("FLAT/L-november");
+        std::fs::create_dir_all(&folder).unwrap();
+        for i in 0..6u64 {
+            let noise = fits_core::testutil::gaussian_background(w, h, 0.0, 5.0, 1_200 + i);
+            let pixels: Vec<f64> = (0..w * h)
+                .map(|k| 500.0 + 20_000.0 * other_flat_field(k % w, w) + noise[k])
+                .collect();
+            let spec = SyntheticSpec::new(w, h, -32)
+                .with_card("IMAGETYP", "'FLAT'")
+                .with_card("FILTER", "'L'")
+                .with_card("EXPTIME", "2.0")
+                .with_card("GAIN", "100")
+                .with_card("DATE-OBS", "'2024-11-09T22:00:00'");
+            write_synthetic(&folder, &format!("FLAT{i}.fits"), &spec, &pixels).unwrap();
+        }
+    }
+
+    /// How far the sky at the right of a stack is from the sky at its left,
+    /// as a fraction: nothing, when it is even from side to side.
+    fn sky_slope(stacked: &FitsImage) -> f64 {
+        let (w, h) = (stacked.width, stacked.height);
+        let median = |xs: std::ops::Range<usize>| {
+            let mut v: Vec<f64> = (10..h - 10)
+                .flat_map(|y| xs.clone().map(move |x| (x, y)))
+                .map(|(x, y)| f64::from(stacked.data[y * w + x]))
+                .filter(|v| v.is_finite() && *v < 1_500.0)
+                .collect();
+            let mid = v.len() / 2;
+            *v.select_nth_unstable_by(mid, f64::total_cmp).1
+        };
+        median(140..150) / median(10..20) - 1.0
+    }
+
+    #[test]
+    fn each_night_of_a_stack_is_calibrated_with_its_own_flat() {
+        // Two nights of one filter, the camera turned between them, and a
+        // flat for each in the library. Calibrated as the first frame's night
+        // was, the second night is divided by a flat that slopes the wrong
+        // way, and the stack's sky slopes by an eighth.
+        let (folder, library) = (two_nights(&[]), library_for_lights(true));
+        add_second_night_flats(library.path());
+        let mut m = model_with_library(folder.path(), library.path());
+
+        // The panel plans each night apart, before anything is stacked.
+        let headings: Vec<String> = m.library_plan.iter().map(|(g, _)| g.heading()).collect();
+        assert_eq!(
+            headings,
+            [
+                "L, 180 s, 2025-01-16, 6 frames",
+                "L, 180 s, 2024-11-10, 6 frames"
+            ]
+        );
+        let planned = |index: usize| m.library_plan[index].1.flat.clone().unwrap();
+        assert!(planned(0).contains("2024-12-01"), "{}", planned(0));
+        assert!(planned(1).contains("2024-11-09"), "{}", planned(1));
+
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let said = m.toast.as_ref().unwrap().text.clone();
+        assert!(said.starts_with("Stacked 12 frames into 1 file"), "{said}");
+        assert!(!said.contains("missing"), "{said}");
+        assert!(!said.contains("uncalibrated"), "{said}");
+
+        let line = |starts: &str| {
+            m.calibration_report
+                .iter()
+                .find(|l| l.starts_with(starts))
+                .unwrap_or_else(|| panic!("no {starts} in {:?}", m.calibration_report))
+                .clone()
+        };
+        let first = line("L, 2025-01-16 — flat:");
+        assert!(first.contains("2024-12-01"), "{first}");
+        let second = line("L, 2024-11-10 — flat:");
+        assert!(second.contains("2024-11-09"), "{second}");
+        // Both nights have the one dark.
+        assert!(line("L, 2025-01-16 — dark:").contains("6 darks"));
+        assert!(line("L, 2024-11-10 — dark:").contains("6 darks"));
+
+        let (stacked, history) = stacked_l(&folder.path().join("night-1"));
+        let slope = sky_slope(&stacked);
+        assert!(
+            slope.abs() < 0.02,
+            "a night was divided by the other night's flat: the sky slopes by {slope:.3}"
+        );
+        assert!(history.contains("Stacked 12 frames"), "{history}");
+        assert!(
+            history.contains("fitsview: L, 2025-01-16, 6 frames:"),
+            "{history}"
+        );
+        assert!(
+            history.contains("fitsview: L, 2024-11-10, 6 frames:"),
+            "{history}"
+        );
+    }
+
+    #[test]
+    fn a_night_with_nothing_to_calibrate_it_is_stacked_as_it_came_and_said_so() {
+        // The second night was taken at another gain, so no dark suits it,
+        // and the library's only flats slope the wrong way for it, so no flat
+        // does either. The first night has both.
+        let (folder, library) = (two_nights(&[("GAIN", "300")]), library_for_lights(true));
+        let mut m = model_with_library(folder.path(), library.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        // Every frame of both nights is in the one stack all the same.
+        let said = m.toast.as_ref().unwrap().text.clone();
+        assert!(said.starts_with("Stacked 12 frames into 1 file"), "{said}");
+        assert!(said.contains("6 went in uncalibrated"), "{said}");
+        assert!(said.contains("2 calibration frames missing"), "{said}");
+
+        let report = &m.calibration_report;
+        let has = |starts: &str| report.iter().any(|l| l.starts_with(starts));
+        assert!(has("L, 2025-01-16, gain 100 — dark:"), "{report:?}");
+        assert!(has("L, 2025-01-16, gain 100 — flat:"), "{report:?}");
+        assert!(has("L, 2024-11-10, gain 300 — no dark:"), "{report:?}");
+        assert!(has("L, 2024-11-10, gain 300 — no flat:"), "{report:?}");
+
+        // The stack is written, says what it lacks, and is there to look at.
+        let (stacked, history) = stacked_l(&folder.path().join("night-1"));
+        assert!(stacked.data.iter().any(|v| v.is_finite()));
+        assert!(history.contains("Stacked 12 frames"), "{history}");
+        assert!(
+            history.contains("fitsview: L, 2024-11-10, gain 300, 6 frames:"),
+            "{history}"
+        );
+        assert!(history.contains("vignetting and dust will remain"));
+        let listed = m.folder.as_ref().unwrap();
+        assert!(
+            listed
+                .files
+                .iter()
+                .any(|e| e.path.ends_with("night-1/stack_L.fits")),
+            "the stack should be in the list to be opened"
+        );
+    }
+
+    #[test]
+    fn each_night_of_an_export_is_calibrated_with_its_own_flat() {
+        let (folder, library) = (two_nights(&[]), library_for_lights(true));
+        add_second_night_flats(library.path());
+        let mut m = model_with_library(folder.path(), library.path());
+        let out = tempfile::tempdir().unwrap();
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        wait_for_job(&mut m);
+        let said = m.toast.as_ref().unwrap().text.clone();
+        assert!(!said.contains("missing"), "{said}");
+
+        for (night, flat) in [("night-1", "2024-12-01"), ("night-2", "2024-11-09")] {
+            let copy = out.path().join(night).join("f3_cal.fits");
+            let history = history_of(&copy);
+            assert!(
+                history.contains("fitsview: flat: 6 flats") && history.contains(flat),
+                "{night} should have the flat of {flat}: {history}"
+            );
+            let slope = sky_slope(&fits_core::read_fits(&copy).unwrap());
+            assert!(slope.abs() < 0.03, "{night} slopes by {slope:.3}");
+        }
+    }
+
+    #[test]
+    fn calibrated_copies_below_the_folder_are_not_stacked_with_their_frames() {
+        // Exported into a subfolder of the folder that is open, the copies
+        // join the list, and the stack was of every frame twice over.
+        let dir = stackable_folder(&[(0.0, 0.0), (5.0, -3.0), (-4.0, 6.0)], &["L", "L", "L"]);
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::StartExport(dir.path().join("calibrated")));
+        wait_for_job(&mut m);
+        m.handle(Action::Rescan);
+        wait_for_job(&mut m);
+        assert_eq!(m.folder.as_ref().unwrap().len(), 6, "the copies are listed");
+
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        let history = history_of(&dir.path().join("stack_L.fits"));
+        assert!(history.contains("Stacked 3 frames"), "{history}");
+        let said = m.toast.as_ref().map(|t| t.text.clone()).unwrap_or_default();
+        assert!(said.starts_with("Stacked 3 frames into 1 file"), "{said}");
+
+        // And a second export has nothing new to write.
+        m.handle(Action::StartExport(dir.path().join("calibrated")));
+        wait_for_job(&mut m);
+        let said = m.toast.as_ref().map(|t| t.text.clone()).unwrap_or_default();
+        assert!(said.contains("3 already calibrated left out"), "{said}");
+        assert!(!dir.path().join("calibrated/calibrated").exists());
+    }
+
+    #[test]
+    fn a_folder_of_calibrated_copies_is_stacked_without_calibrating_it_again() {
+        let dir = stackable_folder(&[(0.0, 0.0), (5.0, -3.0), (-4.0, 6.0)], &["L", "L", "L"]);
+        let (_darks_dir, dark_paths) = darks(1, 160, 160, 100.0);
+        let out = tempfile::tempdir().unwrap();
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::AddDarks(dark_paths.clone()));
+        m.handle(Action::BuildMasterDark);
+        wait_for_job(&mut m);
+        m.handle(Action::StartExport(out.path().to_path_buf()));
+        wait_for_job(&mut m);
+
+        // The copies on their own, the dark still in force.
+        let (mut m, _spy) = model_over(out.path());
+        m.handle(Action::AddDarks(dark_paths));
+        m.handle(Action::BuildMasterDark);
+        wait_for_job(&mut m);
+        assert!(m.calibration.apply_dark);
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+
+        let stacked = fits_core::read_fits(&out.path().join("stack_L.fits")).unwrap();
+        let sky = fits_core::stack::sky_level(&stacked);
+        assert!(
+            (sky - 900.0).abs() < 5.0,
+            "the dark came off twice: sky {sky}"
+        );
+        assert!(m
+            .calibration_report
+            .iter()
+            .any(|line| line.contains("calibrated when exported")));
+    }
+
     #[test]
     fn stacking_writes_one_file_for_each_filter() {
         // Combining filters would average away the thing the filters were for.
@@ -5401,6 +5930,46 @@ mod tests {
             .collect();
         written.sort();
         assert_eq!(written, vec!["stack_Ha.fits", "stack_OIII.fits"]);
+    }
+
+    #[test]
+    fn filters_whose_names_are_made_safe_alike_each_keep_their_stack() {
+        // Both become `Ha-7nm` in a file name, and the second filter's stack
+        // was written over the first's.
+        let dir = stackable_folder(
+            &[(0.0, 0.0), (5.0, -3.0), (0.0, 0.0), (-4.0, 6.0)],
+            &["Ha 7nm", "Ha 7nm", "Ha-7nm", "Ha-7nm"],
+        );
+        let stacks_in = |dir: &Path| {
+            let mut written: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("stack_"))
+                .collect();
+            written.sort();
+            written
+        };
+        let (mut m, _spy) = model_over(dir.path());
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        assert!(m.error.is_none(), "{:?}", m.error);
+        assert_eq!(
+            stacks_in(dir.path()),
+            vec!["stack_Ha-7nm.fits", "stack_Ha-7nm_2.fits"]
+        );
+        for name in ["stack_Ha-7nm.fits", "stack_Ha-7nm_2.fits"] {
+            let header = fits_core::read_fits_header(&dir.path().join(name)).unwrap();
+            assert!(header.get("FILTER").is_some(), "{name}");
+        }
+
+        // Stacked again, the same two names are written over, and no more.
+        m.handle(Action::StackFolder);
+        wait_for_job(&mut m);
+        assert_eq!(
+            stacks_in(dir.path()),
+            vec!["stack_Ha-7nm.fits", "stack_Ha-7nm_2.fits"]
+        );
     }
 
     #[test]

@@ -3910,6 +3910,204 @@ is let through at a little worse, rather than required to be better.
 
 ---
 
+## Phase 28 — What a Read-Through Found
+
+Three faults found by reading the code rather than by using it, each of which
+gave a wrong result and said nothing.
+
+### What was wrong, and what was done
+
+**Calibrated copies were stacked beside their frames.** A folder is searched
+two levels down, so an export into a subfolder of the open folder — `calibrated`
+is the obvious name for one — put its copies in the list. Three frames exported
+and then stacked reported six, with the dark taken off three of them twice; a
+second export wrote `_cal_cal.fits`. A stack is told apart by its name, but a
+copy's name is the user's frame's name, so a copy is told apart by a card,
+`FITSVCAL = T`, as a gain map is by `FITSVFLT`. `jobs::frames_to_stack` is the
+one place that decides what a stack is made from, used by the stack and by the
+panel's plan alike: copies are left out while there are frames that are not
+copies. A folder of nothing but copies is stacked from them and not calibrated
+again, whatever is chosen by hand, and the stack's `HISTORY` says so. Export
+leaves copies out and counts them in its message.
+
+**Two nights' frames of one name were exported over each other.** The copy was
+named for the frame alone and written straight into the chosen folder, while
+the list holds every night below the folder that is open. The second
+`light_0001_cal.fits` replaced the first and the message still counted two.
+Copies are now written below the chosen folder as the frames are below the open
+one (`jobs::output_path_for`).
+
+**A cleared master came back.** `Clear` forgot the master and did not tell the
+folder's sidecar, so opening the folder again loaded and applied it. Clearing
+the flat also left its path behind, which the next thing recorded wrote out
+again. Both now record what they did. `Clear` beside the darks used to clear
+the flat too, though it says darks and sits under Darks; it clears the darks.
+
+### Acceptance criteria
+
+- [x] An exported copy carries the card, and a frame does not.
+- [x] Copies below the open folder are left out of a stack and of the plan.
+- [x] A folder of copies stacks, and a dark in force is not taken off again.
+- [x] A second export writes nothing new and says how many it left out.
+- [x] Frames of the same name in two subfolders are both exported.
+- [x] A cleared dark or flat stays cleared when the folder is reopened.
+- [x] Clearing the darks leaves the flat.
+
+### Not done
+
+- **Copies are still listed, measured and displayed as frames.** With a dark
+  switched on, a copy on screen has it taken off again; only the stack and the
+  export know better.
+- **Copies exported before this carry no card**, and are still taken for
+  frames.
+- **`a.fits` and `a.fit` in one folder** are both written as `a_cal.fits`.
+
+---
+
+## Phase 29 — Each Night Its Own Calibration
+
+The fourth fault from the same read-through, and the worst: it gave a wrong
+stack and said it was calibrated.
+
+### What was wrong
+
+A stack is of a filter, and a filter's dark and flat were chosen once, by how
+its first frame was taken. A target's folder holds every night of it, so every
+night after the first was divided by the first night's flat. Dust moves and
+cameras are turned between evenings; a flat from the wrong one divides dust in
+where there is none and leaves the real dust where it was. Export chose by how
+a frame was taken but not by when, so it did the same. The panel warned that a
+filter's frames were not all one exposure and then gave them all one dark.
+
+### How
+
+- **A group is what one dark and one flat suit** (`masters::Group`): one
+  filter, taken one way — exposure, gain, offset, set temperature, binning,
+  size, camera — on one night. `masters::groups_from` makes them from headers
+  alone, and the stack, the export and the panel's plan all use it.
+- **A night is told by the gap before it**, six hours (`NIGHT_APART`), not by
+  the date. `DATE-OBS` is universal time, and a night in Europe runs across its
+  midnight; by the date it would be two nights, and the half after midnight
+  would be nearer in date to the next evening's flats than to its own. Cloud
+  and a meridian flip are shorter than six hours, and the day between two
+  nights is longer even at midwinter in the north. Frames that do not say when
+  they were taken are a group together.
+- **One stack per filter still.** Each frame is calibrated with its own group's
+  masters as it is read, in every pass, and then lined up and added as before.
+  The frames keep the order they came in, so the frame the rest are lined up
+  with is the one it always was. Each frame is already brought to the
+  reference's sky before it is added, which is what lets a night with its dark
+  taken off sit beside one without.
+- **A night with nothing to calibrate it goes in as it came.** The stack is
+  made and can be opened; the message counts the frames that went in
+  uncalibrated, and the panel and the file's history name the night and what it
+  lacked. Chosen over leaving the night out, or refusing to stack: nothing is
+  dropped without being said, and the user decides whether it will do.
+- **A group is named by what sets it apart** from the others of its filter and
+  no more: `L-Pro` when it is alone, `L-Pro, 2025-01-16` when there are nights,
+  `L-Pro, 60 s` when there are exposures. Two nights begun on one date get the
+  time as well.
+- **Masters are shared** (`masters::Made`). Nights that the same dark suits
+  hold the one copy of it — a 61-megapixel master is a quarter of a gigabyte —
+  and one that could not be made is remembered with why, not tried again for
+  each night. Flats are let go of between filters. What the masters of further
+  nights take comes out of the room the stack is given (`memory::room_beside`),
+  so a stack of many nights goes a colour at a time sooner rather than
+  swapping.
+- **Nothing to choose between, nothing split.** Without a library, with both
+  masters chosen by hand, or with a folder of calibrated copies, every frame
+  gets the same and the lines are said once for the filter, as before.
+
+### Acceptance criteria
+
+- [x] Two nights of one filter, the camera turned between them, a flat for
+      each: the stack's sky is even, and it slopes by a fifth if both nights
+      are given the first night's flat.
+- [x] The panel plans each night apart, and the stack's history names each.
+- [x] Two nights the same dark suits hold one copy of it.
+- [x] A night with neither dark nor flat is stacked with the rest, counted in
+      the message, named in the panel and the history, and the stack is listed.
+- [x] An export gives each night's copies that night's flat.
+- [x] A night across midnight is one night; cloud for a few hours does not make
+      two; two nights begun on one date are told apart.
+
+### Not done
+
+- **A flat chosen by hand goes to every night**, as the user asked for; only
+  what the library chooses is by night.
+- **An export holds every night's masters until it ends.** A stack lets flats
+  go between filters; an export of many nights of full frames holds a quarter
+  of a gigabyte for each night's flat.
+- **A frame with no `DATE-OBS`** cannot be given a night, and is matched as if
+  no date were known: the flat with the most frames, not the nearest.
+- **The viewer still calibrates what is on screen** with the masters chosen by
+  hand alone; the library's choice is seen only in the stack and the export.
+
+---
+
+## Phase 30 — Nothing Written Over, Nothing Waited For
+
+Three more from reading the code: one lost a file, two made the window wait.
+
+### What was wrong, and what was done
+
+**An export wrote over whatever had its copy's name.** A copy of `a.fits` is
+`a_cal.fits`, written with a rename that replaces what is there. A frame of the
+user's own called `a_cal.fits` was replaced, not put in the trash; `a.fit` and
+`a.fits` in one folder were both written as `a_cal.fits`, and Phase 28 left
+that as not done. A copy now replaces a file only if it is one fitsview
+exported, known by its `FITSVCAL` card, so exporting again still updates the
+copies it wrote. Anything else of that name, or a name already taken in this
+export, ignoring case, sends the copy to `a_cal_2.fits`, `a_cal_3.fits` and so
+on (`jobs::first_free`); the message counts how many. Stacks are told apart by
+name only, and `stack_Ha 7nm` and `stack_Ha-7nm` were both made safe as
+`stack_Ha-7nm.fits`, the second replacing the first in one run; the second is
+now `stack_Ha-7nm_2.fits`. A stack still replaces a stack of its name from an
+earlier run, and a file of that name that fitsview did not write, as the user
+decided.
+
+**The stretch copied the whole frame to measure a sample of it.**
+`compute_stretch` turned every value into an `f64` — 1.47 GB for 61 megapixels
+in colour — and then took one in so many. It now takes the sample first and
+converts only that, with the same result to the bit, which a test compares
+against the old way: 209 ms to 13 ms on that frame, on the interface's thread.
+
+**Calibration ran on the interface's thread.** Taking off the dark, dividing by
+the flat, reconstructing colour and taking out the gradient came to 230 ms a
+61-megapixel colour frame, during which the window did not draw or answer.
+`prepare.rs` does it on a thread of its own, `fitsview-prepare`, which keeps
+only the newest request: stepping through frames faster than they are made
+ready makes only the one stepped to. The frame on screen stays, with the
+loading indicator, until the next is ready. A frame made ready with settings
+since changed is thrown away (`prepared_generation`), and one made ready after
+the user moved on is kept in the cache, so stepping back shows it at once.
+
+### Acceptance criteria
+
+- [x] An export never writes over a file it did not write, FITS or not, and
+      writes its copy beside it under a numbered name.
+- [x] Exporting again replaces the copies written before.
+- [x] Two frames whose copies share a name, whatever its case, are both kept.
+- [x] Two filters made safe alike each keep their stack.
+- [x] The stretch is the same to the bit, mono and colour, with gaps in the
+      data.
+- [x] A calibrated frame is made ready without the interface waiting for it;
+      one made ready with settings since changed is never shown; moving on
+      shows the frame moved to.
+
+### Not done
+
+- **Each calibrated frame newly visited still takes about 230 ms to appear.**
+  The window answers meanwhile; making the neighbours ready ahead, as the
+  loader reads ahead, would hide most of it at the cost of CPU and memory.
+- **Combining flat darks, loading and saving a master, and restoring a folder's
+  masters** still read or write on the interface's thread.
+- **Whether a frame is calibrated** is decided from whether the frame before it
+  matched the master's size, so in a folder of mixed sizes a frame can be shown
+  uncalibrated.
+
+---
+
 ## 9. Performance Checklist (apply throughout)
 
 - Read files with a single `std::fs::read`; do not use `BufReader` per-element reads, and do not use `mmap` (unsafe).
