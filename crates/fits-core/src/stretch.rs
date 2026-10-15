@@ -10,8 +10,6 @@
 //! Nothing here changes the pixel data. The stretch affects display only, so
 //! calibration and statistics keep working on the real values.
 
-use rayon::prelude::*;
-
 use crate::image::FitsImage;
 
 /// Largest number of samples used to estimate the background.
@@ -188,14 +186,23 @@ pub struct Background {
 /// Non-finite samples are skipped.
 #[must_use]
 pub fn measure_background(normalised: &[f64]) -> Background {
-    let stride = (normalised.len() / MAX_SAMPLES).max(1);
-    let mut sample: Vec<f64> = normalised
-        .iter()
-        .step_by(stride)
-        .copied()
-        .filter(|v| v.is_finite())
-        .collect();
+    background_of(
+        normalised
+            .iter()
+            .step_by(sample_stride(normalised.len()))
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect(),
+    )
+}
 
+/// How far apart the samples [`measure_background`] takes from `len` are.
+fn sample_stride(len: usize) -> usize {
+    (len / MAX_SAMPLES).max(1)
+}
+
+/// Background statistics of samples already taken, all of them finite.
+fn background_of(mut sample: Vec<f64>) -> Background {
     if sample.is_empty() {
         return Background {
             median: 0.0,
@@ -253,12 +260,25 @@ pub fn compute_stretch(image: &FitsImage, params: &StretchParams) -> Vec<Stretch
     }
     let low = f64::from(image.min);
     let normalise = |v: f32| (f64::from(v) - low) / span;
+    // What `measure_background` would make of `samples` normalised, from only
+    // the ones it would look at. Normalising the whole image first held eight
+    // bytes for every sample — a gigabyte and a half for a colour frame of 61
+    // megapixels — to keep one in a hundred and eighty of them.
+    let measure = |samples: &[f32]| {
+        background_of(
+            samples
+                .iter()
+                .step_by(sample_stride(samples.len()))
+                .map(|&v| normalise(v))
+                .filter(|v| v.is_finite())
+                .collect(),
+        )
+    };
 
     // A mono frame has one channel whichever variant is asked for.
     if params.linked || channels == 1 {
         // One measurement across the whole image, colour planes included.
-        let normalised: Vec<f64> = image.data.par_iter().map(|&v| normalise(v)).collect();
-        let stretch = stretch_for(&measure_background(&normalised), params);
+        let stretch = stretch_for(&measure(&image.data), params);
         return vec![stretch; channels];
     }
 
@@ -272,11 +292,7 @@ pub fn compute_stretch(image: &FitsImage, params: &StretchParams) -> Vec<Stretch
             if start >= end {
                 return Stretch::identity();
             }
-            let normalised: Vec<f64> = image.data[start..end]
-                .par_iter()
-                .map(|&v| normalise(v))
-                .collect();
-            stretch_for(&measure_background(&normalised), params)
+            stretch_for(&measure(&image.data[start..end]), params)
         })
         .collect()
 }
@@ -375,6 +391,86 @@ mod tests {
         let spec = SyntheticSpec::new(width, height, -32);
         let bytes = synthetic_fits(&spec, pixels).unwrap();
         read_fits_from_bytes(&bytes).unwrap()
+    }
+
+    /// `compute_stretch` as it was before it sampled the image first: the
+    /// whole of it normalised, then measured.
+    fn stretch_normalising_everything(image: &FitsImage, params: &StretchParams) -> Vec<Stretch> {
+        let channels = image.channels.max(1);
+        let span = f64::from(image.max) - f64::from(image.min);
+        let low = f64::from(image.min);
+        let normalised = |data: &[f32]| -> Vec<f64> {
+            data.iter().map(|&v| (f64::from(v) - low) / span).collect()
+        };
+        if params.linked || channels == 1 {
+            let stretch = stretch_for(&measure_background(&normalised(&image.data)), params);
+            return vec![stretch; channels];
+        }
+        let pixels = image.width * image.height;
+        (0..channels)
+            .map(|plane| {
+                let plane = &image.data[plane * pixels..(plane + 1) * pixels];
+                stretch_for(&measure_background(&normalised(plane)), params)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sampling_before_normalising_gives_the_same_stretch_to_the_bit() {
+        // Sizes either side of the sample cap, so that the stride is one, two
+        // and more, in mono and colour, linked and not, with gaps in the data.
+        let mut rng = crate::testutil::Prng::new(11);
+        for (width, height, channels) in [
+            (300, 200, 1),
+            (1000, 1000, 1),
+            (1500, 1001, 1),
+            (1100, 1000, 3),
+            (2100, 1003, 3),
+        ] {
+            let mut data: Vec<f32> = (0..width * height * channels)
+                .map(|_| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let v = (1000.0 + 40.0 * rng.next_gaussian()) as f32;
+                    v
+                })
+                .collect();
+            for i in (0..data.len()).step_by(997) {
+                data[i] = f32::NAN;
+            }
+            let (min, max) = crate::finite_min_max(&data);
+            let image = FitsImage {
+                width,
+                height,
+                channels,
+                data,
+                header: crate::FitsHeader::default(),
+                min,
+                max,
+            };
+            for linked in [true, false] {
+                let params = StretchParams {
+                    linked,
+                    ..StretchParams::default()
+                };
+                let bits = |stretches: Vec<Stretch>| -> Vec<[u32; 3]> {
+                    stretches
+                        .iter()
+                        .map(|s| {
+                            [
+                                s.shadows.to_bits(),
+                                s.midtones.to_bits(),
+                                s.highlights.to_bits(),
+                            ]
+                        })
+                        .collect()
+                };
+                assert_eq!(
+                    bits(compute_stretch(&image, &params)),
+                    bits(stretch_normalising_everything(&image, &params)),
+                    "{width}x{height}x{channels}, linked {linked}"
+                );
+            }
+        }
     }
 
     #[test]
