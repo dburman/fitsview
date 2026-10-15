@@ -96,20 +96,33 @@ mod tests {
 
     #[test]
     fn making_the_next_overlaps_using_this_one() {
-        // Ten items, each taking 20 ms to make and 20 ms to use: 400 ms one
-        // after the other, about 220 ms overlapped.
+        // Each item's use waits for the next to be begun. Made one after the
+        // other, the next would not begin until the use returned, and the wait
+        // would run out; made ahead, it begins at once. Timing the whole run
+        // instead failed on shared machines whose sleeps overran fourfold.
         let items: Vec<u32> = (0..10).collect();
-        let started = Instant::now();
+        let begun = AtomicUsize::new(0);
+        let mut overlapped = 0;
         each(
             &items,
-            |_| std::thread::sleep(Duration::from_millis(20)),
-            |_, ()| {
-                std::thread::sleep(Duration::from_millis(20));
+            |_| {
+                begun.fetch_add(1, Ordering::SeqCst);
+            },
+            |item, ()| {
+                // This item and every one before it, and the next.
+                let wanted = (*item as usize + 2).min(items.len());
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while begun.load(Ordering::SeqCst) < wanted {
+                    if Instant::now() > deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                overlapped += 1;
                 true
             },
         );
-        let took = started.elapsed();
-        assert!(took < Duration::from_millis(330), "took {took:?}");
+        assert_eq!(overlapped, items.len());
     }
 
     #[test]
