@@ -243,8 +243,15 @@ Unzip the archive and run `fitsview.exe`. SmartScreen will warn that the
 publisher is unknown, because the binary is not signed with a certificate;
 choose **More info** and then **Run anyway**. It runs on 64-bit Windows 10 and
 11 with nothing else installed, not even the Visual C++ Redistributable: the C
-runtime is built into the program, the graphics go through Direct3D and the
+runtime is built into the program, the graphics go through Direct3D 12 and the
 file dialogs are the system's own.
+
+If it closes without opening a window, try it from PowerShell with another
+graphics interface, and tell us which one works:
+
+```powershell
+$env:WGPU_BACKEND = "vulkan"; .\fitsview.exe
+```
 
 ### Checking what you have
 

@@ -81,6 +81,13 @@ fn presentable_adapter_setup() -> eframe::egui_wgpu::WgpuSetup {
         other => return other,
     };
 
+    setup.instance_descriptor.backends = adapter::backends(
+        cfg!(windows),
+        wgpu::Backends::from_env(),
+        setup.instance_descriptor.backends,
+    );
+    log::info!("starting {:?}", setup.instance_descriptor.backends);
+
     setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
         let candidates: Vec<Candidate> = adapters
             .iter()
@@ -120,10 +127,9 @@ fn presentable_adapter_setup() -> eframe::egui_wgpu::WgpuSetup {
             }
             None => Err(format!(
                 "none of the {} graphics adapters found can draw to a window. \
-                 Over Remote Desktop this is usual: the graphics card cannot \
-                 present to a remote session. Try running with the environment \
-                 variable WGPU_BACKEND set to dx12, which uses Microsoft's \
-                 software renderer.",
+                 Over Remote Desktop the graphics card cannot present to a \
+                 remote session, and only Microsoft's software renderer, part \
+                 of Direct3D 12, can.",
                 adapters.len()
             )),
         }

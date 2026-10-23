@@ -9,6 +9,31 @@
 //!
 //! So presenting comes first and speed second. Software rendering is slow, and
 //! slow is worth having when the alternative is nothing at all.
+//!
+//! Before any of that, Windows starts only Direct3D 12. By default every
+//! graphics interface is started at once, and on a 2024 Razer Blade 14, with
+//! Radeon and GeForce graphics, doing so closed the program before its window
+//! appeared, with no error to catch, though Direct3D 12, Vulkan and OpenGL
+//! each worked alone. Direct3D 12 is part of every Windows that runs fitsview
+//! and brings Microsoft's software renderer with it, which Remote Desktop
+//! needs.
+
+use eframe::wgpu::Backends;
+
+/// Which graphics interfaces to start.
+///
+/// `requested` is what the `WGPU_BACKEND` environment variable asks for, and
+/// always wins, so a machine where Direct3D 12 fails can still be told to use
+/// something else. Otherwise Windows gets Direct3D 12 alone and every other
+/// system gets `default`.
+#[must_use]
+pub fn backends(windows: bool, requested: Option<Backends>, default: Backends) -> Backends {
+    match requested {
+        Some(requested) => requested,
+        None if windows => Backends::DX12,
+        None => default,
+    }
+}
 
 /// What kind of device an adapter is, in the order we would rather have them.
 ///
@@ -62,6 +87,30 @@ mod tests {
 
     fn candidate(kind: Kind, presents: bool) -> Candidate {
         Candidate { kind, presents }
+    }
+
+    #[test]
+    fn windows_starts_direct3d_12_alone() {
+        // All of them at once closed the program on a Razer Blade 14.
+        let everything = Backends::PRIMARY | Backends::GL;
+        assert_eq!(backends(true, None, everything), Backends::DX12);
+    }
+
+    #[test]
+    fn wgpu_backend_wins_on_windows_and_elsewhere() {
+        let everything = Backends::PRIMARY | Backends::GL;
+        for windows in [true, false] {
+            assert_eq!(
+                backends(windows, Some(Backends::VULKAN), everything),
+                Backends::VULKAN
+            );
+        }
+    }
+
+    #[test]
+    fn other_systems_keep_the_default() {
+        let everything = Backends::PRIMARY | Backends::GL;
+        assert_eq!(backends(false, None, everything), everything);
     }
 
     #[test]
