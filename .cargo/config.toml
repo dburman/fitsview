@@ -1,0 +1,8 @@
+# The C runtime is linked into the Windows program rather than loaded from
+# VCRUNTIME140.dll, which Windows does not ship: without this, a machine that
+# never installed the Visual C++ Redistributable cannot start fitsview.
+#
+# RUSTFLAGS in the environment replaces this setting, so CI passes the flag
+# itself wherever it sets RUSTFLAGS.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

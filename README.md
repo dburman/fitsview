@@ -241,8 +241,10 @@ sudo mv fitsview /usr/local/bin/
 
 Unzip the archive and run `fitsview.exe`. SmartScreen will warn that the
 publisher is unknown, because the binary is not signed with a certificate;
-choose **More info** and then **Run anyway**. Nothing else is needed — the
-graphics go through Direct3D and the file dialogs are the system's own.
+choose **More info** and then **Run anyway**. It runs on 64-bit Windows 10 and
+11 with nothing else installed, not even the Visual C++ Redistributable: the C
+runtime is built into the program, the graphics go through Direct3D and the
+file dialogs are the system's own.
 
 ### Checking what you have
 

@@ -82,6 +82,17 @@ jobs:
         run: |
           docker run --rm -v "$PWD/${{ matrix.built }}:/out:ro" rockylinux:8 /out/fitsview --version
 
+      # The runner has the Visual C++ runtime installed, so starting the program
+      # here would not show that it needs it. Its DLL's name in the binary does.
+      - name: Check the Windows build needs no Visual C++ runtime
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if grep -aqi 'vcruntime140' "${{ matrix.built }}/${{ matrix.binary }}"; then
+            echo "fitsview.exe loads VCRUNTIME140.dll; see .cargo/config.toml" >&2
+            exit 1
+          fi
+
       - name: Package
         shell: bash
         run: |
